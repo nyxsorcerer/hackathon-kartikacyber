@@ -1,0 +1,5 @@
+{
+  "bundle_version": "0.1.0",
+  "plugins": [{"id": "pi-commandcode-provider", "name": "Command Code provider", "version": "0.7.3", "source": "https://github.com/patlux/pi-commandcode-provider", "health": "ready", "provider_contribution": "commandcode", "integrity": "sha512-3O7rkWwTIXnIiPKLyOu2IU9q7PR2mr/LVQqLfNwtN9x9qnG+SvN98u17PzMMU/+xT8TqoGF/kHz8Vay80SFWzQ=="}],
+  "agents": {"pi": {"package": "@earendil-works/pi-coding-agent", "version": "1.0.0"}, "claude": {"package": "@anthropic-ai/claude-code", "version": "2.1.288"}, "codex": {"package": "@openai/codex", "version": "0.160.0"}}
+}

@@ -1,0 +1,55 @@
+FROM ghcr.io/astral-sh/uv:0.8.22@sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1 AS uv
+FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c AS runtime
+COPY --from=uv /uv /uvx /usr/local/bin/
+RUN groupadd -g 10001 job && useradd -u 10001 -g job -m -d /home/job job
+WORKDIR /opt/runner
+COPY runner/pyproject.toml runner/uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project
+COPY runner/numen_runner ./numen_runner
+COPY runner/seccomp-codex.json runner/plugins.lock.json runner/resources.lock.json /opt/runner/
+RUN uv sync --locked --no-dev
+COPY runner/resources /opt/resources
+ENV PATH="/opt/runner/.venv/bin:/usr/local/bin:/usr/bin:/bin" HOME=/home/job
+FROM runtime AS broker
+USER root
+CMD ["python", "-m", "numen_runner.broker"]
+FROM runtime AS gateway
+USER 10001:10001
+CMD ["python", "-m", "numen_runner.gateway"]
+FROM runtime AS probe
+USER 10001:10001
+CMD ["python", "-m", "numen_runner.workload"]
+FROM runtime AS lab
+USER 10001:10001
+CMD ["python", "-m", "numen_runner.workload"]
+FROM runtime AS test
+RUN uv sync --locked --extra dev
+COPY runner/tests ./tests
+USER 10001:10001
+CMD ["pytest", "-q", "-p", "no:cacheprovider"]
+FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d488ce091c69d442ebec9f103 AS node
+FROM runtime AS node-runtime
+COPY --from=node /usr/local/bin/node /usr/local/bin/
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
+WORKDIR /opt/numen
+COPY runner/node/proxy-preload.cjs /opt/numen/proxy-preload.cjs
+ENV PATH="/opt/numen/node_modules/.bin:/opt/runner/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+FROM node-runtime AS pi
+COPY runner/node/pi/package.json runner/node/pi/package-lock.json ./
+COPY runner/node/patch-pi-dependency.py runner/vendor/brace-expansion-5.0.12.tgz ./
+RUN npm ci --omit=dev --ignore-scripts && python patch-pi-dependency.py && npm audit --omit=dev --audit-level=high && ./node_modules/.bin/pi --version && npm cache clean --force
+COPY runner/node/pi-capabilities.mjs runner/node/pi-commandcode-login.mjs runner/node/pi-tools.ts ./
+USER 10001:10001
+CMD ["python", "-m", "numen_runner.workload"]
+FROM node-runtime AS claude
+COPY runner/node/claude/package.json runner/node/claude/package-lock.json ./
+# The reviewed, pinned installer only links the npm-locked platform binary; it does not download code.
+RUN npm ci --omit=dev --ignore-scripts && node node_modules/@anthropic-ai/claude-code/install.cjs && ./node_modules/.bin/claude --version && npm cache clean --force
+USER 10001:10001
+CMD ["python", "-m", "numen_runner.workload"]
+FROM node-runtime AS codex
+COPY runner/node/codex/package.json runner/node/codex/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+USER 10001:10001
+CMD ["python", "-m", "numen_runner.workload"]

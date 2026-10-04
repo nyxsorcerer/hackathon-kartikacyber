@@ -1,0 +1,1 @@
+{"name":"numen-codex-runtime","private":true,"version":"0.1.0","dependencies":{"@openai/codex":"0.160.0","undici":"8.11.2"}}

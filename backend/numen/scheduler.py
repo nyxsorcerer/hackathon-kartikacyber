@@ -1,0 +1,21 @@
+import time
+from .broker import Broker
+from .config import Config
+from .db import make_database
+from .domain import schedule
+from .queue import recover
+
+
+def main():
+    config = Config.from_env()
+    _, factory = make_database(config)
+    broker = Broker(config)
+    while True:
+        recover(factory, broker)
+        with factory.begin() as db:
+            schedule(db)
+        time.sleep(15)
+
+
+if __name__ == "__main__":
+    main()

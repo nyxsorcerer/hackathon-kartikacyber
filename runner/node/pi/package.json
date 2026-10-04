@@ -1,0 +1,1 @@
+{"name":"numen-pi-runtime","private":true,"version":"0.1.0","dependencies":{"@earendil-works/pi-ai":"1.0.0","@earendil-works/pi-coding-agent":"1.0.0","pi-commandcode-provider":"0.7.3","undici":"8.11.2"}}

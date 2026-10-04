@@ -1,0 +1,252 @@
+import logging
+import socket
+import threading
+import time
+from sqlalchemy import select
+
+from .broker import Broker
+from .config import Config
+from .db import make_database
+from .models import (
+    Account,
+    AuditContext,
+    Commit,
+    Job,
+    JobAttempt,
+    LabRun,
+    Observation,
+    Program,
+    VersionRecipe,
+    now,
+)
+from .security import DomainError, Vault
+from .queue import ExecutionContext, claim
+from .workflows import Workflows, all_secrets
+from .domain import event
+
+log = logging.getLogger("numen.worker")
+# Agent, lab and interactive login work that can occupy a slot for hours.
+LONG_KINDS = (
+    "account_login",
+    "audit_context",
+    "commit_analysis",
+    "commit_triage",
+    "cve_analysis",
+    "finding_artifacts",
+    "lab_run",
+    "version_recipe",
+)
+
+
+def run_once(config, factory, broker=None, owner=None, exclude=()):
+    broker = broker or Broker(config)
+    vault = Vault(config.secret_key)
+    with factory.begin() as db:
+        job = claim(db, owner or socket.gethostname(), exclude)
+        if not job:
+            return False
+        ident, token = job.id, job.attempt_token
+    context = ExecutionContext(factory, job, broker)
+    context.start()
+    try:
+        with factory() as db:
+            job = db.get(Job, ident)
+            workflows = Workflows(config, vault, broker, context)
+            try:
+                result = workflows.execute(db, job)
+            finally:
+                workflows.close()
+            context.fence(db)
+            if context.executions:
+                result = {**result, "runtime_executions": context.executions}
+            job.status, job.result, job.finished_at = "succeeded", result, now()
+            job.lease_until, job.lease_owner = None, None
+            attempt = db.get(JobAttempt, token)
+            attempt.status = "succeeded"
+            event(db, job, "succeeded", "Job completed", partial_output_retained=False)
+            db.commit()
+        for callback in context.callbacks:
+            try:
+                callback()
+            except DomainError:
+                log.warning("Native credential ingress cleanup requires broker reconciliation")
+    except Exception as exc:
+        error = (
+            exc.as_dict()
+            if isinstance(exc, DomainError)
+            else {
+                "code": "internal_job_error",
+                "message": "Job failed unexpectedly; no successful output was published",
+                "retryable": False,
+            }
+        )
+        with factory() as scan:
+            try:
+                secrets = [*all_secrets(scan, vault), *context.secrets]
+            except DomainError:
+                secrets = []
+        for value in secrets:
+            error["message"] = error["message"].replace(value, "[redacted]")
+        with factory() as db:
+            row = db.get(Job, ident)
+            owned = row and row.attempt_token == token
+            run_id = row.broker_run_id if owned else None
+            attempt = db.get(JobAttempt, token)
+            phase_token = attempt.data.get("runtime_attempt_token") if attempt else None
+            terminal_target = (
+                "cancelled"
+                if (owned and row.status == "cancelling")
+                or error["code"] in ("cancelled", "lease_lost")
+                else "failed"
+            )
+        stopped = run_id is None and phase_token is None
+        if owned and phase_token and not run_id:
+            try:
+                found = broker.lookup_attempt(phase_token)
+                if found:
+                    run_id = found["run_id"]
+                else:
+                    stopped = True  # Positive broker absence proof, not an HTTP error.
+            except DomainError:
+                stopped = False
+        if owned and run_id:
+            try:
+                broker.cancel(run_id)
+                stopped = broker.request("GET", f"/internal/runs/{run_id}").get("status") in (
+                    "cancelled",
+                    "failed",
+                    "succeeded",
+                )
+            except DomainError:
+                stopped = False
+        with factory.begin() as db:
+            row = db.scalar(select(Job).where(Job.id == ident).with_for_update())
+            if row and row.attempt_token == token and row.status in ("running", "cancelling"):
+                row.status = terminal_target if stopped else "cancelling"
+                if run_id:
+                    row.broker_run_id = run_id
+                if not stopped:
+                    error = {**error, "reconciliation_pending": True}
+                    row.progress = {"stage": "reconciliation_pending"}
+                row.error, row.finished_at = error, now() if stopped else None
+                row.lease_until = None if stopped else now()
+                row.lease_owner = None
+                attempt = db.get(JobAttempt, token)
+                if attempt:
+                    attempt.status = row.status
+                    if not stopped:
+                        attempt.data = {**attempt.data, "pending_terminal_status": terminal_target}
+                partial_output_retained = False
+                if (
+                    row.program_id
+                    and row.kind == "source_check"
+                    and error["code"] not in ("input_changed", "source_check_superseded")
+                ):
+                    db.get(Program, row.program_id).last_error = error
+                if row.kind in ("commit_triage", "jev_triage"):
+                    commit = db.get(Commit, row.input.get("commit_id"))
+                    if commit:
+                        commit.triage_status, commit.triage_result = (
+                            "failed",
+                            {"decision": "insufficient_context", "reason": error["message"]},
+                        )
+                if row.kind in ("account_capabilities", "account_check", "account_login"):
+                    account = db.get(Account, row.input.get("account_id"))
+                    if account and account.revision == row.input.get("credential_revision"):
+                        account.data = {
+                            **account.data,
+                            "status": "unavailable",
+                            "error": error,
+                            "last_checked_at": now().isoformat(),
+                        }
+                if row.kind == "version_check" and row.program_id:
+                    db.add(
+                        Observation(
+                            program_id=row.program_id,
+                            recipe_id=row.input.get("recipe_id"),
+                            source_generation=row.input.get("source_generation", 1),
+                            data={
+                                "status": "error",
+                                "version": None,
+                                "candidates": [],
+                                "method": "script",
+                                "origin": "script",
+                                "evidence": [],
+                                "confidence": {"level": "unknown", "basis": "Execution failed"},
+                                "limitations": [error["message"]],
+                                "error": error,
+                            },
+                        )
+                    )
+                if row.kind == "version_recipe":
+                    for recipe in db.scalars(
+                        select(VersionRecipe).where(
+                            VersionRecipe.program_id == row.program_id,
+                            VersionRecipe.status.in_(["validating", "rejected"]),
+                        )
+                    ):
+                        if recipe.data.get("job_id") == row.id:
+                            partial_output_retained = True
+                            recipe.status = "rejected"
+                            recipe.data = {**recipe.data, "error": error}
+                if row.kind == "audit_context":
+                    for report in db.scalars(
+                        select(AuditContext).where(
+                            AuditContext.job_id == row.id, AuditContext.status == "running"
+                        )
+                    ):
+                        partial_output_retained = (
+                            bool(report.coverage.get("artifact_revision"))
+                            or partial_output_retained
+                        )
+                        report.status = "partial"
+                        report.coverage = {**report.coverage, "interrupted": True, "error": error}
+                if row.kind == "lab_run":
+                    lab = db.scalar(select(LabRun).where(LabRun.job_id == row.id))
+                    if lab:
+                        lab.status, lab.data = row.status, {"error": error}
+                event(
+                    db,
+                    row,
+                    row.status,
+                    error["message"],
+                    partial_output_retained=partial_output_retained,
+                )
+    finally:
+        context.close()
+    return True
+
+
+def serve(config, factory, owner, exclude=()):
+    broker = Broker(config)
+    while True:
+        try:
+            busy = run_once(config, factory, broker, owner, exclude)
+        except Exception:
+            log.exception("Job slot %s failed outside a job attempt", owner)
+            busy = False
+            time.sleep(4)
+        if not busy:
+            time.sleep(1)
+
+
+def main():
+    config = Config.from_env()
+    _, factory = make_database(config)
+    host = socket.gethostname()
+    # Claims are row-locked and attempts fenced, so slots run jobs concurrently. The extra slot
+    # never takes long work, so checks, syncs and notifications keep moving during long audits.
+    slots = [(f"{host}/{i}", ()) for i in range(max(1, config.worker_concurrency))]
+    slots.append((f"{host}/short", LONG_KINDS))
+    threads = [
+        threading.Thread(target=serve, args=(config, factory, owner, exclude), daemon=True)
+        for owner, exclude in slots
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
+if __name__ == "__main__":
+    main()

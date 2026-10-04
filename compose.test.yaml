@@ -1,0 +1,29 @@
+services:
+  fixtures:
+    image: numen-app:0.1.0
+    user: root
+    environment:
+      NUMEN_FIXTURE_SVN: "1"
+    entrypoint: [/fixtures/start.sh]
+    volumes: [./tests/integration:/fixtures:ro]
+    ports: ["127.0.0.1:18090:8090"]
+    networks: [application]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  app:
+    environment: &test-env
+      NUMEN_TEST_MODE: "1"
+      NUMEN_GITHUB_API_URL: http://fixtures:8090
+      NUMEN_NVD_API_URL: http://fixtures:8090/rest/json/cves/2.0
+      NUMEN_WORDPRESS_SVN_URL: svn://fixtures:3690
+    depends_on:
+      fixtures:
+        condition: service_healthy
+  worker:
+    environment: *test-env
+    depends_on:
+      fixtures:
+        condition: service_healthy

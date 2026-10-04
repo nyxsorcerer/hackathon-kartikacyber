@@ -1,0 +1,192 @@
+name: numen
+x-app: &app
+  image: numen-app:0.1.0
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: app
+  restart: unless-stopped
+  init: true
+  networks: [application]
+  volumes: [artifact-data:/data/artifacts]
+  environment: &app-env
+    NUMEN_DATABASE_URL: postgresql+psycopg://numen:${POSTGRES_PASSWORD:?Run setup first}@db:5432/numen
+    NUMEN_SECRET_KEY: ${NUMEN_SECRET_KEY:?Run setup first}
+    NUMEN_ARTIFACT_ROOT: /data/artifacts
+    NUMEN_FRONTEND_ROOT: /app/frontend/dist
+    NUMEN_BROKER_URL: http://runner-broker:8081
+    NUMEN_BROKER_TOKEN: ${NUMEN_BROKER_TOKEN:?Run setup first}
+    NUMEN_DASHBOARD_URL: ${NUMEN_DASHBOARD_URL:-http://localhost:8787}
+    NUMEN_MONITOR_INTERVAL_DAYS: ${NUMEN_MONITOR_INTERVAL_DAYS:-7}
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  depends_on:
+    db:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+services:
+  db:
+    image: postgres:18.0-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: numen
+      POSTGRES_USER: numen
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run setup first}
+    volumes: [postgres-data:/var/lib/postgresql]
+    networks: [application]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U numen -d numen]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  migrate:
+    <<: *app
+    restart: no
+    command: [alembic, upgrade, head]
+    depends_on:
+      db:
+        condition: service_healthy
+  bootstrap-operator:
+    <<: *app
+    profiles: [setup]
+    restart: no
+    command: [python, -m, numen.cli, bootstrap]
+    environment:
+      <<: *app-env
+      NUMEN_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap-password
+    secrets: [bootstrap-password]
+  app:
+    <<: *app
+    ports: ["127.0.0.1:${NUMEN_PORT:-8787}:8080"]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  worker:
+    <<: *app
+    command: [python, -m, numen.worker]
+    environment:
+      <<: *app-env
+      NUMEN_WORKER_CONCURRENCY: ${NUMEN_WORKER_CONCURRENCY:-3}
+    networks: [application, control]
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      runner-broker:
+        condition: service_healthy
+  scheduler:
+    <<: *app
+    command: [python, -m, numen.scheduler]
+    networks: [application, control]
+  runner-broker:
+    image: numen-broker:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      target: broker
+    restart: unless-stopped
+    init: true
+    networks: [control]
+    environment:
+      NUMEN_RUNNER_INSTANCE: ${COMPOSE_PROJECT_NAME:-numen}
+      NUMEN_BROKER_TOKEN: ${NUMEN_BROKER_TOKEN:?Run setup first}
+      NUMEN_RUNNER_STATE: /data/runner
+      NUMEN_RUNNER_CONCURRENCY: ${NUMEN_RUNNER_CONCURRENCY:-4}
+    volumes: [/var/run/docker.sock:/var/run/docker.sock, runner-state:/data/runner]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  fetch-gateway:
+    image: numen-gateway:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile.runner
+      target: gateway
+    restart: unless-stopped
+    init: true
+    networks: [egress]
+    read_only: true
+    tmpfs: ["/tmp:size=16m,uid=10001,gid=10001"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8082/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  pi-image:
+    image: numen-pi:0.1.0
+    profiles: [images]
+    build: {context: ., dockerfile: Dockerfile.runner, target: pi}
+    command: [pi, --version]
+    network_mode: none
+  claude-image:
+    image: numen-claude:0.1.0
+    profiles: [images]
+    build: {context: ., dockerfile: Dockerfile.runner, target: claude}
+    command: [claude, --version]
+    network_mode: none
+  codex-image:
+    image: numen-codex:0.1.0
+    profiles: [images]
+    build: {context: ., dockerfile: Dockerfile.runner, target: codex}
+    command: [codex, --version]
+    network_mode: none
+  probe-image:
+    image: numen-probe:0.1.0
+    profiles: [images]
+    build: {context: ., dockerfile: Dockerfile.runner, target: probe}
+    network_mode: none
+  lab-image:
+    image: numen-lab:0.1.0
+    profiles: [images]
+    build: {context: ., dockerfile: Dockerfile.runner, target: lab}
+    network_mode: none
+  backend-tests:
+    <<: *app
+    profiles: [test]
+    image: numen-backend-test:0.1.0
+    build: {context: ., dockerfile: Dockerfile, target: test}
+    restart: no
+    command: [pytest, -q, -p, no:cacheprovider]
+  runner-tests:
+    image: numen-runner-test:0.1.0
+    profiles: [test]
+    build: {context: ., dockerfile: Dockerfile.runner, target: test}
+    command: [pytest, -q, -p, no:cacheprovider]
+    network_mode: none
+  frontend-tests:
+    image: numen-frontend-test:0.1.0
+    profiles: [test]
+    build: {context: ., dockerfile: Dockerfile, target: frontend-tests}
+    command: [npm, test]
+    network_mode: none
+  runner-runtime-tests:
+    image: numen-runner-test:0.1.0
+    profiles: [test]
+    build: {context: ., dockerfile: Dockerfile.runner, target: test}
+    user: root
+    environment:
+      NUMEN_DOCKER_TESTS: "1"
+      NUMEN_RUNNER_INSTANCE: runtime-tests
+    volumes: [/var/run/docker.sock:/var/run/docker.sock]
+    command: [pytest, -q, -p, no:cacheprovider]
+    network_mode: none
+networks:
+  application:
+  control:
+    internal: true
+  egress:
+volumes:
+  postgres-data:
+  artifact-data:
+  runner-state:
+secrets:
+  bootstrap-password:
+    file: ./.numen/bootstrap-password
