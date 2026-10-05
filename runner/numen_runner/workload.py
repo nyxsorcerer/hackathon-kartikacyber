@@ -621,8 +621,8 @@ def main():
             "Pi turn did not complete", "Pi agent did not complete its final response", "Codex turn did not complete",
             "Claude turn did not complete", "Claude omitted structured output", "output limit exceeded", "output symlinks are not allowed",
             "output root cannot be a symlink", "output must be a regular file without hard links", "credential material detected in output",
-            "agent final response was not valid JSON", "interactive agent session did not start",
-            "interactive agent session ended unexpectedly", "agent session ended without a valid result"}:
+            "agent final response was not valid JSON", "agent session ended without a valid result"} or (
+            isinstance(exc, ValueError) and str(exc).startswith("interactive agent session")):
             message = str(exc)[:1].upper() + str(exc)[1:] + "."
             code = "plugin_incompatible" if "incompatible" in str(exc) else ("unsupported_access" if "unsupported" in str(exc) else "workload_failed")
         envelope = {"failure":{"code":code,"message":message}}

@@ -30,7 +30,9 @@ INSTRUCTIONS = (
 
 
 class HerdrError(ValueError):
-    pass
+    def __init__(self, code):
+        self.code = code
+        super().__init__(f"herdr: {code}")
 
 
 def call(method, **params):
@@ -41,7 +43,7 @@ def call(method, **params):
         connection.sendall((json.dumps({"id": "numen", "method": method, "params": params}) + "\n").encode())
         reply = json.loads(connection.makefile("rb").readline())
     if "error" in reply:
-        raise HerdrError(f"herdr {method}: {reply['error'].get('code')}")
+        raise HerdrError(f"{method} {reply['error'].get('code')}")
     return reply["result"]
 
 
@@ -123,7 +125,7 @@ def watch(schema, pane, sleep=time.sleep):
         if nudges == NUDGES:
             raise ValueError("agent session ended without a valid result")
         nudges, quiet = nudges + 1, 0
-        call("agent.prompt", target=AGENT, text=f"The task is not finished: {error}. Continue, then write the result file.")
+        submit(f"The task is not finished: {error}. Continue, then write the result file.", time.monotonic() + 60)
 
 
 def run(argv, profile, env, prompt, schema):
@@ -132,15 +134,16 @@ def run(argv, profile, env, prompt, schema):
     server = subprocess.Popen(["herdr", "server"], env=env, cwd="/workspace", stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     try:
+        # Herdr's error code names the failed step (e.g. "agent.prompt agent_not_ready").
         try:
             pane = start(argv, profile, server)
-            call("agent.prompt", target=AGENT, text=prompt + INSTRUCTIONS)
-        except HerdrError:
-            raise ValueError("interactive agent session did not start") from None
+            submit(prompt + INSTRUCTIONS, time.monotonic() + 120)
+        except HerdrError as exc:
+            raise ValueError(f"interactive agent session did not start ({exc.code})") from None
         try:
             return watch(schema, pane)
-        except HerdrError:
-            raise ValueError("interactive agent session ended unexpectedly") from None
+        except HerdrError as exc:
+            raise ValueError(f"interactive agent session ended unexpectedly ({exc.code})") from None
     except Exception:
         # A held session stays inspectable after a failure until the operator releases it.
         while HOLD.exists():
@@ -159,19 +162,32 @@ def start(argv, profile, server):
             break
         except (OSError, ValueError):
             if time.monotonic() > deadline or server.poll() is not None:
-                raise HerdrError("herdr server did not start") from None
+                raise HerdrError("server unavailable") from None
             time.sleep(.2)
     pane = call("workspace.create", cwd="/workspace", label=AGENT)["root_pane"]["pane_id"]
     call("agent.start", name=AGENT, kind=profile["agent"], pane_id=pane,
          args=agent_argv(argv, profile["agent"]), timeout_ms=120000)
-    # Readiness can be reported before the TUI draws; wait for its screen to settle.
+    # agent.start can return before the agent is ready (Pi still loading its provider plugin),
+    # and Herdr can call Claude ready before its TUI draws: wait for both, then a settled screen.
     previous, stable, deadline = None, 0, time.monotonic() + 120
     while stable < 3 and time.monotonic() < deadline:
         time.sleep(1)
+        ready = call("agent.get", target=AGENT)["agent"].get("interactive_ready")
         screen = call("pane.read", pane_id=pane, source="visible")["read"]["text"]
-        stable = stable + 1 if screen == previous and len(screen.strip().splitlines()) > 3 else 0
+        stable = stable + 1 if ready and screen == previous and len(screen.strip().splitlines()) > 3 else 0
         previous = screen
     return pane
+
+
+def submit(text, deadline):
+    """agent.prompt, retried while Herdr still reports the agent as not ready."""
+    while True:
+        try:
+            return call("agent.prompt", target=AGENT, text=text)
+        except HerdrError as exc:
+            if not exc.code.endswith("agent_not_ready") or time.monotonic() > deadline:
+                raise
+            time.sleep(1)
 
 
 def main():

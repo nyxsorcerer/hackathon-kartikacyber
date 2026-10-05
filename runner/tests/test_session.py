@@ -117,3 +117,38 @@ def test_broker_session_redacts_credentials_and_validates_input(tmp_path):
         assert client.post(url, headers=headers, json={"action": "prompt", "text": "explain step 2"}).status_code == 202
         assert client.post(url, headers=headers, json={"action": "keys", "keys": ["esc"]}).status_code == 202
         assert engine.sent == [{"action": "prompt", "text": "explain step 2"}, {"action": "keys", "keys": ["esc"]}]
+
+
+def test_start_waits_for_herdr_readiness_and_prompt_retries_until_ready(monkeypatch):
+    # agent.start may return before the agent is ready; Pi then rejects prompts with agent_not_ready.
+    log = {"gets": 0, "prompts": 0}
+
+    def herdr(method, **params):
+        if method == "ping":
+            return {}
+        if method == "workspace.create":
+            return {"root_pane": {"pane_id": "w1:p1"}}
+        if method == "agent.start":
+            return {}
+        if method == "agent.get":
+            log["gets"] += 1
+            return {"agent": {"interactive_ready": True if log["gets"] > 5 else None}}
+        if method == "pane.read":
+            return {"read": {"text": "$ pi --long command\nline\nline\nline\nline"}}
+        if method == "agent.prompt":
+            log["prompts"] += 1
+            if log["prompts"] < 3:
+                raise session.HerdrError("agent.prompt agent_not_ready")
+            return {}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(session, "call", herdr)
+    monkeypatch.setattr(session.time, "sleep", lambda _: None)
+    server = type("Server", (), {"poll": lambda self: None})()
+    assert session.start(["pi", "--print", "--mode", "json"], {"agent": "pi"}, server) == "w1:p1"
+    assert log["gets"] >= 5 + session.SETTLED  # never settles before herdr reports readiness
+    session.submit("task", session.time.monotonic() + 60)
+    assert log["prompts"] == 3
+    with pytest.raises(session.HerdrError):
+        monkeypatch.setitem(log, "prompts", 0)
+        session.submit("task", session.time.monotonic() - 1)  # deadline passed: not_ready surfaces
