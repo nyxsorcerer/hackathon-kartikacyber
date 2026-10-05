@@ -132,6 +132,7 @@ const analysisResultSchema = z
     category: z.string().optional(),
     summary: z.string().optional(),
     report: z.string().optional(),
+    finding_id: z.string().optional(),
   })
   .passthrough();
 export const analysisSchema = z

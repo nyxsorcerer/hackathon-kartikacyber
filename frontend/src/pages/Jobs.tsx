@@ -51,6 +51,11 @@ type JobFilters = { status: string; kind: string; program: string; q: string };
 function jobError(job: Job) {
   return job.error ? describeError(job.error) || "Failed without a reason" : "";
 }
+function resultId(result: unknown, key: string) {
+  if (typeof result !== "object" || !result || !(key in result)) return;
+  const value: unknown = Reflect.get(result, key);
+  return typeof value === "string" ? value : undefined;
+}
 function applyJobFilters(items: Job[], f: JobFilters, skip?: keyof JobFilters) {
   return items.filter(
     (job) =>
@@ -392,6 +397,8 @@ export function JobDetail() {
     3000,
   );
   const job = resource.data;
+  const findingId = resultId(job?.result, "finding_id");
+  const cveId = resultId(job?.result, "cve_id");
   return (
     <DataState
       loading={resource.loading}
@@ -482,6 +489,24 @@ export function JobDetail() {
               ]}
             />
             <Progress value={job.progress} />
+            <div className="inline-actions">
+              {job.kind === "cve_analysis" && cveId && job.program_id && (
+                <Link
+                  className="secondary button"
+                  to={`/cves?program_id=${encodeURIComponent(job.program_id)}&cve_id=${encodeURIComponent(cveId)}`}
+                >
+                  View CVE analysis and report
+                </Link>
+              )}
+              {findingId && (
+                <Link
+                  className="secondary button"
+                  to={`/findings/${encodeURIComponent(findingId)}`}
+                >
+                  View finding artifacts
+                </Link>
+              )}
+            </div>
             {!!job.result && (
               <Evidence
                 value={job.result}

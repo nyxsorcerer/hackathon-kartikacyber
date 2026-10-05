@@ -41,6 +41,8 @@ export function JobLaunch({
   const [override, setOverride] = useState<Profile>();
   const [focus, setFocus] = useState("");
   const [maxFunctions, setMaxFunctions] = useState("24");
+  const [fresh, setFresh] = useState(false);
+  const [sourceRef, setSourceRef] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [key, setKey] = useState(() => crypto.randomUUID());
@@ -50,6 +52,8 @@ export function JobLaunch({
     settings.data?.default_profiles[operation] ||
     emptyProfile;
   const valid = isProfileReady(profile, accounts.data?.items || []);
+  const pinnable =
+    operation === "cve_analysis" || operation === "finding_artifacts";
   return (
     <Modal
       title={operationNames[operation]}
@@ -84,7 +88,10 @@ export function JobLaunch({
                 {
                   profile,
                   ...(operation === "audit_context"
-                    ? { focus, max_functions: Number(maxFunctions) }
+                    ? { focus, max_functions: Number(maxFunctions), fresh }
+                    : {}),
+                  ...(pinnable && sourceRef.trim()
+                    ? { source_ref: sourceRef.trim() }
                     : {}),
                 },
                 key,
@@ -140,6 +147,37 @@ export function JobLaunch({
                 }}
               />
               <small>Each selected function is analyzed in its own agent run.</small>
+            </label>
+          )}
+          {operation === "audit_context" && (
+            <label className="check-label">
+              <input
+                type="checkbox"
+                checked={fresh}
+                onChange={(e) => {
+                  setFresh(e.target.checked);
+                  setKey(crypto.randomUUID());
+                }}
+              />
+              Start fresh instead of continuing an interrupted audit with the same
+              scope and profile
+            </label>
+          )}
+          {pinnable && (
+            <label>
+              Vulnerable revision (optional)
+              <input
+                value={sourceRef}
+                onChange={(e) => {
+                  setSourceRef(e.target.value);
+                  setKey(crypto.randomUUID());
+                }}
+                placeholder="Tag, branch, or commit"
+              />
+              <small>
+                Leave empty to pin the newest release the record still reports as
+                affected. The current checkout already contains the fix.
+              </small>
             </label>
           )}
           {!valid && (

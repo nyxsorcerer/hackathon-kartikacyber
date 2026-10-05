@@ -147,6 +147,7 @@ class FixtureBroker:
         files=None,
         policy=None,
         limits=None,
+        build=False,
     ):
         call = {
             "token": token,
@@ -156,6 +157,8 @@ class FixtureBroker:
             "schema": schema,
             "files": files or {},
             "policy": policy,
+            "limits": limits,
+            "build": build,
         }
         self.calls.append(call)
         result, outputs = self.handler(call) if self.handler else (self.result, self.outputs)

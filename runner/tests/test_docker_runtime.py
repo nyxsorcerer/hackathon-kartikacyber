@@ -8,7 +8,7 @@ import threading
 import uuid
 import pytest
 from numen_runner.contracts import RunRequest
-from numen_runner.engine import DockerEngine, RuntimeFailure, LABEL, INSTANCE
+from numen_runner.engine import DockerEngine, RuntimeFailure, LABEL, INSTANCE, VERSION
 
 pytestmark = pytest.mark.skipif(os.getenv("NUMEN_DOCKER_TESTS") != "1", reason="explicit Docker Engine verification only")
 
@@ -350,3 +350,54 @@ def test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed(
         wrapper.available=True
         if run_id:
             engine.cleanup(run_id)
+
+
+def test_build_run_gets_a_private_daemon_and_a_writable_nonroot_workspace(engine):
+    run_id = str(uuid.uuid4())
+    job = RunRequest(attempt_token=run_id, kind="agent", build=True,
+                     profile={"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}})
+    labels = {LABEL:run_id, INSTANCE:engine.instance}
+    try:
+        network = engine.client.networks.create("numen-job-" + run_id, internal=True, labels=labels)
+        engine.start_build_daemon(run_id, job, network, labels)
+        spec = engine.spec(job, network, labels)
+        # The workspace is disk backed for a build run, and the workload itself stays unprivileged.
+        assert "/workspace" not in spec["tmpfs"] and spec["read_only"] and spec["user"] == "10001:10001"
+        assert spec["cap_drop"] == ["ALL"] and "no-new-privileges:true" in spec["security_opt"]
+        workspace = engine.client.volumes.create("numen-workspace-" + run_id, labels=labels)
+        observed = engine.client.containers.run(
+            "numen-codex:" + VERSION,
+            ["sh","-c","id -u; git --version >/dev/null && echo git-ok; test -e /var/run/docker.sock && echo SOCKET || echo no-host-socket; "
+                       "touch /workspace/writable && echo workspace-writable; docker run --rm alpine:3.20 echo nested-ok"],
+            environment={"DOCKER_HOST":"tcp://docker:2375"}, network=network.name,
+            volumes={workspace.name:{"bind":"/workspace","mode":"rw"}}, user="10001:10001",
+            labels=labels, remove=True)
+        assert observed.decode().split() == ["10001","git-ok","no-host-socket","workspace-writable","nested-ok"]
+    finally:
+        engine.cleanup(run_id)
+        assert not engine.client.containers.list(all=True,filters={"label":f"{LABEL}={run_id}"})
+        assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})
+        assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
+
+
+def test_build_agent_run_wires_the_daemon_and_workspace_before_the_provider_step(engine):
+    run_id = str(uuid.uuid4())
+    job = RunRequest(attempt_token=run_id, kind="agent", build=True, limits={"timeout_seconds":120},
+                     profile={"agent":"codex","provider_id":"openai","model_id":"m",
+                              "operation":"cve_analysis","credential":{"api_key":"fixture-key-no-real-access"}})
+    events = []
+    try:
+        # The run cannot reach a provider with a fixture credential; its capability wiring still must hold.
+        with pytest.raises(RuntimeFailure):
+            engine.run(run_id, job, lambda: False, events.append)
+        assert any(e["type"] == "build_daemon_started" for e in events), events
+        workload = next(c for c in engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})
+                        if c.image.tags and c.image.tags[0].startswith("numen-codex"))
+        assert "DOCKER_HOST=tcp://docker:2375" in workload.attrs["Config"]["Env"]
+        workspace = [m for m in workload.attrs["Mounts"] if m["Destination"] == "/workspace"]
+        assert workspace and workspace[0]["Type"] == "volume" and workspace[0]["RW"]
+        assert workload.attrs["HostConfig"]["ReadonlyRootfs"] and workload.attrs["HostConfig"]["CapDrop"] == ["ALL"]
+        assert not any(m["Source"] == "/var/run/docker.sock" for m in workload.attrs["Mounts"])
+    finally:
+        engine.cleanup(run_id)
+        assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})

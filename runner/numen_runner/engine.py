@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 import docker
-from .contracts import PROVIDERS, decode_file, input_files
+from .contracts import BUILD_HOSTS, PROVIDERS, decode_file, input_files
 
 LABEL = "org.pruferva.numen.run"
 INSTANCE = "org.pruferva.numen.instance"
@@ -128,7 +128,7 @@ class DockerEngine:
 
     def spec(self, request, network, labels):
         b = request.bounds
-        return {"user":"10001:10001", "read_only":True, "cap_drop":["ALL"], "security_opt":["no-new-privileges:true"],
+        spec = {"user":"10001:10001", "read_only":True, "cap_drop":["ALL"], "security_opt":["no-new-privileges:true"],
                 "mem_limit":f"{int(b['memory_mb'])}m", "memswap_limit":f"{int(b['memory_mb'])}m",
                 "nano_cpus":int(b["cpus"]*1e9), "pids_limit":int(b["pids"]), "network":network.name,
                 "tmpfs":{"/workspace":f"rw,nosuid,nodev,size={int(b['input_bytes']+b['output_bytes']+32*1024*1024)},uid=10001,gid=10001,mode=0700",
@@ -136,6 +136,38 @@ class DockerEngine:
                          "/tmp":"rw,nosuid,nodev,size=33554432,uid=10001,gid=10001,mode=1777"},
                 "labels":labels, "log_config":docker.types.LogConfig(type="json-file",config={"max-size":"16m","max-file":"1"}),
                 "ulimits":[docker.types.Ulimit(name="nofile",soft=256,hard=256)], "use_config_proxy":False, "detach":True}
+        if request.build:
+            # A checkout with history and installed dependencies does not fit a memory-backed
+            # workspace, and dependency installers exceed the analysis file/process budget.
+            spec["tmpfs"].pop("/workspace")
+            spec["tmpfs"]["/home/job"] = "rw,nosuid,nodev,size=1073741824,uid=10001,gid=10001,mode=0700"
+            spec["tmpfs"]["/tmp"] = "rw,nosuid,nodev,size=1073741824,uid=10001,gid=10001,mode=1777"
+            spec["ulimits"] = [docker.types.Ulimit(name="nofile",soft=4096,hard=4096)]
+        return spec
+
+    def start_build_daemon(self, run_id, request, job_network, labels):
+        """A per-run rootless Docker daemon the agent drives; the host Engine socket is never shared."""
+        egress = self.client.networks.create("numen-build-" + run_id, labels=labels)
+        b = request.bounds
+        daemon = self.client.containers.create(
+            "numen-dind:" + VERSION, command=["--host=tcp://0.0.0.0:2375"],
+            # ponytail: privileged is what nested containers actually need on Engine 20.10 without
+            # cgroup delegation; the rootless image still runs its daemon unprivileged inside.
+            privileged=True, environment={"DOCKER_TLS_CERTDIR":""}, network=egress.name,
+            mem_limit=f"{int(b['memory_mb'])}m", nano_cpus=int(b["cpus"]*1e9), labels=labels, detach=True,
+            log_config=docker.types.LogConfig(type="json-file",config={"max-size":"16m","max-file":"1"}),
+            use_config_proxy=False)
+        job_network.connect(daemon, aliases=["docker"])
+        daemon.start()
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            daemon.reload()
+            if daemon.status in {"exited","dead"}:
+                raise RuntimeFailure("build_daemon_failed", "The private build daemon stopped before it was ready.")
+            if b"API listen on [::]:2375" in daemon.logs(stdout=False, stderr=True):
+                return daemon
+            time.sleep(0.5)
+        raise RuntimeFailure("build_daemon_failed", "The private build daemon did not become ready.")
 
     def run(self, run_id, request, cancelled, event, login_input=None):
         timeout = request.bounds["timeout_seconds"]
@@ -150,7 +182,8 @@ class DockerEngine:
         kind = request.kind
         environment = {"HOME":"/home/job","PATH":"/opt/numen/node_modules/.bin:/opt/runner/.venv/bin:/usr/local/bin:/usr/bin:/bin"}
         if kind in {"agent","capabilities","account_login","probe"}:
-            config = {"provider_hosts":PROVIDERS.get(profile["provider_id"], []) if kind != "probe" else []}
+            config = {"provider_hosts":(PROVIDERS.get(profile["provider_id"], []) if kind != "probe" else [])
+                                       + (BUILD_HOSTS if request.build else [])}
             if request.target_policy:
                 policy = dict(request.target_policy)
                 # An explicit internal asset exception never authorizes application/control subnets.
@@ -175,7 +208,7 @@ class DockerEngine:
         if kind == "lab":
             lab_image = self.build_lab(run_id, request, cancelled, event)
             app_spec = self.spec(request, job_network, labels)
-            app_spec["tmpfs"].pop("/workspace")
+            app_spec["tmpfs"].pop("/workspace", None)
             application = self.client.containers.create(lab_image, **app_spec)
             job_network.disconnect(application)
             job_network.connect(application, aliases=["application"])
@@ -185,6 +218,17 @@ class DockerEngine:
         input_volume = self.materialize_inputs(run_id, request, labels)
         spec = self.spec(request, job_network, labels)
         spec["volumes"] = {input_volume.name:{"bind":"/workspace/inputs","mode":"ro"}}
+        if request.build:
+            daemon = self.start_build_daemon(run_id, request, job_network, labels)
+            environment["DOCKER_HOST"] = "tcp://docker:2375"
+            # The agent's own workspace is disk backed so a full checkout and its dependencies fit.
+            # Image ownership of /workspace seeds the fresh volume, keeping the workload nonroot.
+            # ponytail: volume and daemon storage are bounded only by the run's lifetime; add a
+            # quota-backed driver if a build run ever fills the Engine's disk.
+            workspace = self.client.volumes.create("numen-workspace-" + run_id, labels=labels)
+            spec["volumes"][workspace.name] = {"bind":"/workspace","mode":"rw"}
+            event({"type":"build_daemon_started","message":"Private build daemon ready at tcp://docker:2375.",
+                   "daemon_image":self.client.images.get("numen-dind:" + VERSION).id, "daemon_id":daemon.id})
         if kind == "agent" and profile["agent"] == "codex":
             policy = json.loads((Path(__file__).parents[1] / "seccomp-codex.json").read_text())
             spec["security_opt"].append("seccomp=" + json.dumps(policy, separators=(",", ":")))

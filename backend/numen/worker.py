@@ -20,7 +20,7 @@ from .models import (
     now,
 )
 from .security import DomainError, Vault
-from .queue import ExecutionContext, claim
+from .queue import ExecutionContext, claim, runtime_phases, stop_runs
 from .workflows import Workflows, all_secrets
 from .domain import event
 
@@ -90,35 +90,17 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
         with factory() as db:
             row = db.get(Job, ident)
             owned = row and row.attempt_token == token
-            run_id = row.broker_run_id if owned else None
             attempt = db.get(JobAttempt, token)
-            phase_token = attempt.data.get("runtime_attempt_token") if attempt else None
+            # Concurrent phases may each own a run; all of them must stop before a terminal state.
+            phases = runtime_phases(attempt, row.broker_run_id) if owned else {}
             terminal_target = (
                 "cancelled"
                 if (owned and row.status == "cancelling")
                 or error["code"] in ("cancelled", "lease_lost")
                 else "failed"
             )
-        stopped = run_id is None and phase_token is None
-        if owned and phase_token and not run_id:
-            try:
-                found = broker.lookup_attempt(phase_token)
-                if found:
-                    run_id = found["run_id"]
-                else:
-                    stopped = True  # Positive broker absence proof, not an HTTP error.
-            except DomainError:
-                stopped = False
-        if owned and run_id:
-            try:
-                broker.cancel(run_id)
-                stopped = broker.request("GET", f"/internal/runs/{run_id}").get("status") in (
-                    "cancelled",
-                    "failed",
-                    "succeeded",
-                )
-            except DomainError:
-                stopped = False
+        stopped, runs = stop_runs(broker, phases)
+        run_id = runs[-1] if runs else None
         with factory.begin() as db:
             row = db.scalar(select(Job).where(Job.id == ident).with_for_update())
             if row and row.attempt_token == token and row.status in ("running", "cancelling"):
@@ -136,7 +118,11 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                     attempt.status = row.status
                     if not stopped:
                         attempt.data = {**attempt.data, "pending_terminal_status": terminal_target}
-                partial_output_retained = False
+                partial_output_retained = bool(
+                    row.kind in ("cve_analysis", "finding_artifacts")
+                    and row.result
+                    and row.result.get("artifact_revision")
+                )
                 if (
                     row.program_id
                     and row.kind == "source_check"

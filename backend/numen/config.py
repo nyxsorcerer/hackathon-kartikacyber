@@ -20,6 +20,7 @@ class Config:
     monitor_interval_days: int | None = None
     test_mode: bool = False
     worker_concurrency: int = 3
+    audit_concurrency: int = 3
 
     @classmethod
     def from_env(cls):
@@ -35,4 +36,5 @@ class Config:
             monitor_interval_days=int(days) if days else None,
             test_mode=os.getenv("NUMEN_TEST_MODE") == "1",
             worker_concurrency=int(os.getenv("NUMEN_WORKER_CONCURRENCY", "3")),
+            audit_concurrency=int(os.getenv("NUMEN_AUDIT_CONCURRENCY", "3")),
         )

@@ -603,7 +603,11 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 db,
                 "audit_context",
                 row,
-                {"focus": body.focus, "max_functions": body.max_functions},
+                {
+                    "focus": body.focus,
+                    "max_functions": body.max_functions,
+                    **({"fresh": True} if body.fresh else {}),
+                },
                 body.profile.model_dump() if body.profile else None,
                 key,
             )
@@ -648,7 +652,13 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         program, cve, link = program_cve(db, ident, cve_id)
         return accepted(
             domain.queue_cve(
-                db, program, cve, link, body.profile.model_dump() if body.profile else None, key
+                db,
+                program,
+                cve,
+                link,
+                body.profile.model_dump() if body.profile else None,
+                key,
+                body.source_ref,
             )
         )
 
@@ -809,7 +819,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 db,
                 "finding_artifacts",
                 domain.get(db, Program, row.program_id),
-                {"finding_id": row.id},
+                # None resolves the newest still-affected release when the job runs.
+                {"finding_id": row.id, "source_ref": body.source_ref},
                 body.profile.model_dump() if body.profile else None,
                 key,
             )

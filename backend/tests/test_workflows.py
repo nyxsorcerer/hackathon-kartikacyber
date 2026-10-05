@@ -598,6 +598,163 @@ def test_audit_function_limit_is_configurable_and_records_reach_synthesis_as_a_f
         assert response.status_code == 422
 
 
+def audit_setup(system, tmp_path, monkeypatch, count):
+    app, client, _ = system
+    connection(app)
+    p = program(client)
+    source_snapshot(app, p["id"])
+    skill = tmp_path / "skill"
+    skill.mkdir()
+    (skill / "SKILL.md").write_text("Analyze functions")
+    monkeypatch.setenv("NUMEN_SKILL_ROOT", str(skill))
+    units = [{"id": f"F{i}", "path": "main.py", "name": f"parse{i}"} for i in range(count)]
+
+    def handler(call):
+        if call["token"].endswith(":orientation"):
+            return {"overview": "Map", "functions": units}, {}
+        if ":function:" in call["token"]:
+            return {
+                "summary": "Converts input",
+                "evidence": [{"path": "main.py"}],
+                "open_questions": [],
+            }, {"function.md": b"# parse"}
+        return {"summary": "System model", "open_questions": []}, {
+            "audit-context/DOSSIER.md": b"# Dossier"
+        }
+
+    queued = client.post(f"/api/programs/{p['id']}/audit-contexts", json={}).json()["job_id"]
+    return queued, handler
+
+
+def test_audit_analyzes_functions_concurrently_and_reports_progress(
+    system, tmp_path, monkeypatch
+):
+    import threading
+
+    app, client, config = system
+    queued, handler = audit_setup(system, tmp_path, monkeypatch, 2)
+    # Each function run waits until the other is in flight; sequential analysis would time out.
+    barrier = threading.Barrier(2, timeout=10)
+
+    class ConcurrentBroker(FixtureBroker):
+        def wait(self, run_id, heartbeat, progress, deadline=900):
+            if ":function:" in run_id:
+                barrier.wait()
+            return super().wait(run_id, heartbeat, progress, deadline)
+
+    run_once(config, app.state.factory, ConcurrentBroker(handler=handler))
+    job = client.get(f"/api/jobs/{queued}").json()
+    assert job["status"] == "succeeded", job
+    assert job["progress"] == {"stage": "synthesis", "status": "2 of 2 analysed, 0 failed"}
+    with app.state.factory() as db:
+        attempt = db.scalar(select(JobAttempt).where(JobAttempt.job_id == queued))
+        assert attempt.data["runtime_phases"] == {}
+
+
+def test_audit_failure_cancels_every_in_flight_function_run(system, tmp_path, monkeypatch):
+    import threading
+    import time
+
+    from numen.security import DomainError
+
+    app, client, config = system
+    queued, handler = audit_setup(system, tmp_path, monkeypatch, 2)
+    both_started = threading.Barrier(2, timeout=10)
+
+    class FailingBroker(FixtureBroker):
+        def wait(self, run_id, heartbeat, progress, deadline=900):
+            if run_id.endswith(":function:1"):
+                both_started.wait()
+                raise DomainError("broker_unavailable", "Execution broker is unavailable", 503)
+            if run_id.endswith(":function:0"):
+                both_started.wait()
+                # Still working until the attempt's failure handling cancels this run.
+                while self.states[run_id]["status"] != "cancelled":
+                    time.sleep(0.02)
+                raise DomainError("cancelled", "Runtime cancelled", 409)
+            return super().wait(run_id, heartbeat, progress, deadline)
+
+    broker = FailingBroker(handler=handler)
+    run_once(config, app.state.factory, broker)
+    job = client.get(f"/api/jobs/{queued}").json()
+    assert job["status"] == "failed" and job["error"]["code"] == "broker_unavailable", job
+    in_flight = next(c["token"] for c in broker.calls if c["token"].endswith(":function:0"))
+    assert broker.states[in_flight]["status"] == "cancelled"
+
+
+def test_interrupted_audit_continues_without_repeating_work(system, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from numen.security import DomainError
+
+    app, client, config = system
+    queued, handler = audit_setup(system, tmp_path, monkeypatch, 2)
+    program_id = client.get(f"/api/jobs/{queued}").json()["program_id"]
+
+    class InterruptedBroker(FixtureBroker):
+        def wait(self, run_id, heartbeat, progress, deadline=900):
+            if run_id.endswith(":function:1"):
+                raise DomainError("broker_unavailable", "Execution broker is unavailable", 503)
+            return super().wait(run_id, heartbeat, progress, deadline)
+
+    # One function at a time, so function 0 is checkpointed before function 1 fails.
+    sequential = replace(config, audit_concurrency=1)
+    run_once(sequential, app.state.factory, InterruptedBroker(handler=handler))
+    assert client.get(f"/api/jobs/{queued}").json()["status"] == "failed"
+
+    retried = client.post(f"/api/jobs/{queued}/retry").json()["job_id"]
+    broker = FixtureBroker(handler=handler)
+    run_once(config, app.state.factory, broker)
+    assert client.get(f"/api/jobs/{retried}").json()["status"] == "succeeded"
+    # Orientation and function 0 are reused; only the unfinished function and synthesis run.
+    assert [call["token"].split(":", 1)[1] for call in broker.calls] == ["function:1", "synthesis"]
+    contexts = client.get(f"/api/programs/{program_id}/audit-contexts").json()["items"]
+    latest, first = contexts[0], contexts[1]
+    assert latest["job_id"] == retried and latest["status"] in ("complete", "partial")
+    assert latest["coverage"]["resumed_from"] == first["id"]
+    assert latest["coverage"]["reused_functions"] == 1 and latest["coverage"]["completed"] == 2
+    synthesis = next(call for call in broker.calls if call["token"].endswith(":synthesis"))
+    assert len(json.loads(synthesis["files"]["audit-functions.json"])) == 2
+
+    # A continued checkpoint is not reused again; fresh or a different scope starts over too.
+    for body in ({}, {"fresh": True}, {"max_functions": 5}):
+        client.post(f"/api/programs/{program_id}/audit-contexts", json=body)
+        restart = FixtureBroker(handler=handler)
+        run_once(config, app.state.factory, restart)
+        assert restart.calls[0]["token"].endswith(":orientation"), body
+
+
+def test_stop_runs_cancels_every_phase_and_requires_terminal_proof():
+    from types import SimpleNamespace
+
+    from numen.queue import runtime_phases, stop_runs
+
+    class Broker:
+        def __init__(self):
+            self.cancelled, self.status = [], {"r1": "cancelled", "r2": "running"}
+
+        def lookup_attempt(self, phase):
+            return {"run_id": "r2"} if phase == "p2" else None  # p3 provably never started
+
+        def cancel(self, run_id):
+            self.cancelled.append(run_id)
+
+        def request(self, method, path):
+            return {"status": self.status[path.rsplit("/", 1)[-1]]}
+
+    broker = Broker()
+    assert stop_runs(broker, {"p1": "r1", "p2": None, "p3": None}) == (False, ["r1", "r2"])
+    assert broker.cancelled == ["r1", "r2"]
+    broker.status["r2"] = "cancelled"
+    assert stop_runs(broker, {"p1": "r1", "p2": None}) == (True, ["r1", "r2"])
+    # Attempts recorded before concurrent phases keep their single phase and run.
+    assert runtime_phases(SimpleNamespace(data={"runtime_attempt_token": "p1"}), "r1") == {
+        "p1": "r1"
+    }
+    finished = SimpleNamespace(data={"runtime_phases": {}, "runtime_attempt_token": "p1"})
+    assert runtime_phases(finished, "r1") == {}
+
+
 def test_capabilities_exact_runtime_native_ingress_and_secret_redaction(system):
     app, client, config = system
     account = client.post(

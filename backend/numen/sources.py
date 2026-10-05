@@ -15,10 +15,12 @@ from urllib.parse import quote
 
 import httpx
 from .artifacts import MAX_SET, MAX_FILE, MAX_SOURCE_FILES
-from .cves import cpe_identity
+from .cves import compare_versions, cpe_identity
 from .models import now, utc
 from .schemas import safe_path
 from .security import DomainError, retry_delay
+
+TAG_PAGES = 4  # Bounded newest-first tag catalog; vendor release histories are far shorter.
 
 # Binary media is not source evidence; omitting it keeps CMS-sized snapshots within bounds.
 MEDIA_SUFFIXES = frozenset(
@@ -298,6 +300,56 @@ class Sources:
                     )
                 files[relative] = archive.extractfile(member).read()
         return files
+
+    def github_tags(self, program):
+        """Bounded newest-first tag catalog with each tag's immutable commit."""
+        repo = program.source_url.removeprefix("https://github.com/")
+        headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+        tags = []
+        for page in range(1, TAG_PAGES + 1):
+            batch = self.get(
+                f"{self.github}/repos/{repo}/tags", {"per_page": 100, "page": page}, headers
+            ).json()
+            if not isinstance(batch, list):
+                raise DomainError("invalid_source_response", "GitHub did not return a tag list", 502)
+            tags += [
+                (tag["name"], tag["commit"]["sha"])
+                for tag in batch
+                if tag.get("name") and (tag.get("commit") or {}).get("sha")
+            ]
+            if len(batch) < 100:
+                break
+        return tags
+
+    def vulnerable_tag(self, program, bound, inclusive, scheme):
+        """Newest release tag a record still reports as affected, pinned to its own commit."""
+        best = None
+        for name, sha in self.github_tags(program):
+            compared = compare_versions(name, bound, scheme)
+            if compared is None or compared > 0 or (compared == 0 and not inclusive):
+                continue
+            if best is None or (compare_versions(name, best["version"], scheme) or 0) > 0:
+                best = {"version": name, "source_ref": sha}
+        return best
+
+    def commit_ref(self, program, ref):
+        """Resolve a tag, branch or abbreviated revision to its immutable commit."""
+        repo = program.source_url.removeprefix("https://github.com/")
+        headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+        try:
+            data = self.get(
+                f"{self.github}/repos/{repo}/commits/{quote(ref, safe='/')}", headers=headers
+            ).json()
+        except DomainError as exc:
+            if exc.code == "upstream_error" and "404" in exc.message:
+                raise DomainError(
+                    "unknown_source_ref", f"Source has no revision {ref}", 422
+                ) from exc
+            raise
+        sha = data.get("sha") if isinstance(data, dict) else None
+        if not sha:
+            raise DomainError("invalid_source_response", "GitHub did not return a commit", 502)
+        return sha
 
     def svn(self, *args):
         self.heartbeat()

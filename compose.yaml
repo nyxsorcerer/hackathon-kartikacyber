@@ -70,6 +70,7 @@ services:
     environment:
       <<: *app-env
       NUMEN_WORKER_CONCURRENCY: ${NUMEN_WORKER_CONCURRENCY:-3}
+      NUMEN_AUDIT_CONCURRENCY: ${NUMEN_AUDIT_CONCURRENCY:-3}
     networks: [application, control]
     depends_on:
       db:
@@ -137,6 +138,12 @@ services:
     profiles: [images]
     build: {context: ., dockerfile: Dockerfile.runner, target: codex}
     command: [codex, --version]
+    network_mode: none
+  dind-image:
+    image: numen-dind:0.1.0
+    profiles: [images]
+    build: {context: ., dockerfile: Dockerfile.runner, target: dind}
+    entrypoint: [docker, --version]
     network_mode: none
   probe-image:
     image: numen-probe:0.1.0

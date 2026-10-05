@@ -6,7 +6,7 @@ WRITE_OPERATIONS = {"commit_analysis", "cve_analysis", "version_recipe", "findin
 PI_BASE = ["pi", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"]
 
 
-def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/workspace/final.json"):
+def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/workspace/final.json", build=False):
     agent, model, effort = profile["agent"], profile["model_id"], profile.get("reasoning_effort")
     write = profile.get("operation") in WRITE_OPERATIONS
     if agent == "codex":
@@ -14,13 +14,18 @@ def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/work
                 "--model", model, "--output-schema", schema_path, "--output-last-message", output_path,
                 "-c", 'default_permissions="numen"', "-c", 'permissions.numen.extends=' + json.dumps(":workspace" if write else ":read-only"),
                 "-c", 'permissions.numen.filesystem./home/job="deny"', "-C", "/workspace", "-c", 'approval_policy="never"',
-                "-c", "project_doc_max_bytes=0", "-c", 'shell_environment_policy.inherit="all"', "-c", 'shell_environment_policy.include_only=["PATH","HOME","NUMEN_FETCH_URL","NUMEN_FETCH_TOKEN"]',
-                "-c", "sandbox_workspace_write.network_access=" + ("true" if profile.get("operation") == "version_recipe" else "false")]
+                "-c", "project_doc_max_bytes=0", "-c", 'shell_environment_policy.inherit="all"',
+                "-c", 'shell_environment_policy.include_only=' + json.dumps(
+                    ["PATH","HOME","NUMEN_FETCH_URL","NUMEN_FETCH_TOKEN"]
+                    + (["DOCKER_HOST","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY"] if build else [])),
+                "-c", "sandbox_workspace_write.network_access=" + ("true" if build or profile.get("operation") == "version_recipe" else "false")]
         if effort:
             args += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
         return args + ["-"]
     if agent == "claude":
         tools = "Read,Grep,Glob,Write,Edit" if write else "Read,Grep,Glob"
+        if build:
+            tools += ",Bash"
         allowed_tools = tools
         target_mcp = {"mcpServers":{}}
         if profile.get("operation") == "version_recipe":
@@ -35,7 +40,9 @@ def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/work
             args += ["--effort", effort]
         return args
     if agent == "pi":
-        args = pi_argv(profile) + ["--no-builtin-tools", "--extension", "/opt/numen/pi-tools.ts", "--tools", "numen_read,numen_list,numen_write,target_fetch" if write else "numen_read,numen_list"]
+        tools = "numen_read,numen_list,numen_write,target_fetch" if write else "numen_read,numen_list"
+        args = pi_argv(profile) + ["--no-builtin-tools", "--extension", "/opt/numen/pi-tools.ts",
+                                   "--tools", tools + ",numen_shell" if build else tools]
         if effort:
             args += ["--thinking", effort]
         return args

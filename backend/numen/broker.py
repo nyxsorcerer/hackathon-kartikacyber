@@ -53,6 +53,7 @@ class Broker:
         files=None,
         policy=None,
         limits=None,
+        build=False,
     ):
         files, source = dict(files or {}), {}
         # Agent source evidence travels as one compressed archive the runner expands read-only.
@@ -93,6 +94,9 @@ class Broker:
         }
         if kind == "agent":
             del defaults["timeout_seconds"]  # Agent runs have no deadline; operators cancel them.
+        if build:
+            # A build run compiles, installs and runs a real application in its own workspace.
+            defaults.update({"memory_mb": 6144, "cpus": 2, "pids": 2048, "output_bytes": 64 * 1024 * 1024})
         return self.request(
             "POST",
             "/internal/runs",
@@ -105,6 +109,7 @@ class Broker:
                 "inputs": inputs,
                 "limits": limits or defaults,
                 "target_policy": policy,
+                "build": build,
             },
         )
 

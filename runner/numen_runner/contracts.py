@@ -12,6 +12,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 MAXIMA = {"timeout_seconds": 1800, "memory_mb": 2048, "cpus": 2.0, "pids": 128,
           "output_bytes": 8 * 1024 * 1024, "input_bytes": 32 * 1024 * 1024}
+# A build run compiles and runs a real application, so it needs process, memory and output room
+# that ordinary read-only analysis never does. Its ceiling applies only with build enabled.
+BUILD_MAXIMA = {**MAXIMA, "timeout_seconds": 10800, "memory_mb": 8192, "cpus": 4.0, "pids": 2048,
+                "output_bytes": 64 * 1024 * 1024}
+BUILD_OPERATIONS = {"cve_analysis"}
+# CONNECT destinations the build agent's own shell reaches through the credential-free proxy.
+# The build daemon has its own egress; these are for the agent's clone and dependency reads.
+BUILD_HOSTS = ["github.com", "codeload.github.com", "api.github.com", "objects.githubusercontent.com",
+               "raw.githubusercontent.com", "registry.npmjs.org", "packagist.org", "repo.packagist.org",
+               "getcomposer.org", "pypi.org", "files.pythonhosted.org", "registry-1.docker.io",
+               "index.docker.io", "auth.docker.io", "production.cloudflare.docker.com"]
 # Expanded bounds for an agent's compressed source archive input.
 ARCHIVE_FILES, ARCHIVE_BYTES = 20000, 64 * 1024 * 1024
 PROVIDERS = {"openai": ["api.openai.com", "chatgpt.com", "auth.openai.com"],
@@ -106,15 +117,18 @@ class RunRequest(BaseModel):
     inputs: list[InputFile] = Field(default_factory=list, max_length=512)
     limits: dict[str, float] = Field(default_factory=dict)
     target_policy: dict[str, Any] | None = None
+    # Grants a private build daemon, a writable workspace and dependency egress for this run.
+    build: bool = False
 
     @model_validator(mode="after")
     def validate_request(self):
-        if set(self.limits) - set(MAXIMA):
+        maxima = BUILD_MAXIMA if self.build else MAXIMA
+        if set(self.limits) - set(maxima):
             raise ValueError("unknown execution limit")
         for key, value in self.limits.items():
             if key != "cpus" and not value.is_integer():
                 raise ValueError(f"{key} must be a whole number")
-            if not 0 < value <= MAXIMA[key]:
+            if not 0 < value <= maxima[key]:
                 raise ValueError(f"{key} must lower the broker maximum")
         schema_text = __import__("json").dumps(self.output_schema)
         if len(schema_text.encode()) > 65536:
@@ -143,6 +157,8 @@ class RunRequest(BaseModel):
                 seen.add(path)
         if total > self.bounds["input_bytes"]:
             raise ValueError("aggregate input byte limit exceeded")
+        if self.build and (self.kind != "agent" or self.profile.operation not in BUILD_OPERATIONS):
+            raise ValueError("build runs are available only to supported agent operations")
         if self.kind in ("agent", "capabilities", "account_login"):
             p = self.profile
             if p.provider_id not in PROVIDERS:
@@ -161,7 +177,7 @@ class RunRequest(BaseModel):
 
     @property
     def bounds(self):
-        bounds = {k: self.limits.get(k, v) for k, v in MAXIMA.items()}
+        bounds = {k: self.limits.get(k, v) for k, v in (BUILD_MAXIMA if self.build else MAXIMA).items()}
         if self.kind == "agent" and "timeout_seconds" not in self.limits:
             bounds["timeout_seconds"] = None  # Agent runs have no deadline unless one is requested.
         return bounds

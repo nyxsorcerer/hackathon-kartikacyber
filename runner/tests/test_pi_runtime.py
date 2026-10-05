@@ -161,7 +161,7 @@ await mkdir('/workspace/inputs',{recursive:true});await mkdir('/workspace/output
 await writeFile('/workspace/inputs/source.txt','source evidence');await writeFile('/home/job/private.txt','fixture private marker');
 let tools=[];register({registerTool:t=>tools.push(t)});
 async function call(name,args){const tool=tools.find(t=>t.name===name);return tool.execute('1',validateToolCall(tools,{id:'1',name,arguments:args}));}
-const denied=[];for(const [name,args] of [['numen_read',{path:'/home/job/private.txt'}],['numen_write',{path:'inputs/source.txt',content:'mutated'}],['numen_read',{path:'inputs/../../home/job/private.txt'}],['target_fetch',{url:'https://example.invalid',method:'POST'}]]){try{await call(name,args);denied.push(false);}catch{denied.push(true);}}
+const denied=[];for(const [name,args] of [['numen_read',{path:'/home/job/private.txt'}],['numen_write',{path:'inputs/source.txt',content:'mutated'}],['numen_read',{path:'inputs/../../home/job/private.txt'}],['target_fetch',{url:'https://example.invalid',method:'POST'}],['numen_shell',{command:'id'}]]){try{await call(name,args);denied.push(false);}catch{denied.push(true);}}
 await symlink('/home/job/private.txt','/workspace/inputs/escape.txt');try{await call('numen_read',{path:'inputs/escape.txt'});denied.push(false);}catch{denied.push(true);}
 const read=await call('numen_read',{path:'inputs/source.txt'});await call('numen_write',{path:'outputs/report.md',content:'# Artifact'});
 console.log(JSON.stringify({denied,read:read.content[0].text,source:await readFile('/workspace/inputs/source.txt','utf8'),artifact:await readFile('/workspace/outputs/report.md','utf8'),tools:tools.map(t=>t.name)}));
@@ -170,7 +170,8 @@ console.log(JSON.stringify({denied,read:read.content[0].text,source:await readFi
     assert all(observed["denied"])
     assert observed["read"] == observed["source"] == "source evidence"
     assert observed["artifact"] == "# Artifact"
-    assert set(observed["tools"]) == {"numen_read", "numen_list", "numen_write", "target_fetch"}
+    # numen_shell is registered but refuses without a build capability, and only build runs enable it.
+    assert set(observed["tools"]) == {"numen_read", "numen_list", "numen_write", "target_fetch", "numen_shell"}
 
 
 @DOCKER

@@ -103,6 +103,10 @@ class ExecutionContext:
         self.secrets = []
         self.last_progress = None
         self.kind = job.kind
+        # Operation progress (e.g. audit function counts) shown in place of the runtime state.
+        self.operation = None
+        # Runtime phases of one attempt may run concurrently; their records share this lock.
+        self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._pulse, daemon=True)
 
     def _pulse(self):
@@ -155,8 +159,8 @@ class ExecutionContext:
             )
         return row
 
-    def set_run(self, run_id):
-        with self.factory.begin() as db:
+    def set_run(self, run_id, attempt_token=None):
+        with self.lock, self.factory.begin() as db:
             changed = db.execute(
                 update(Job)
                 .where(
@@ -169,6 +173,10 @@ class ExecutionContext:
                 raise DomainError(
                     "lease_lost", "Attempt lost ownership before execution could be recorded", 409
                 )
+            if attempt_token:
+                attempt = db.get(JobAttempt, self.token)
+                phases = {**attempt.data.get("runtime_phases", {}), attempt_token: run_id}
+                attempt.data = {**attempt.data, "runtime_phases": phases}
             db.add(
                 JobEvent(
                     job_id=self.job_id,
@@ -181,7 +189,8 @@ class ExecutionContext:
             )
 
     def set_phase(self, attempt_token):
-        with self.factory.begin() as db:
+        # Every unfinished phase stays recorded, so failure handling and recovery stop all runs.
+        with self.lock, self.factory.begin() as db:
             row = db.get(Job, self.job_id)
             if not row or row.attempt_token != self.token or row.status != "running":
                 raise DomainError(
@@ -189,7 +198,20 @@ class ExecutionContext:
                 )
             row.broker_run_id = None
             attempt = db.get(JobAttempt, self.token)
-            attempt.data = {**attempt.data, "runtime_attempt_token": attempt_token}
+            phases = {**attempt.data.get("runtime_phases", {}), attempt_token: None}
+            attempt.data = {
+                **attempt.data,
+                "runtime_attempt_token": attempt_token,
+                "runtime_phases": phases,
+            }
+
+    def end_phase(self, attempt_token):
+        with self.lock, self.factory.begin() as db:
+            attempt = db.get(JobAttempt, self.token)
+            if attempt:
+                phases = dict(attempt.data.get("runtime_phases", {}))
+                phases.pop(attempt_token, None)
+                attempt.data = {**attempt.data, "runtime_phases": phases}
 
     def progress(self, state):
         # Ordinary logs never pass arbitrary runtime output, prompts, or credentials into the UI.
@@ -204,13 +226,14 @@ class ExecutionContext:
         # Device-login events can arrive while the CLI's status and percentage stay unchanged.
         safe["login_instructions"] = instructions
         digest = str(safe)
-        if digest == self.last_progress:
-            return
-        self.last_progress = digest
+        with self.lock:
+            if digest == self.last_progress:
+                return
+            self.last_progress = digest
         with self.factory.begin() as db:
             row = db.get(Job, self.job_id)
             if row and row.attempt_token == self.token:
-                row.progress = {"status": state.get("status"), "stage": "runtime"}
+                row.progress = self.operation or {"status": state.get("status"), "stage": "runtime"}
                 execution = state.get("execution")
                 if isinstance(execution, dict):
                     execution = {
@@ -252,6 +275,34 @@ class ExecutionContext:
         self.callbacks.append(callback)
 
 
+def runtime_phases(attempt, run_id=None):
+    """Runtime phases of an attempt that may still own a run: phase token -> run id or None."""
+    data = attempt.data if attempt else {}
+    if "runtime_phases" in data:
+        return dict(data["runtime_phases"])
+    phase = data.get("runtime_attempt_token")  # Attempts recorded before concurrent phases.
+    return {phase: run_id} if phase else ({None: run_id} if run_id else {})
+
+
+def stop_runs(broker, phases):
+    """Cancel every phase's run. Stopped only when each is terminal or provably never started."""
+    stopped, runs = True, []
+    for phase, run_id in phases.items():
+        try:
+            if not run_id:
+                found = broker.lookup_attempt(phase) if phase else None
+                if not found:
+                    continue  # Positive broker absence proof, not an HTTP error.
+                run_id = found["run_id"]
+            runs.append(run_id)
+            broker.cancel(run_id)
+            status = broker.request("GET", f"/internal/runs/{run_id}").get("status")
+            stopped = stopped and status in ("cancelled", "failed", "succeeded")
+        except DomainError:
+            stopped = False
+    return stopped, runs
+
+
 def recover(factory, broker):
     with factory() as db:
         rows = list(
@@ -268,30 +319,18 @@ def recover(factory, broker):
                 (
                     row.id,
                     row.attempt_token,
-                    row.broker_run_id,
+                    runtime_phases(attempt, row.broker_run_id),
                     row.status,
-                    attempt.data.get("runtime_attempt_token") if attempt else None,
                     attempt.data.get("pending_terminal_status") if attempt else None,
                 )
             )
     recovered = 0
-    for ident, token, run_id, status, phase_token, pending_terminal in candidates:
-        if phase_token and not run_id:
-            try:
-                found = broker.lookup_attempt(phase_token)
-                if found:
-                    run_id = found["run_id"]
-            except DomainError:
-                continue
-        if run_id:
-            try:
-                broker.cancel(run_id)
-                state = broker.request("GET", f"/internal/runs/{run_id}")
-                if state.get("status") not in ("cancelled", "failed", "succeeded"):
-                    continue
-            except DomainError:
-                # Never issue a replacement while a former isolated run cannot be reconciled.
-                continue
+    for ident, token, phases, status, pending_terminal in candidates:
+        stopped, runs = stop_runs(broker, phases)
+        if not stopped:
+            # Never issue a replacement while a former isolated run cannot be reconciled.
+            continue
+        run_id = runs[-1] if runs else None
         with factory.begin() as db:
             row = db.scalar(select(Job).where(Job.id == ident).with_for_update())
             if not row or row.attempt_token != token or row.status != status:

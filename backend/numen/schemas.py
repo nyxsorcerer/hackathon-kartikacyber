@@ -224,6 +224,17 @@ class OperationInput(Strict):
     focus: str | None = Field(default=None, max_length=4000)
     # Audit context only: significant functions orientation may select, one agent run each.
     max_functions: int = Field(default=AUDIT_MAX_FUNCTIONS, ge=1, le=100)
+    # Audit context only: ignore an interrupted audit of the same request instead of continuing it.
+    fresh: bool = False
+    # CVE analysis and finding artifacts only: analyze this revision instead of the resolved
+    # affected release, for records whose vulnerable version cannot be ranked automatically.
+    source_ref: str | None = Field(default=None, max_length=200)
+
+    @field_validator("source_ref")
+    @classmethod
+    def revision(cls, value):
+        value = (value or "").strip()
+        return safe_path(value) if value else None
 
 
 class ReviewInput(Strict):

@@ -131,6 +131,14 @@ export function AnalysisHistory({
                 value={analysis}
                 label="Source evidence & full result"
               />
+              {analysis.result?.finding_id && (
+                <Link
+                  className="secondary button"
+                  to={`/findings/${encodeURIComponent(analysis.result.finding_id)}`}
+                >
+                  View finding artifacts
+                </Link>
+              )}
               {findingCategories.includes(category || "") && (
                 <Link
                   className="secondary button"

@@ -154,6 +154,59 @@ def compare_versions(a, b, scheme):
     return None
 
 
+def version_scheme(program):
+    return (
+        "php"
+        if program.source_kind == "wordpress"
+        else program.config.get("version_scheme", "unknown")
+    )
+
+
+def vulnerable_bound(program, cve):
+    """Highest version a record still reports as affected, for pinning vulnerable source."""
+    scheme, candidates = version_scheme(program), []
+    for entry in cve.raw.get("affected", []):
+        for data in entry.get("affectedData", []):
+            collection = data.get("repo") or data.get("collectionURL")
+            if collection and collection.rstrip("/") != (program.source_url or "").rstrip("/"):
+                continue
+            for version in data.get("versions", []):
+                if version.get("status") != "affected":
+                    continue
+                if version.get("lessThanOrEqual"):
+                    candidates.append((version["lessThanOrEqual"], True))
+                elif version.get("lessThan"):
+                    candidates.append((version["lessThan"], False))
+                elif version.get("version") not in (None, "", "*", "-"):
+                    candidates.append((version["version"], True))
+    selectors = program.config.get("cve_selectors", [])
+    for config in cve.raw.get("configurations", []):
+        if config.get("negate"):
+            continue
+        for node in config.get("nodes", []):
+            if node.get("negate"):
+                continue
+            for match in node.get("cpeMatch", []):
+                if not match.get("vulnerable") or not any(
+                    s.get("type") == "cpe" and cpe_matches(match.get("criteria", ""), s["value"])
+                    for s in selectors
+                ):
+                    continue
+                if match.get("versionEndIncluding"):
+                    candidates.append((match["versionEndIncluding"], True))
+                elif match.get("versionEndExcluding"):
+                    candidates.append((match["versionEndExcluding"], False))
+    best = None
+    for version, inclusive in candidates:
+        # An unorderable bound cannot rank releases, so it is not a usable pin.
+        if compare_versions(version, version, scheme) is None:
+            continue
+        compared = compare_versions(version, best[0], scheme) if best else 1
+        if compared is not None and (compared > 0 or (compared == 0 and inclusive)):
+            best = (version, inclusive)
+    return {"version": best[0], "inclusive": best[1]} if best else None
+
+
 def range_match(version, match, scheme):
     pieces = match.get("criteria", "").split(":")
     if len(pieces) < 6:
@@ -189,11 +242,7 @@ def applicability(program, cve, observation):
         or not observation.data.get("version")
     ):
         return "unknown"
-    scheme = (
-        "php"
-        if program.source_kind == "wordpress"
-        else program.config.get("version_scheme", "unknown")
-    )
+    scheme = version_scheme(program)
     values = []
     selectors = program.config.get("cve_selectors", [])
     for config in cve.raw.get("configurations", []):

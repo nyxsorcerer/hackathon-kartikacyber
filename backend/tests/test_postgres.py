@@ -135,6 +135,53 @@ def test_postgres_worker_slots_run_jobs_concurrently(postgres, monkeypatch):
         assert all(job.result["concurrent"] for job in jobs)
 
 
+def test_postgres_command_code_runs_share_their_native_connection(postgres):
+    from numen.security import Vault
+    from numen.workflows import Workflows
+
+    config, factory = postgres
+    config = replace(config, secret_key=Fernet.generate_key().decode())
+    vault = Vault(config.secret_key)
+    with factory.begin() as db:
+        account = Account(
+            label="cc",
+            provider="commandcode",
+            auth_type="native_oauth",
+            credential=vault.encrypt({"auth_json": {"commandcode": {"access": "synthetic"}}}),
+            data={},
+        )
+        db.add(account)
+        db.flush()
+        account_id = account.id
+        enqueue(db, "audit_context", create_program(db), {"source_generation": 1})
+    with factory.begin() as db:
+        job = claim(db, "worker")
+    # Both runs must be in flight at once; a lock held on the account row would time this out.
+    barrier = threading.Barrier(2, timeout=20)
+
+    class SharedBroker(FixtureBroker):
+        def wait(self, run_id, heartbeat, progress, deadline=900):
+            barrier.wait()
+            return super().wait(run_id, heartbeat, progress, deadline)
+
+    broker = SharedBroker(result={"summary": "ok"})
+    workflows = Workflows(config, vault, broker, ExecutionContext(factory, job, broker))
+    profile = {
+        "agent": "pi",
+        "auth_type": "native_oauth",
+        "connection_id": account_id,
+        "provider_id": "commandcode",
+        "model_id": "m",
+    }
+
+    def phase(i):
+        with factory() as db:
+            return workflows.run(db, job, "agent", dict(profile), suffix=f":function:{i}")[0]
+
+    with ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(phase, range(2))) == [{"summary": "ok"}, {"summary": "ok"}]
+
+
 def test_postgres_pending_login_returns_while_worker_holds_account_lock(postgres):
     config, factory = postgres
     url = make_url(config.database_url)

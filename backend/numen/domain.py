@@ -259,7 +259,7 @@ def submit_agent(db, operation, program, inputs=None, submitted=None, key=None):
     return enqueue(db, operation, program, job_input(program, **(inputs or {})), profile, key)
 
 
-def queue_cve(db, program, cve, link, submitted=None, key=None):
+def queue_cve(db, program, cve, link, submitted=None, key=None, source_ref=None):
     decision = cves.gate(program, cve, link)
     if not decision["eligible"]:
         raise DomainError("criteria_not_met", decision["eligibility_reason"], 422)
@@ -269,6 +269,8 @@ def queue_cve(db, program, cve, link, submitted=None, key=None):
         program,
         {
             "cve_id": cve.id,
+            # None resolves the newest still-affected release when the job runs.
+            "source_ref": source_ref,
             "gate_hash": cves.gate_hash(program, cve, link),
             "record_hash": cve.record_hash,
             "source_record": cve.raw,
