@@ -5,7 +5,7 @@ import io
 import tarfile
 import zlib
 from pathlib import PurePosixPath
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from jsonschema import Draft202012Validator
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -105,6 +105,19 @@ class Profile(BaseModel):
 class LoginInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     code: str = Field(repr=False, pattern="^" + LOGIN_CODE + "$")
+
+
+class SessionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["prompt", "keys", "hold", "release"]
+    text: str | None = Field(default=None, min_length=1, max_length=16000)
+    keys: list[Annotated[str, Field(pattern=r"^[a-z0-9+]{1,20}$")]] | None = Field(default=None, min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def complete(self):
+        if (self.action == "prompt") != (self.text is not None) or (self.action == "keys") != (self.keys is not None):
+            raise ValueError("session input does not match its action")
+        return self
 
 
 class RunRequest(BaseModel):

@@ -45,6 +45,7 @@ Job fields: `id`, `kind`, `program_id`, `status`, `progress`, `profile`, `create
 - `GET/POST /findings`; `GET/PATCH /findings/{id}`; `POST /findings/{id}/artifacts` multipart upload; `POST /findings/{id}/artifact-generations`; `POST /findings/{id}/lab-runs`.
 - `GET /artifacts/{id}/content`; `GET /findings/{id}/download` returns the complete bundle ZIP.
 - `GET /jobs`; `GET /jobs/{id}`; `GET /jobs/{id}/events`; `POST /jobs/{id}/cancel`; `POST /jobs/{id}/retry`.
+- `GET /jobs/{id}/session?run=` returns `{runs, run_id, agent, agent_status, screen, held}` for a running job's Herdr agent session (latest run by default); `POST /jobs/{id}/session` with `{run_id, action: "prompt"|"keys"|"hold"|"release", text?, keys?}` chats with or steers it. Only runs of the job's current attempt are reachable, so the application joins the `control` network.
 - `GET/PATCH /settings`: monitoring days, `default_profiles`, webhook enabled/masked/configured state, dashboard URL, optional integration-health fields. Webhook URL/key writes are write-only.
 - `GET/POST /accounts`; `PATCH/DELETE /accounts/{id}`; `POST /accounts/{id}/check`; `GET/POST /accounts/{id}/capabilities`; `POST /accounts/{id}/login`; `GET /accounts/{id}/login`.
 - Native login starts reuse the account's queued/running/cancelling login attempt. A conflicting credential operation returns retryable `account_busy` (409) promptly. Login status includes verification events while the attempt runs, even when its runtime progress percentage stays unchanged.

@@ -59,6 +59,8 @@ services:
   app:
     <<: *app
     ports: ["127.0.0.1:${NUMEN_PORT:-8787}:8080"]
+    # Agent session chat relays operator input to the broker.
+    networks: [application, control]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health', timeout=3)"]
       interval: 10s
@@ -97,6 +99,7 @@ services:
       NUMEN_BROKER_TOKEN: ${NUMEN_BROKER_TOKEN:?Run setup first}
       NUMEN_RUNNER_STATE: /data/runner
       NUMEN_RUNNER_CONCURRENCY: ${NUMEN_RUNNER_CONCURRENCY:-4}
+      NUMEN_AGENT_BACKEND: ${NUMEN_AGENT_BACKEND:-herdr}
     volumes: [/var/run/docker.sock:/var/run/docker.sock, runner-state:/data/runner]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=3)"]

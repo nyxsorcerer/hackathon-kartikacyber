@@ -117,3 +117,37 @@ def test_commit_constraint_failure_rolls_back_before_http_success(system):
             assert independent.scalar(select(Job).where(Job.program_id == monitored["id"])) is None
     finally:
         event.remove(app.state.factory.class_, "before_commit", reject_commit)
+
+
+def test_job_session_proxies_only_runs_of_the_running_attempt(system, monkeypatch):
+    from numen.broker import Broker
+    from numen.models import Job, JobAttempt
+
+    app, client, _ = system
+    calls = []
+
+    def session(self, run_id, body=None):
+        calls.append((run_id, body))
+        return {"agent": "claude", "agent_status": "working", "screen": "thinking", "held": False}
+
+    monkeypatch.setattr(Broker, "session", session)
+    with app.state.factory.begin() as db:
+        job = Job(kind="commit_analysis", status="running", input_hash="h", attempt_token="a",
+                  broker_run_id="run-2")
+        db.add(job)
+        db.flush()
+        db.add(JobAttempt(id="a", job_id=job.id, status="running",
+                          data={"runtime_phases": {"a:1": "run-1", "a:2": "run-2", "a:3": None}}))
+        ident = job.id
+    state = client.get(f"/api/jobs/{ident}/session").json()
+    assert state["runs"] == ["run-1", "run-2"] and state["run_id"] == "run-2"
+    assert client.get(f"/api/jobs/{ident}/session?run=run-1").json()["run_id"] == "run-1"
+    url = f"/api/jobs/{ident}/session"
+    assert client.post(url, json={"run_id": "other", "action": "hold"}).status_code == 409
+    assert client.post(url, json={"run_id": "run-1", "action": "prompt"}).status_code == 422
+    response = client.post(url, json={"run_id": "run-1", "action": "prompt", "text": "why?"})
+    assert response.status_code == 202
+    assert calls[-1] == ("run-1", {"action": "prompt", "text": "why?"})
+    with app.state.factory.begin() as db:
+        db.get(Job, ident).status = "succeeded"
+    assert client.get(url).status_code == 409

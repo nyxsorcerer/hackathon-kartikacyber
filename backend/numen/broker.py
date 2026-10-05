@@ -156,6 +156,30 @@ class Broker:
             retryable=True,
         )
 
+    def session(self, run_id, body=None):
+        """Read (GET) or steer (POST body) a running agent's interactive session."""
+        try:
+            response = self.client.request(
+                "POST" if body else "GET", f"/internal/runs/{run_id}/session", json=body
+            )
+        except httpx.HTTPError as exc:
+            raise DomainError(
+                "broker_unavailable", "Execution broker is unavailable", 503, retryable=True
+            ) from exc
+        if response.status_code == 409:
+            detail = response.json().get("detail")
+            raise DomainError(
+                "session_unavailable",
+                detail if isinstance(detail, str) else "The agent session is unavailable",
+                409,
+                retryable=True,
+            )
+        if response.status_code >= 400:
+            raise DomainError(
+                "broker_error", f"Execution broker returned HTTP {response.status_code}", 502
+            )
+        return response.json()
+
     def login_input(self, run_id, code):
         self.request("POST", f"/internal/runs/{run_id}/login-input", json={"code": code})
 

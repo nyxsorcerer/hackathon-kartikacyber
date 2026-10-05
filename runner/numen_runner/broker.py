@@ -14,7 +14,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from jsonschema import Draft202012Validator
 
-from .contracts import LoginInput, RunRequest, validate_outputs
+from .contracts import LoginInput, RunRequest, SessionInput, validate_outputs
+from .workload import secret_values
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
 
@@ -27,6 +28,7 @@ class Store:
         self.runs = {}
         self.credentials = {}
         self.login_inputs = {}  # Memory only: authorization codes are never written to run state.
+        self.session_secrets = {}  # Memory only: credential strings redacted from session screens.
         for file in self.path.glob("*.json"):
             value = json.loads(file.read_text())
             self.runs[value["run_id"]] = value
@@ -108,6 +110,7 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
         completion = None
         # Only login workloads read operator input; other engines keep the original call shape.
         login = {"login_input": lambda: store.login_inputs.pop(run_id, None)} if request.kind == "account_login" else {}
+        store.session_secrets[run_id] = secret_values(request.profile.credential)
         try:
             envelope = engine.run(run_id, request,
                                   lambda: get(run_id)["status"] in {"cancelling", "cancelled"},
@@ -147,6 +150,7 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
                     publish_completion(run_id)
             request.profile.credential.clear()
             store.login_inputs.pop(run_id, None)
+            store.session_secrets.pop(run_id, None)
 
     async def schedule(run_id, request):
         async with semaphore:
@@ -303,6 +307,27 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
             raise HTTPException(409, "run is not waiting for login input")
         store.login_inputs[run_id] = body.code
         return {"run_id": run_id, "status": value["status"]}
+
+    def session_call(run_id, *args):
+        if get(run_id)["status"] != "running" or not hasattr(engine, "session"):
+            raise HTTPException(409, "run has no live agent session")
+        try:
+            return engine.session(run_id, *args)
+        except Exception as exc:
+            raise HTTPException(409, getattr(exc, "safe_message", "The agent session is unavailable.")) from None
+
+    @app.get("/internal/runs/{run_id}/session", dependencies=[Depends(auth)])
+    def session(run_id: str):
+        state = session_call(run_id, "read")
+        # ponytail: exact-match redaction; a secret the TUI wraps across lines would pass through.
+        for secret in store.session_secrets.get(run_id, ()):
+            state["screen"] = state.get("screen", "").replace(secret, "[redacted]")
+        return state
+
+    @app.post("/internal/runs/{run_id}/session", dependencies=[Depends(auth)], status_code=202)
+    def session_input(run_id: str, body: SessionInput):
+        session_call(run_id, "send", body.model_dump_json(exclude_none=True))
+        return {"run_id": run_id, "status": "accepted"}
 
     @app.get("/internal/runs/{run_id}/credential", dependencies=[Depends(auth)])
     def credential(run_id: str):

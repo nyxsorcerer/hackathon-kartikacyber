@@ -11,6 +11,7 @@ import {
 } from "../types";
 import type { Job } from "../types";
 import { queueJob } from "../components/JobLaunch";
+import { AgentSession } from "../components/AgentSession";
 import {
   ActionButton,
   Badge,
@@ -514,6 +515,9 @@ export function JobDetail() {
               />
             )}
           </Panel>
+          {job.status === "running" && !!job.profile && (
+            <AgentSession jobId={job.id} />
+          )}
           <Panel
             title="Execution events"
             description="Sanitized progress and errors recorded by the worker."

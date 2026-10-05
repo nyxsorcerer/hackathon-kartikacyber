@@ -526,14 +526,19 @@ def execute(job):
         if p["operation"] == "audit_context":
             prompt += "\nBundled authoritative Trail of Bits analysis resources are under /opt/resources/trailofbits. Follow the supplied coordinator phase and write supporting function documents."
         prompt += "\nApplication result JSON schema: " + json.dumps(job["output_schema"])
-        if p["agent"] in {"codex","claude"}:
-            prompt += '\nYour native structured final response must be {"result_json":"JSON-encoded application result"}. The result_json string must parse into an object matching the application schema above.'
+        if job.get("session"):
+            from . import session
+            argv = agent_argv(p, build=bool(job.get("build")), session=True)
+            result = session.run(argv, p, env, prompt, job["output_schema"])
         else:
-            prompt += "\nYour final response must be JSON only, matching the application result schema."
-        code, stdout, _ = run_process(agent_argv(p, build=bool(job.get("build"))), env, prompt, timeout, events=agent_events(p["agent"]))
-        if code:
-            raise ValueError("native agent exited unsuccessfully (check native sandbox/provider configuration)")
-        result = agent_result(p, env, stdout, job["output_schema"], timeout)
+            if p["agent"] in {"codex","claude"}:
+                prompt += '\nYour native structured final response must be {"result_json":"JSON-encoded application result"}. The result_json string must parse into an object matching the application schema above.'
+            else:
+                prompt += "\nYour final response must be JSON only, matching the application result schema."
+            code, stdout, _ = run_process(agent_argv(p, build=bool(job.get("build"))), env, prompt, timeout, events=agent_events(p["agent"]))
+            if code:
+                raise ValueError("native agent exited unsuccessfully (check native sandbox/provider configuration)")
+            result = agent_result(p, env, stdout, job["output_schema"], timeout)
         outputs = output_files(int(job["limits"]["output_bytes"]))
         serialized = json.dumps(result) + "".join(base64.b64decode(o["content_base64"]).decode(errors="replace") for o in outputs)
         if any(secret in serialized for secret in secret_values(p["credential"])):
@@ -616,7 +621,8 @@ def main():
             "Pi turn did not complete", "Pi agent did not complete its final response", "Codex turn did not complete",
             "Claude turn did not complete", "Claude omitted structured output", "output limit exceeded", "output symlinks are not allowed",
             "output root cannot be a symlink", "output must be a regular file without hard links", "credential material detected in output",
-            "agent final response was not valid JSON"}:
+            "agent final response was not valid JSON", "interactive agent session did not start",
+            "interactive agent session ended unexpectedly", "agent session ended without a valid result"}:
             message = str(exc)[:1].upper() + str(exc)[1:] + "."
             code = "plugin_incompatible" if "incompatible" in str(exc) else ("unsupported_access" if "unsupported" in str(exc) else "workload_failed")
         envelope = {"failure":{"code":code,"message":message}}

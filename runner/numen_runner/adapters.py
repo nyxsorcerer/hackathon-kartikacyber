@@ -6,9 +6,10 @@ WRITE_OPERATIONS = {"commit_analysis", "cve_analysis", "version_recipe", "findin
 PI_BASE = ["pi", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"]
 
 
-def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/workspace/final.json", build=False):
+def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/workspace/final.json", build=False, session=False):
     agent, model, effort = profile["agent"], profile["model_id"], profile.get("reasoning_effort")
-    write = profile.get("operation") in WRITE_OPERATIONS
+    # An interactive session writes its result file, so every session operation can write outputs.
+    write = session or profile.get("operation") in WRITE_OPERATIONS
     if agent == "codex":
         args = ["codex", "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--color", "never",
                 "--model", model, "--output-schema", schema_path, "--output-last-message", output_path,

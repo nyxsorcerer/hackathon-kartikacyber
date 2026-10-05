@@ -341,6 +341,14 @@ export const dashboardSchema = z.object({
   recent_events: z.array(z.unknown()),
   due_programs: z.array(z.unknown()),
 });
+export const agentSessionSchema = z.object({
+  runs: z.array(z.string()),
+  run_id: z.string(),
+  agent: z.string().nullable().optional(),
+  agent_status: z.string(),
+  screen: z.string(),
+  held: z.boolean(),
+});
 export const jobAcceptedSchema = z.object({
   job_id: z.string(),
   status_url: z.string(),

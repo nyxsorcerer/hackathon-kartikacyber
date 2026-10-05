@@ -3829,3 +3829,16 @@ tbody tr.group-row:hover {
     display: none;
   }
 }
+.agent-screen {
+  max-height: 560px;
+  overflow: auto;
+  margin: 0 0 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #0d1117;
+  color: #e6edf3;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

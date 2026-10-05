@@ -91,11 +91,15 @@ class DockerEngine:
     def __init__(self, client=None):
         self.client = client or docker.from_env(timeout=30)
         self.instance = os.getenv("NUMEN_RUNNER_INSTANCE", "numen")
+        # herdr runs agents as interactive sessions an operator can watch and steer.
+        self.agent_backend = os.getenv("NUMEN_AGENT_BACKEND", "native")
+        self.sessions = {}  # run id -> workload container hosting its agent session
 
     def ping(self):
         return self.client.ping()
 
     def cleanup(self, run_id):
+        self.sessions.pop(run_id, None)
         for container in self.client.containers.list(all=True, filters={"label":[f"{LABEL}={run_id}",f"{INSTANCE}={self.instance}"]}):
             try:
                 container.remove(force=True, v=True)
@@ -241,6 +245,9 @@ class DockerEngine:
         data["lab_image"] = lab_image
         data["inputs"] = []
         data["inputs_materialized"] = True
+        data["session"] = kind == "agent" and self.agent_backend == "herdr"
+        if data["session"]:
+            self.sessions[run_id] = container
         try:
             connection._sock.sendall((json.dumps(data) + "\n").encode())
         finally:
@@ -310,6 +317,20 @@ class DockerEngine:
             final["credential"] = native_credential
             final["credential_updated"] = True
         return final
+
+    def session(self, run_id, *args):
+        """Read or steer a run's agent session through the fixed in-workload session command."""
+        container = self.sessions.get(run_id)
+        if container is None:
+            raise RuntimeFailure("no_session", "This run has no interactive agent session.")
+        try:
+            done = container.exec_run(["python","-m","numen_runner.session",*args], user="10001:10001",
+                                      stdout=True, stderr=False, privileged=False)
+        except docker.errors.DockerException:
+            raise RuntimeFailure("session_unavailable", "The agent session is not reachable.") from None
+        if done.exit_code or len(done.output) > 4*1024*1024:
+            raise RuntimeFailure("session_unavailable", "The agent session is not ready or has ended.")
+        return json.loads(done.output) if done.output.strip() else {}
 
     def ingest_native_credential(self, container):
         # Neither credentials nor caller-controlled values enter argv/environment/errors.

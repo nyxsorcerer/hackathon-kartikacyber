@@ -1,5 +1,5 @@
 import re
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 from pathlib import PurePosixPath
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -214,6 +214,24 @@ class LoginCodeInput(Strict):
     @classmethod
     def trim(cls, value):
         return value.strip() if isinstance(value, str) else value
+
+
+class SessionInput(Strict):
+    # The runner enforces the same shape before input reaches the agent's session.
+    run_id: str = Field(min_length=1, max_length=64)
+    action: Literal["prompt", "keys", "hold", "release"]
+    text: str | None = Field(default=None, min_length=1, max_length=16000)
+    keys: list[Annotated[str, Field(pattern=r"^[a-z0-9+]{1,20}$")]] | None = Field(
+        default=None, min_length=1, max_length=16
+    )
+
+    @model_validator(mode="after")
+    def complete(self):
+        if (self.action == "prompt") != (self.text is not None) or (self.action == "keys") != (
+            self.keys is not None
+        ):
+            raise ValueError("Session input does not match its action")
+        return self
 
 
 AUDIT_MAX_FUNCTIONS = 24

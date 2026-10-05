@@ -19,6 +19,7 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from . import artifacts, cves, domain
+from .broker import Broker
 from .config import Config
 from .db import make_database
 from .models import (
@@ -56,6 +57,7 @@ from .schemas import (
     OperationInput,
     ProgramInput,
     ReviewInput,
+    SessionInput,
     http_url,
 )
 from .security import (
@@ -67,6 +69,7 @@ from .security import (
     token_hash,
     verify_password,
 )
+from .queue import runtime_phases
 from .workflows import all_secrets
 
 
@@ -87,6 +90,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             if not db.get(Operator, "admin"):
                 db.add(Operator(id="admin", password_hash=hash_password(admin_password)))
     vault = Vault(config.secret_key)
+    broker = Broker(config)
     attempts = defaultdict(deque)
 
     @asynccontextmanager
@@ -925,6 +929,29 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             cursor,
             limit,
         )
+
+    def session_runs(db, ident):
+        """Broker runs the job's current attempt still owns, oldest first."""
+        row = domain.get(db, Job, ident)
+        if row.status != "running":
+            return []
+        attempt = db.get(JobAttempt, row.attempt_token) if row.attempt_token else None
+        return [run for run in runtime_phases(attempt, row.broker_run_id).values() if run]
+
+    @router.get("/jobs/{ident}/session")
+    def job_session(ident: str, run: str | None = None, db=database_dependency):
+        runs = session_runs(db, ident)
+        if not runs:
+            raise DomainError("session_unavailable", "This job has no running agent session", 409)
+        run_id = run if run in runs else runs[-1]
+        return {"runs": runs, "run_id": run_id, **broker.session(run_id)}
+
+    @router.post("/jobs/{ident}/session", status_code=202)
+    def job_session_input(ident: str, body: SessionInput, db=database_dependency):
+        if body.run_id not in session_runs(db, ident):
+            raise DomainError("session_unavailable", "That run is not a live session of this job", 409)
+        broker.session(body.run_id, body.model_dump(exclude={"run_id"}, exclude_none=True))
+        return {"status": "accepted"}
 
     @router.post("/jobs/{ident}/cancel")
     def cancel(ident: str, db=database_dependency):
