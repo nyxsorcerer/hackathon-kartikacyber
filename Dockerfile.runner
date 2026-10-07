@@ -1,5 +1,6 @@
 FROM ghcr.io/astral-sh/uv:0.8.22@sha256:9874eb7afe5ca16c363fe80b294fe700e460df29a55532bbfea234a0f12eddb1 AS uv
 FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c AS runtime
+LABEL org.pruferva.numen.image=true
 COPY --from=uv /uv /uvx /usr/local/bin/
 RUN groupadd -g 10001 job && useradd -u 10001 -g job -m -d /home/job job
 WORKDIR /opt/runner
@@ -20,7 +21,11 @@ FROM runtime AS probe
 USER 10001:10001
 CMD ["python", "-m", "numen_runner.workload"]
 FROM runtime AS lab
-USER 10001:10001
+# Vulnerable applications are built on this base, so it carries the tools their builds reach for,
+# and a bundle's Dockerfile installs packages without switching user. The PoC workload that also
+# runs this image is always started as the unprivileged job user by the engine.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git unzip \
+    && rm -rf /var/lib/apt/lists/*
 CMD ["python", "-m", "numen_runner.workload"]
 FROM runtime AS test
 RUN uv sync --locked --extra dev
@@ -32,6 +37,7 @@ FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d48
 FROM docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS docker-cli
 # The per-run build daemon. Its own daemon process is rootless inside this image.
 FROM docker:27.5.1-dind-rootless@sha256:e2ac8e8f66ae21a060b0a8e3005c70f6ed9441aabf409434463d1f6eecd38026 AS dind
+LABEL org.pruferva.numen.image=true
 FROM runtime AS node-runtime
 COPY --from=node /usr/local/bin/node /usr/local/bin/
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm

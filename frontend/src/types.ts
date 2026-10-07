@@ -86,6 +86,8 @@ export const configSchema = z
     cve_min_score: z.number().nullable().optional(),
     cve_versions: z.array(z.string()).default([]),
     cve_auto_analyze: z.boolean().default(false),
+    // Programs saved before this setting existed keep it off.
+    audit_auto_refresh: z.boolean().default(false),
     active_recipe_id: z.string().nullable().optional(),
     version_scheme: z.enum(["semver", "php", "unknown"]).optional(),
     version_monitor_enabled: z.boolean().optional(),
@@ -130,14 +132,24 @@ export function programState(program: Program) {
 const analysisResultSchema = z
   .object({
     category: z.string().optional(),
+    title: z.string().optional(),
+    finding_decision: z
+      .enum(["finding", "not_a_finding", "needs_more_evidence"])
+      .optional(),
+    finding_reason: z.string().optional(),
+    vulnerable_ref: z.string().nullable().optional(),
     summary: z.string().optional(),
     report: z.string().optional(),
-    finding_id: z.string().optional(),
+    finding_id: z.string().nullable().optional(),
+    /** The finding this analysis created was later deleted. */
+    finding_removed: z.boolean().optional(),
   })
   .passthrough();
 export const analysisSchema = z
   .object({
     id: z.string().optional(),
+    job_id: z.string().optional(),
+    superseded: z.boolean().optional(),
     category: z.string().optional(),
     summary: z.string().optional(),
     created_at: z.string().optional(),
@@ -148,6 +160,11 @@ export const analysisSchema = z
   })
   .passthrough();
 export type Analysis = z.infer<typeof analysisSchema>;
+export const findingDecisionLabels: Record<string, string> = {
+  finding: "Finding",
+  not_a_finding: "Not a finding",
+  needs_more_evidence: "Needs more evidence",
+};
 /** Changed paths arrive as objects from source imports, or as bare paths. */
 const commitFileSchema = z.union([
   z.string().transform((path) => ({
@@ -177,8 +194,65 @@ export const commitSchema = z.object({
   triage_result: z.unknown().nullable(),
   review_decision: z.string(),
   analyses: z.array(analysisSchema).default([]),
+  /** Findings recorded from this revision. */
+  findings: z
+    .array(
+      z.object({
+        id: z.string(),
+        title: z.string(),
+        status: z.string(),
+        kind: z.string().optional(),
+      }),
+    )
+    .default([]),
 });
 export type Commit = z.infer<typeof commitSchema>;
+/** One decision applied to many revisions; `previous` lets the change be undone. */
+export const reviewBatchSchema = z.object({
+  items: z.array(
+    z.object({
+      id: z.string(),
+      previous: z.string(),
+      review_decision: z.string(),
+    }),
+  ),
+});
+/** Most revisions one batch analysis may queue; each runs as its own agent job. */
+export const analysisBatchMax = 50;
+export const analysisBatchSchema = z.object({
+  items: z.array(
+    z.object({
+      id: z.string(),
+      job_id: z.string().nullable(),
+      // historical_source: from an earlier source generation; analysis_active: already queued.
+      skipped: z.string().nullable(),
+    }),
+  ),
+});
+export const findingDeletionSchema = z.object({ deleted: z.array(z.string()) });
+export const promptTemplateSchema = z.object({
+  name: z.string(),
+  // An operation renders a job's prompt; a section is shared by the operations including it.
+  kind: z.enum(["operation", "section"]),
+  description: z.string(),
+  source: z.string(),
+  default_source: z.string(),
+  customized: z.boolean(),
+  updated_at: z.string().nullable(),
+  default_changed: z.boolean(),
+  includes: z.array(z.string()),
+  used_by: z.array(z.string()),
+});
+export type PromptTemplate = z.infer<typeof promptTemplateSchema>;
+export const promptTemplatesSchema = z.object({
+  items: z.array(promptTemplateSchema),
+  variables: z.record(z.string(), z.string()),
+});
+export const promptPreviewSchema = z.object({
+  prompt: z.string(),
+  templates: z.array(z.string()),
+  build: z.boolean(),
+});
 export const scoreSchema = z.object({
   version: z.string(),
   base_score: z.number(),
@@ -222,8 +296,9 @@ export const findingSchema = z.object({
   cve_id: z.string().nullable(),
   title: z.string(),
   status: z.enum(["open", "fixed"]),
-  affected_versions: z.array(z.string()),
-  fixed_versions: z.array(z.string()),
+  // Findings created by a commit analysis may not record version ranges yet.
+  affected_versions: z.array(z.union([z.string(), unknownRecord])).default([]),
+  fixed_versions: z.array(z.union([z.string(), unknownRecord])).default([]),
   target_applicability: z.string(),
   evidence: z.array(z.unknown()).default([]),
   source_commit_id: z.string().nullable().optional(),
@@ -242,10 +317,41 @@ export const findingSchema = z.object({
   updated_at: z.string(),
 });
 export type Finding = z.infer<typeof findingSchema>;
+export const findingSummarySchema = findingSchema
+  .pick({
+    id: true,
+    program_id: true,
+    kind: true,
+    cve_id: true,
+    title: true,
+    status: true,
+    affected_versions: true,
+    fixed_versions: true,
+    target_applicability: true,
+    source_commit_id: true,
+    source_analysis_id: true,
+    artifact_revision: true,
+    artifact_state: true,
+    created_at: true,
+    updated_at: true,
+  })
+  .extend({ lab_status: z.string().nullable() });
+export type FindingSummary = z.infer<typeof findingSummarySchema>;
+/** What a job acts on, resolved by the API into a label and dashboard link. */
+export const jobSubjectSchema = z.object({
+  type: z.string(),
+  label: z.string(),
+  detail: z.string().nullable().optional(),
+  ref: z.string().nullable().optional(),
+  link: z.string().nullable().optional(),
+});
+export type JobSubject = z.infer<typeof jobSubjectSchema>;
 export const jobSchema = z.object({
   id: z.string(),
   kind: z.string(),
   program_id: z.string().nullable().optional(),
+  program_name: z.string().nullable().optional(),
+  subject: jobSubjectSchema.nullable().optional(),
   status: z.string(),
   progress: z.unknown(),
   profile: profileSchema.nullable().optional(),
@@ -305,6 +411,30 @@ export const auditCoverageSchema = z
     completed: z.number().optional(),
     failed: z.number().optional(),
     omitted: z.number().optional(),
+    // Functions whose file the refreshed revision deleted.
+    removed: z.number().optional(),
+    // Functions orientation selected beyond the limit, recorded but not analysed.
+    deferred: z.number().optional(),
+    deferred_units: z
+      .array(z.object({ name: z.unknown(), path: z.unknown() }).passthrough())
+      .optional(),
+    reused_functions: z.number().optional(),
+    resumed_from: z.string().optional(),
+    // Present when this context refreshed an earlier one.
+    refresh: z
+      .object({
+        from: z.string(),
+        from_revision: z.string(),
+        changed_files: z.array(z.string()).default([]),
+        changed_files_total: z.number().default(0),
+        removed_units: z
+          .array(
+            z.object({ name: z.unknown(), path: z.unknown() }).passthrough(),
+          )
+          .default([]),
+      })
+      .passthrough()
+      .optional(),
     failed_units: z
       .array(
         z.object({ unit: auditUnitSchema, error: z.unknown() }).passthrough(),
@@ -348,6 +478,7 @@ export const agentSessionSchema = z.object({
   agent_status: z.string(),
   screen: z.string(),
   held: z.boolean(),
+  live: z.boolean().optional(),
 });
 export const jobAcceptedSchema = z.object({
   job_id: z.string(),
@@ -381,6 +512,7 @@ export const accountsSchema = listSchema(accountSchema);
 export const commitsSchema = listSchema(commitSchema);
 export const cvesSchema = listSchema(cveSchema);
 export const findingsSchema = listSchema(findingSchema);
+export const findingSummariesSchema = listSchema(findingSummarySchema);
 export const jobsSchema = listSchema(jobSchema);
 export const pluginsSchema = listSchema(pluginSchema);
 export const versionsSchema = listSchema(versionSchema);

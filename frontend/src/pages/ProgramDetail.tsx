@@ -27,10 +27,17 @@ import {
 import {
   commitsSchema,
   cvesSchema,
-  findingsSchema,
+  findingSummariesSchema,
   jobsSchema,
 } from "../types";
-import type { Commit, CVE, Finding, Job, Operation, Program } from "../types";
+import type {
+  Commit,
+  CVE,
+  FindingSummary,
+  Job,
+  Operation,
+  Program,
+} from "../types";
 import { JobLaunch, queueJob } from "../components/JobLaunch";
 import { ArtifactBrowser } from "../components/ArtifactPreview";
 import {
@@ -56,7 +63,8 @@ import { AuditTab } from "./AuditContext";
 import { CommitList, sortCommits } from "./Commits";
 import { CVEList, cveRows } from "./CVEs";
 import { FindingsList } from "./Findings";
-import { failureGroups, jobName } from "./Jobs";
+import { failureGroups } from "./Jobs";
+import { jobName, jobOutcome } from "../jobSummary";
 type VersionRecord = NonNullable<Program["version"]>;
 export function ProgramDetail() {
   const { id } = useParams();
@@ -104,6 +112,11 @@ function ProgramBody({
   const [params, setParams] = useSearchParams();
   const tab = params.get("tab") || "overview";
   const [launch, setLaunch] = useState<Operation>();
+  // The audit context a launched audit job refreshes, when it refreshes one.
+  const [refreshContext, setRefreshContext] = useState<{
+    id: string;
+    revision: string;
+  }>();
   const [manual, setManual] = useState(false);
   const failure = program.last_error;
   const data = useProgramData(program);
@@ -286,6 +299,10 @@ function ProgramBody({
         <AuditTab
           program={program}
           onGenerate={() => setLaunch("audit_context")}
+          onRefresh={(context) => {
+            setRefreshContext({ id: context.id, revision: context.source_ref });
+            setLaunch("audit_context");
+          }}
         />
       )}
       {tab === "cves" && <CVEList program={program} collection={data.cves} />}
@@ -296,7 +313,11 @@ function ProgramBody({
           path={`/programs/${program.id}/${launch === "audit_context" ? "audit-contexts" : "version-recipes"}`}
           initialProfile={program.config.profiles[launch]}
           context={`${program.product_name} · ${program.source_ref || "default source ref"} · source generation ${program.source_generation}`}
-          onClose={() => setLaunch(undefined)}
+          refresh={launch === "audit_context" ? refreshContext : undefined}
+          onClose={() => {
+            setLaunch(undefined);
+            setRefreshContext(undefined);
+          }}
           onSubmitted={refresh}
         />
       )}
@@ -309,6 +330,19 @@ function ProgramBody({
       )}
     </>
   );
+}
+/** Confidence arrives as a level string or as `{level, basis}`. */
+function confidenceOf(value: unknown) {
+  if (typeof value === "string") return { level: value };
+  const level =
+    typeof value === "object" && value && "level" in value
+      ? String(value.level)
+      : undefined;
+  const basis =
+    typeof value === "object" && value && "basis" in value
+      ? String(value.basis)
+      : undefined;
+  return { level, basis };
 }
 function versionLabel(version: VersionRecord) {
   return version.version || version.candidates?.join(" / ") || "Unknown";
@@ -326,11 +360,11 @@ function VersionFacts({ version }: { version: VersionRecord }) {
           ],
           [
             "Confidence basis",
-            typeof version.confidence === "string"
-              ? version.confidence
-              : version.confidence
+            confidenceOf(version.confidence).basis ||
+              confidenceOf(version.confidence).level ||
+              (version.confidence
                 ? "See observation evidence"
-                : "Not reported",
+                : "Not reported"),
           ],
           ["Checked", <Time value={version.checked_at} absolute />],
           [
@@ -428,9 +462,10 @@ function VersionSummary({
                 </button>
               }
             >
-              The fingerprint matches more than one release. Add another
-              fingerprint by regenerating the recipe, or record an independent
-              manual observation.
+              The site&apos;s published files match more than one release, and
+              these releases ship identical front-end files, so a remote check
+              cannot tell them apart. Record a manual observation if you have
+              independent evidence of the exact release.
             </Callout>
           )}
           <VersionFacts version={version} />
@@ -521,6 +556,12 @@ function ProgramConfiguration({
             "Auto CVE analysis",
             program.config.cve_auto_analyze ? "Enabled" : "Off",
           ],
+          [
+            "Audit context refresh",
+            program.config.audit_auto_refresh
+              ? "After each source change"
+              : "Manual",
+          ],
         ]}
       />
       <div className="field-block">
@@ -582,7 +623,134 @@ function humanTriage(mode: string) {
     }[mode] || mode
   );
 }
-function VersionTab({
+type FingerprintCoverage = {
+  releases: string[];
+  distinguishing: number;
+  groups: string[][];
+};
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+/** What a recipe's release corpus can tell apart, from its saved metadata. */
+function fingerprintCoverage(metadata: unknown): FingerprintCoverage {
+  const coverage = record(record(metadata)?.corpus_coverage);
+  const releases = Array.isArray(coverage?.releases)
+    ? coverage.releases
+        .map((release) => record(release)?.version)
+        .filter((version): version is string => typeof version === "string")
+    : [];
+  const groups = Array.isArray(coverage?.resolution)
+    ? coverage.resolution.filter(
+        (group): group is string[] =>
+          Array.isArray(group) && group.every((v) => typeof v === "string"),
+      )
+    : [];
+  return {
+    releases,
+    distinguishing:
+      typeof coverage?.distinguishing_paths === "number"
+        ? coverage.distinguishing_paths
+        : 0,
+    groups,
+  };
+}
+/** Which captured releases the fingerprints can and cannot tell apart. */
+function RecipeResolution({ metadata }: { metadata: unknown }) {
+  const coverage = fingerprintCoverage(metadata);
+  if (!coverage.releases.length)
+    return (
+      <p className="hint">
+        No release could be captured for this recipe, so it carries no
+        fingerprints to compare with the site.
+      </p>
+    );
+  const shared = coverage.groups.filter((group) => group.length > 1);
+  return (
+    <p className="hint">
+      Fingerprints cover {coverage.releases[coverage.releases.length - 1]} to{" "}
+      {coverage.releases[0]}.{" "}
+      {coverage.groups.length
+        ? shared.length
+          ? `Their published files separate ${coverage.groups.length} groups; ${shared.map((group) => group.join(" and ")).join("; ")} publish identical files.`
+          : "Their published files tell every captured release apart."
+        : ""}
+    </p>
+  );
+}
+function RecipeCoverage({ metadata }: { metadata: unknown }) {
+  const coverage = fingerprintCoverage(metadata);
+  if (!coverage.releases.length)
+    return <Badge tone="warm">No release fingerprints</Badge>;
+  return (
+    <span className="recipe-coverage">
+      {coverage.releases.length} releases fingerprinted ·{" "}
+      {coverage.distinguishing} distinguishing{" "}
+      {coverage.distinguishing === 1 ? "file" : "files"}
+    </span>
+  );
+}
+type FingerprintProbe = {
+  path: string;
+  versions?: string[];
+  status?: number;
+  error?: string;
+};
+/** Files Numen's fingerprint stage fetched, from an observation's evidence. */
+function fingerprintProbes(evidence: unknown): FingerprintProbe[] {
+  if (!Array.isArray(evidence)) return [];
+  return evidence.flatMap((item) => {
+    const entry = record(item);
+    if (
+      !entry ||
+      typeof entry.path !== "string" ||
+      !("versions" in entry || "status" in entry || "error" in entry)
+    )
+      return [];
+    return [
+      {
+        path: entry.path,
+        versions: Array.isArray(entry.versions)
+          ? entry.versions.filter((v): v is string => typeof v === "string")
+          : undefined,
+        status: typeof entry.status === "number" ? entry.status : undefined,
+        error: typeof entry.error === "string" ? entry.error : undefined,
+      },
+    ];
+  });
+}
+function FingerprintList({ evidence }: { evidence: unknown }) {
+  const probes = fingerprintProbes(evidence);
+  if (!probes.length) return null;
+  return (
+    <div className="fingerprint-list">
+      <span className="field-label">Release fingerprints</span>
+      <ul>
+        {probes.map((probe, i) => (
+          <li key={`${probe.path}-${i}`}>
+            <code>{probe.path}</code>
+            {probe.versions?.length ? (
+              <span>matches {probe.versions.join(", ")}</span>
+            ) : probe.status === 200 ? (
+              <span className="warning">matches no captured release</span>
+            ) : (
+              <span className="muted">
+                not served
+                {probe.status
+                  ? ` (HTTP ${probe.status})`
+                  : probe.error
+                    ? ` (${probe.error})`
+                    : ""}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+export function VersionTab({
   program,
   onGenerate,
   onManual,
@@ -600,8 +768,30 @@ function VersionTab({
     recipesSchema,
   );
   const hasRecipe = !!program.config.active_recipe_id;
+  const active = recipes.data?.items.find(
+    (recipe) => recipe.id === program.config.active_recipe_id,
+  );
+  const unfingerprinted =
+    !!active && !fingerprintCoverage(active.metadata).releases.length;
   return (
     <>
+      {unfingerprinted && (
+        <Callout
+          tone="warm"
+          title="The active recipe has no release fingerprints"
+          action={
+            <button className="secondary" onClick={onGenerate}>
+              <Sparkles size={15} aria-hidden="true" />
+              Generate recipe
+            </button>
+          }
+        >
+          No release files could be captured when it was generated, so checks
+          can recognise the product but cannot narrow its version. A new recipe
+          captures the releases&apos; published files and lets each check
+          compare them with the site.
+        </Callout>
+      )}
       <Panel
         title="Version observations"
         description="Recipes are reused without another agent call. Ambiguous and failed observations keep their evidence."
@@ -664,8 +854,10 @@ function VersionTab({
                     {observation.origin === "manual"
                       ? "Manual observation"
                       : observation.method || "Script observation"}
-                    {typeof observation.confidence === "string" &&
-                      ` · ${observation.confidence}`}
+                    {confidenceOf(observation.confidence).level &&
+                      ` · ${confidenceOf(observation.confidence).level}`}
+                    {confidenceOf(observation.confidence).basis &&
+                      ` — ${confidenceOf(observation.confidence).basis}`}
                   </p>
                   {!!observation.limitations?.length && (
                     <ul className="limitations">
@@ -674,6 +866,7 @@ function VersionTab({
                       ))}
                     </ul>
                   )}
+                  <FingerprintList evidence={observation.evidence} />
                   <Evidence
                     value={observation}
                     label="Evidence, confidence & limitations"
@@ -708,11 +901,13 @@ function VersionTab({
                   {program.config.active_recipe_id === recipe.id && (
                     <Badge tone="accent">Active</Badge>
                   )}
+                  <RecipeCoverage metadata={recipe.metadata} />
                   <span className="summary-end">
                     <Time value={recipe.created_at} absolute />
                   </span>
                 </summary>
                 <div className="disclosure-body">
+                  <RecipeResolution metadata={recipe.metadata} />
                   <Evidence value={recipe.metadata} label="Recipe metadata" />
                 </div>
                 <ArtifactBrowser artifacts={recipe.artifacts} />
@@ -814,7 +1009,7 @@ function ManualVersion({
 type ProgramData = {
   commits: Collection<Commit>;
   cves: Collection<CVE>;
-  findings: Collection<Finding>;
+  findings: Collection<FindingSummary>;
   jobs: Collection<Job>;
   audits: { data?: { items: unknown[] } };
 };
@@ -823,7 +1018,10 @@ function useProgramData(program: Program): ProgramData {
   return {
     commits: useCollection(`/programs/${id}/commits`, commitsSchema),
     cves: useCollection(`/cves?program_id=${id}`, cvesSchema),
-    findings: useCollection(`/findings?program_id=${id}`, findingsSchema),
+    findings: useCollection(
+      `/findings?program_id=${id}&view=summary`,
+      findingSummariesSchema,
+    ),
     jobs: useCollection(`/jobs?program_id=${id}`, jobsSchema, 15000, 200),
     audits: useResource(`/programs/${id}/audit-contexts`, auditsSchema),
   };
@@ -1010,7 +1208,7 @@ function SetupChecklist({
       title: "Build audit context",
       done: (data.audits.data?.items.length || 0) > 0,
       detail:
-        "Gives commit and CVE analysis a source-referenced map of the code.",
+        "Gives CVE analysis and finding artifacts a source-referenced map of the code to start from.",
       action: (
         <button className="secondary" onClick={onGenerateContext}>
           Generate context
@@ -1104,12 +1302,15 @@ function RecentJobs({
               <Link key={job.id} to={`/jobs/${job.id}`} className="job-row">
                 <Badge>{job.status}</Badge>
                 <span className="job-row-main">
-                  <strong>{jobName(job.kind)}</strong>
-                  {!!job.error && (
-                    <span className="danger-text clamp">
-                      {describeError(job.error)}
-                    </span>
-                  )}
+                  <strong>
+                    {jobName(job.kind)}
+                    {job.subject && (
+                      <span className="muted">: {job.subject.label}</span>
+                    )}
+                  </strong>
+                  <span className={`clamp job-outcome ${jobOutcome(job).tone}`}>
+                    {jobOutcome(job).summary}
+                  </span>
                 </span>
                 <small>
                   <Time value={job.finished_at || job.created_at} />

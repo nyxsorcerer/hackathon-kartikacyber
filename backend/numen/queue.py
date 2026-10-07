@@ -6,6 +6,45 @@ from .models import AuditContext, Job, JobAttempt, JobEvent, VersionRecipe, now
 from .security import DomainError
 from .domain import event
 
+# Runtime lifecycle milestones surfaced on the job timeline. A runtime event only selects which
+# of these messages is recorded: the wording is the application's own, because a workload reports
+# its events on the same stdout an agent can write to.
+RUNTIME_EVENTS = {
+    "build_daemon_started": "Private build daemon ready",
+    "build_base_loaded": "Loaded the offline lab base into the build daemon",
+    "build_base_unavailable": "Build daemon has no offline lab base, so lab verification will fail",
+    "build_daemon_lost": "The private build daemon failed during this run",
+    "build_rejected_image": "A build failed on an image this daemon cannot pull",
+    "build_rejected_mount": "A build failed on a bind mount path not shared with this daemon",
+    "build_rejected_disk": "A build failed because the daemon ran out of disk space",
+    "repository_ready": "Cloned the program's full repository, with history, into the workspace",
+    "repository_unavailable": "The program's repository could not be prepared; the agent may clone it itself",
+    "lab_started": "Pinned application launched for lab verification",
+    "lab_application_exited": "The pinned application stopped before it could be verified",
+    "lab_base_fetch": "Fetching the bundle's pinned base before the offline lab build",
+    "lab_build": "Building the pinned lab image",
+    "lab_built": "Built the pinned lab image",
+    "result_repair": "The agent was asked to restate its final answer as the result",
+}
+
+# The only runtime-supplied value a timeline message carries: a refused image, and only when it is
+# a plain image reference, so no other text can reach the operator through it.
+IMAGE_REFERENCE = re.compile(r"[a-z0-9][a-z0-9._/:@-]{0,199}")
+
+
+def runtime_event(record, run_id):
+    image = record.get("image")
+    if record["type"] == "build_rejected_image" and isinstance(image, str) and IMAGE_REFERENCE.fullmatch(image):
+        return {
+            "kind": record["type"],
+            "message": f"A build could not pull {image}: it does not exist or needs a login. "
+            "Use numen-lab:0.1.0, an image built earlier in the run, or a public image pinned by @sha256",
+            "image": image,
+            "run_id": run_id,
+        }
+    return {"kind": record["type"], "message": RUNTIME_EVENTS[record["type"]], "run_id": run_id}
+
+
 LEASE_SECONDS = 120
 
 
@@ -102,6 +141,7 @@ class ExecutionContext:
         self.executions = []
         self.secrets = []
         self.last_progress = None
+        self.runtime_reported = set()
         self.kind = job.kind
         # Operation progress (e.g. audit function counts) shown in place of the runtime state.
         self.operation = None
@@ -159,7 +199,7 @@ class ExecutionContext:
             )
         return row
 
-    def set_run(self, run_id, attempt_token=None):
+    def set_run(self, run_id, attempt_token=None, kind=None):
         with self.lock, self.factory.begin() as db:
             changed = db.execute(
                 update(Job)
@@ -184,9 +224,15 @@ class ExecutionContext:
                         "kind": "runtime_started",
                         "message": "Isolated runtime started",
                         "run_id": run_id,
+                        **({"runtime_kind": kind} if kind else {}),
                     },
                 )
             )
+
+    def note(self, kind, message, **data):
+        """Records a timeline event in its own transaction, so a long run never holds one open."""
+        with self.lock, self.factory.begin() as db:
+            db.add(JobEvent(job_id=self.job_id, data={"kind": kind, "message": message, **data}))
 
     def set_phase(self, attempt_token):
         # Every unfinished phase stays recorded, so failure handling and recovery stop all runs.
@@ -220,6 +266,14 @@ class ExecutionContext:
             "progress": state.get("progress"),
             "execution": state.get("execution"),
         }
+        # Lifecycle milestones the runtime reports about itself. The event selects a message; it
+        # never supplies one, so runtime output cannot reach the timeline through this path.
+        runtime = [
+            runtime_event(record, state.get("run_id"))
+            for record in state.get("events", [])
+            if isinstance(record, dict) and record.get("type") in RUNTIME_EVENTS
+        ]
+        safe["runtime_events"] = runtime
         instructions = (
             login_instructions(state.get("events", [])) if self.kind == "account_login" else []
         )
@@ -230,14 +284,24 @@ class ExecutionContext:
             if digest == self.last_progress:
                 return
             self.last_progress = digest
+            # Concurrent runtime phases share this record, so a milestone is claimed under the lock
+            # that already guards progress. Each phase reports its own run's milestones.
+            unreported = []
+            for record in runtime:
+                key = (record["run_id"], record["kind"])
+                if key not in self.runtime_reported:
+                    self.runtime_reported.add(key)
+                    unreported.append(record)
         with self.factory.begin() as db:
             row = db.get(Job, self.job_id)
             if row and row.attempt_token == self.token:
                 row.progress = self.operation or {"status": state.get("status"), "stage": "runtime"}
                 execution = state.get("execution")
                 if isinstance(execution, dict):
+                    # A workload reports provenance on the same log an agent with a shell can write,
+                    # so the values are bounded here and the row count per attempt is capped.
                     execution = {
-                        k: execution[k]
+                        k: bounded(execution[k])
                         for k in (
                             "image_digest",
                             "image",
@@ -249,7 +313,7 @@ class ExecutionContext:
                         if k in execution
                     }
                     record = {"run_id": state.get("run_id"), **execution}
-                    if record not in self.executions:
+                    if record not in self.executions and len(self.executions) < 8:
                         self.executions.append(record)
                         db.add(
                             JobEvent(
@@ -261,6 +325,8 @@ class ExecutionContext:
                                 },
                             )
                         )
+                for record in unreported:
+                    db.add(JobEvent(job_id=row.id, data=record))
                 if row.kind == "account_login":
                     existing = [
                         event.data
@@ -273,6 +339,13 @@ class ExecutionContext:
 
     def after_commit(self, callback):
         self.callbacks.append(callback)
+
+
+def bounded(value, limit=200):
+    """Runtime-reported provenance, reduced to short strings before it becomes an operator row."""
+    if isinstance(value, dict):
+        return {str(k)[:64]: str(v)[:limit] for k, v in list(value.items())[:16]}
+    return None if value is None else str(value)[:limit]
 
 
 def runtime_phases(attempt, run_id=None):

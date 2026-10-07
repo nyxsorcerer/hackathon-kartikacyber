@@ -29,6 +29,7 @@ describe("audit context reading", () => {
         artifact("audit-context/DOSSIER.md"),
         artifact("functions/001.md"),
         artifact("coverage.json"),
+        artifact("audit-functions.json"),
       ],
       {
         failed_units: [

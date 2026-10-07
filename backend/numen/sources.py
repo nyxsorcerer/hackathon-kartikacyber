@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+from . import fingerprints
 from .artifacts import MAX_SET, MAX_FILE, MAX_SOURCE_FILES
 from .cves import compare_versions, cpe_identity
 from .models import now, utc
@@ -31,6 +32,13 @@ MEDIA_SUFFIXES = frozenset(
 
 def media(path):
     return Path(path).suffix.lower() in MEDIA_SUFFIXES
+
+
+def github_parents(data):
+    parents = data.get("parents") if isinstance(data, dict) else None
+    if not isinstance(parents, list) or any(not isinstance(p, dict) or not isinstance(p.get("sha"), str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", p["sha"]) for p in parents):
+        raise DomainError("invalid_source_response", "Source omitted valid immutable parent revisions", 502)
+    return [p["sha"] for p in parents]
 
 
 class Sources:
@@ -262,6 +270,7 @@ class Sources:
                     "diff": diff,
                     "diff_complete": complete,
                     "history_rewritten": history_rewritten,
+                    **({"parent_revisions": github_parents(detail)} if "parents" in detail else {}),
                 }
             )
         return head or program.cursor, commits
@@ -350,6 +359,14 @@ class Sources:
         if not sha:
             raise DomainError("invalid_source_response", "GitHub did not return a commit", 502)
         return sha
+
+    def commit_parents(self, program, revision):
+        repo = program.source_url.removeprefix("https://github.com/")
+        headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+        data = self.get(f"{self.github}/repos/{repo}/commits/{quote(revision, safe='')}", headers=headers).json()
+        if not isinstance(data, dict) or data.get("sha") != revision:
+            raise DomainError("invalid_source_response", "Source returned a different commit while resolving its parents", 502)
+        return github_parents(data)
 
     def svn(self, *args):
         self.heartbeat()
@@ -590,12 +607,21 @@ class Sources:
                 else:
                     # Uploaded release packages are actual distribution bytes; source archives are
                     # retained as a separate method with an explicit transformation limitation.
-                    packages = [
-                        asset
-                        for asset in assets
-                        if asset.get("name", "").endswith((".zip", ".tar.gz", ".tgz"))
-                    ][:3]
+                    # One installable package per release: an updater or patch package
+                    # holds a subset of the same files under another folder.
+                    packages = sorted(
+                        (
+                            asset
+                            for asset in assets
+                            if asset.get("name", "").endswith((".zip", ".tar.gz", ".tgz"))
+                        ),
+                        key=lambda asset: any(
+                            word in asset["name"].lower() for word in ("updater", "update", "patch")
+                        ),
+                    )[:3]
                     for asset in packages:
+                        if files:
+                            break
                         url = asset.get("url", "")
                         if not url.startswith("https://api.github.com/repos/"):
                             continue
@@ -626,8 +652,8 @@ class Sources:
                                         502,
                                     )
                                 response = self.get(dest)
-                            distributed = self.distribution_files(
-                                response.content, asset["name"]
+                            distributed = fingerprints.strip_root(
+                                self.distribution_files(response.content, asset["name"])
                             )
                         except (DomainError, ValueError, tarfile.TarError, zipfile.BadZipFile) as exc:
                             code = getattr(exc, "code", type(exc).__name__)
@@ -651,9 +677,8 @@ class Sources:
                             f"{version}: source archive only; installed/minified/distributed assets may differ"
                         )
                 for path, content in files.items():
-                    if not path.endswith((".js", ".css", ".php", ".json", ".txt")) and Path(
-                        path
-                    ).name not in ("VERSION", "version"):
+                    # Only assets a site publishes as-is can be compared remotely.
+                    if not fingerprints.published(path):
                         continue
                     digest = hashlib.sha256(content).hexdigest()
                     record = (
@@ -681,6 +706,7 @@ class Sources:
             corpus["limitations"].append(
                 "No release fingerprints are available; use disclosures/manual evidence or return unknown"
             )
+        corpus.update(fingerprints.plan(corpus))
         return corpus
 
     def distribution_files(self, content, name):

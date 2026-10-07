@@ -148,6 +148,7 @@ class FixtureBroker:
         policy=None,
         limits=None,
         build=False,
+        repository=None,
     ):
         call = {
             "token": token,
@@ -159,6 +160,7 @@ class FixtureBroker:
             "policy": policy,
             "limits": limits,
             "build": build,
+            "repository": repository,
         }
         self.calls.append(call)
         result, outputs = self.handler(call) if self.handler else (self.result, self.outputs)

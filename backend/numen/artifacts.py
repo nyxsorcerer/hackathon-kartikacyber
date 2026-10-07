@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import mimetypes
+import re
 import os
 import shutil
 import tempfile
@@ -14,9 +15,13 @@ from .models import Artifact, uid
 from .schemas import safe_path
 from .security import DomainError, decode_content
 
-MAX_FILE = 16 * 1024 * 1024
-MAX_SET = 64 * 1024 * 1024
-MAX_SOURCE_FILES = 20000  # Matches the runner's expanded source-archive bound.
+# A finding bundle carries a real application: its own tree is tens of thousands of files and
+# hundreds of megabytes before any dependency is vendored, so these bound storage, not plausibility.
+MAX_FILE = 64 * 1024 * 1024
+MAX_SET = 512 * 1024 * 1024
+MAX_SOURCE_FILES = 65536  # Matches the runner's expanded archive bound.
+MAX_INPUTS = 4096  # Individual runtime inputs; bulk travels as one compressed archive.
+MAX_SUBMISSION = 256 * 1024 * 1024  # Compressed bytes one runtime submission may carry.
 REQUIRED = (
     "poc.py",
     "report.md",
@@ -25,6 +30,20 @@ REQUIRED = (
     "vulnerable-app/README.md",
     "vulnerable-app/application.lock.json",
 )
+# The runner's validate_dockerfile is the authority on what the lab verifier accepts; these mirror
+# it so a bundle is never published complete and then refused. Keep the two in step.
+LAB_DIRECTIVES = frozenset(
+    {
+        "FROM", "RUN", "COPY", "ADD", "WORKDIR", "USER", "ENV", "ARG", "EXPOSE",
+        "CMD", "ENTRYPOINT", "LABEL", "VOLUME", "STOPSIGNAL", "SHELL", "HEALTHCHECK",
+    }
+)
+LAB_BASE = re.compile(
+    r"(?:numen-lab:0\.1\.0|scratch|[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?"
+    r"@sha256:[0-9a-f]{64})(?: AS [a-zA-Z][a-zA-Z0-9_-]*)?"
+)
+LAB_DOCKERFILE_BYTES = 262144  # The verifier's own bound on the file it parses.
+
 
 
 def clean_files(files, secrets=()):
@@ -61,7 +80,7 @@ def unpack_zip(content):
         raise DomainError("artifact_too_large", "Archive exceeds its limit", 413)
     files = {}
     with zipfile.ZipFile(io.BytesIO(content)) as archive:
-        if len(archive.infolist()) > 1000:
+        if len(archive.infolist()) > MAX_SOURCE_FILES:
             raise DomainError("artifact_too_large", "Too many archive entries", 413)
         total = 0
         for entry in archive.infolist():
@@ -166,6 +185,28 @@ def resource_files(db, root, resource_type, resource_id, revision=None):
     return {a.path: read_file(root, a) for a in db.scalars(stmt)}
 
 
+def resource_completeness(db, root, resource_type, resource_id, revision):
+    conditions = (
+        Artifact.resource_type == resource_type,
+        Artifact.resource_id == resource_id,
+        Artifact.revision == revision,
+    )
+    # Completeness needs contents only for these two declarations. Other published
+    # files contribute their paths and nonempty sizes; integrity is checked on use.
+    files = {
+        path: b"present" if size else b""
+        for path, size in db.execute(select(Artifact.path, Artifact.size).where(*conditions))
+    }
+    declarations = db.scalars(
+        select(Artifact).where(
+            *conditions,
+            Artifact.path.in_(("vulnerable-app/Dockerfile", "vulnerable-app/application.lock.json")),
+        )
+    )
+    files.update({row.path: read_file(root, row) for row in declarations})
+    return completeness(files)
+
+
 def completeness(files):
     missing = [path for path in REQUIRED if path not in files or not files[path]]
     limitations = []
@@ -205,12 +246,62 @@ def completeness(files):
         except (ValueError, TypeError):
             limitations.append("Application lock is not valid JSON")
     if "vulnerable-app/Dockerfile" in files:
-        for line in files["vulnerable-app/Dockerfile"].decode(errors="replace").splitlines():
-            parts = line.split()
-            if parts and parts[0].upper() == "FROM":
-                image = next((p for p in parts[1:] if not p.startswith("--")), "")
-                if image.lower() not in ("scratch", "numen-lab:0.1.0") and "@sha256:" not in image:
-                    limitations.append("Dockerfile base image is not pinned by digest")
+        text = files["vulnerable-app/Dockerfile"].decode(errors="replace")
+        bases = []
+        if len(text) > LAB_DOCKERFILE_BYTES:
+            limitations.append("Dockerfile is larger than the lab verifier parses")
+        stages = set()
+        for line in re.sub(r"\\[ \t]*\n", " ", text).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            instruction, _, value = line.partition(" ")
+            instruction = instruction.upper()
+            if instruction not in LAB_DIRECTIVES:
+                # The message stays application-owned: the file is agent-authored and unbounded.
+                limitations.append("A Dockerfile directive is refused by the lab verifier")
+                continue
+            if instruction == "FROM":
+                bases.append(value)
+                if " AS " in value.upper():
+                    stages.add(value.split()[-1])
+                if not LAB_BASE.fullmatch(value) and value.split()[0] not in stages:
+                    limitations.append("Dockerfile base must be the bundled lab image, scratch, a build stage or digest pinned")
+            # Only the flags leading the directive are inspected, so an ENV may mention one.
+            leading = []
+            for part in value.split():
+                if not part.startswith("--"):
+                    break
+                leading.append(part)
+            if any(flag.startswith(("--mount", "--security", "--network")) for flag in leading):
+                limitations.append("Dockerfile build mounts are not accepted by the lab verifier")
+            if (
+                instruction in ("COPY", "ADD")
+                and "--from=" not in value
+                and any(
+                    part.startswith("/") or ".." in part.split("/")
+                    for part in value.split()[:-1]
+                    if not part.startswith("--") and not re.match(r"[a-z][a-z0-9+.-]*://", part)
+                )
+            ):
+                limitations.append("Dockerfile COPY source must stay inside the bundle")
+            elif instruction in ("COPY", "ADD") and "--from=" in value:
+                stage = next(
+                    part.removeprefix("--from=") for part in value.split() if part.startswith("--from=")
+                )
+                if stage not in stages and not LAB_BASE.fullmatch(stage):
+                    limitations.append("A Dockerfile COPY --from names no build stage or pinned image")
+            elif instruction == "COPY":
+                for part in value.split()[:-1]:
+                    # A glob or the context root cannot be resolved here without the builder's rules.
+                    if part in (".", "./") or any(c in part for c in "*?["):
+                        continue
+                    source = "vulnerable-app/" + part.removeprefix("./").rstrip("/")
+                    if source not in files and not any(p.startswith(source + "/") for p in files):
+                        limitations.append("A Dockerfile COPY source is missing from the bundle")
+        if not bases:
+            limitations.append("Dockerfile lacks a pinned base")
+    limitations = sorted(set(limitations))[:20]
     return {
         "status": "complete" if not missing and not limitations else "draft",
         "missing": missing,
@@ -220,9 +311,13 @@ def completeness(files):
 
 
 def bundle_zip(db, root, finding):
-    files = resource_files(db, root, "finding", finding.id, finding.artifact_revision)
+    return resource_zip(db, root, "finding", finding.id, finding.artifact_revision)
+
+
+def resource_zip(db, root, resource_type, resource_id, revision=None):
+    files = resource_files(db, root, resource_type, resource_id, revision)
     if not files:
-        raise DomainError("no_artifacts", "This finding has no artifacts", 409)
+        raise DomainError("no_artifacts", f"This {resource_type} has no artifacts", 409)
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as bundle:
         for path, content in files.items():

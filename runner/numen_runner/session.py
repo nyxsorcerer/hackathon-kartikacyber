@@ -8,6 +8,7 @@ validates and the agent is quiet. The broker reaches a session only by executing
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
+from .session_history import read_history, read_scrollback, read_state, save_scrollback, save_state
+
 AGENT = "numen"
 RESULT = Path("/workspace/outputs/result.json")
 HOLD = Path("/home/job/session-hold")
@@ -24,6 +27,12 @@ NUDGES = 3
 POLL = 2  # seconds between session checks
 SETTLED = 3  # unchanged polls before a quiet agent counts as finished with its turn
 STALLED = 8  # unchanged polls before a quiet agent without a result is reminded
+# Herdr's ANSI read normalizes the screen to SGR style codes; settling compares the bare text.
+STYLE = re.compile(r"\x1b\[[0-9;:]*m")
+RECENT = 1000  # Herdr returns at most this many terminal lines per read
+SCROLLBACK = 10000  # terminal lines kept, about a real terminal's scrollback
+TRIM = 1000  # the oldest lines are dropped together, so kept lines rarely shift
+GAP = "\x1b[2m… more output scrolled past than one read holds; the Transcript has the full conversation …\x1b[0m"
 INSTRUCTIONS = (
     "\nWhen you finish, write only the application result JSON object to /workspace/outputs/result.json and stop."
     " An operator may watch this session and send you messages; follow their instructions.")
@@ -71,9 +80,9 @@ def agent_argv(argv, agent):
             elif arg not in exec_only:
                 args.append(arg)
         return args
-    args = [a for a in argv[1:] if a != "--print"]
+    args = [a for a in argv[1:] if a not in {"--print", "--no-session"}]
     mode = args.index("--mode")
-    return args[:mode] + args[mode + 2:] + ["--tui-mode", "regular", "--offline"]
+    return args[:mode] + args[mode + 2:] + ["--session-dir", "/home/job/session-transcripts/pi", "--tui-mode", "regular", "--offline"]
 
 
 def seed_claude(env, profile):
@@ -87,6 +96,40 @@ def seed_claude(env, profile):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(state))
     path.chmod(0o600)
+
+
+def screen_lines(text):
+    lines = text.replace("\r\n", "\n").split("\n")
+    return lines[:-1] if lines and lines[-1] == "" else lines
+
+
+def merge_scrollback(saved, scrolled):
+    """`saved` extended by the lines of `scrolled` that follow its overlap with them."""
+    if not scrolled:
+        return saved
+    for overlap in range(min(len(saved), len(scrolled)), 0, -1):
+        if saved[-overlap:] == scrolled[:overlap]:
+            return saved + scrolled[overlap:]
+    return saved + ([GAP] if saved else []) + scrolled
+
+
+def read_terminal(pane, scrollback):
+    """Scrollback extended by the lines that left the screen, the whole terminal with its colors,
+    and the screen's plain text used to tell when it settles.
+
+    Herdr keeps more history than one read returns, so every poll saves what scrolled off.
+    """
+    visible = screen_lines(call("pane.read", pane_id=pane, source="visible", format="ansi")["read"]["text"])
+    recent = screen_lines(call("pane.read", pane_id=pane, source="recent", format="ansi", lines=RECENT)["read"]["text"])
+    rows = len(visible)
+    lines = merge_scrollback(scrollback["lines"], recent[:-rows] if rows else recent)
+    trimmed = scrollback["trimmed"]
+    if len(lines) > SCROLLBACK:
+        drop = len(lines) - SCROLLBACK + TRIM
+        lines, trimmed = lines[drop:], trimmed + drop
+    note = [f"\x1b[2m… {trimmed} earlier lines are not kept here; the Transcript has the full conversation …\x1b[0m"]
+    shown = (note if trimmed else []) + lines + (recent[-rows:] if rows else [])
+    return {"trimmed": trimmed, "lines": lines}, "\n".join(shown), STYLE.sub("", "\n".join(visible))
 
 
 def result_error(schema):
@@ -103,13 +146,18 @@ def result_error(schema):
     return None if error is None else f"{RESULT} does not match the schema: {error.message[:500]}"
 
 
-def watch(schema, pane, sleep=time.sleep):
+def watch(schema, pane, sleep=time.sleep, agent=None):
     """Wait for a valid result while the operator may steer; remind a stalled agent."""
     previous, quiet, nudges = None, 0, 0
+    scrollback = {"trimmed": 0, "lines": []}
     while True:
         sleep(POLL)
         status = call("agent.get", target=AGENT)["agent"]["agent_status"]
-        screen = call("pane.read", pane_id=pane, source="visible")["read"]["text"]
+        scrollback, terminal, screen = read_terminal(pane, scrollback)
+        if agent:
+            save_scrollback(scrollback)
+            save_state(agent, terminal, status, HOLD.exists())
+        # A color-only change (a pulsing spinner) is not new output.
         quiet = quiet + 1 if screen == previous else 0
         previous = screen
         # Herdr reports Codex as unknown while idle; an unchanged screen guards that fallback.
@@ -129,7 +177,20 @@ def watch(schema, pane, sleep=time.sleep):
 
 
 def run(argv, profile, env, prompt, schema):
+    save_state(profile["agent"])
+    env = dict(env)
+    if profile["agent"] in {"claude", "pi"}:
+        temporary = Path("/home/job/session-output") / profile["agent"]
+        temporary.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if profile["agent"] == "claude":
+            env.update({"CLAUDE_CODE_TMPDIR": str(temporary), "CLAUDE_CODE_PROJECT_DIR_NAME": "numen"})
+        else:
+            env["TMPDIR"] = str(temporary)
     if profile["agent"] == "claude":
+        # Claude's fullscreen renderer draws on the alternate screen, which has no scrollback,
+        # so the conversation could not be scrolled back in the session view. Codex gets
+        # --no-alt-screen and Pi --tui-mode regular for the same reason.
+        env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
         seed_claude(env, profile)
     server = subprocess.Popen(["herdr", "server"], env=env, cwd="/workspace", stdin=subprocess.DEVNULL,
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
@@ -141,7 +202,7 @@ def run(argv, profile, env, prompt, schema):
         except HerdrError as exc:
             raise ValueError(f"interactive agent session did not start ({exc.code})") from None
         try:
-            return watch(schema, pane)
+            return watch(schema, pane, agent=profile["agent"])
         except HerdrError as exc:
             raise ValueError(f"interactive agent session ended unexpectedly ({exc.code})") from None
     except Exception:
@@ -193,10 +254,21 @@ def submit(text, deadline):
 def main():
     command = sys.argv[1]
     if command == "read":
-        agent = call("agent.get", target=AGENT)["agent"]
-        screen = call("pane.read", pane_id=agent["pane_id"], source="recent_unwrapped", lines=400)["read"]["text"]
-        print(json.dumps({"agent": agent.get("agent"), "agent_status": agent["agent_status"],
-                          "screen": screen, "held": HOLD.exists()}))
+        try:
+            agent = call("agent.get", target=AGENT)["agent"]
+            try:
+                saved = read_scrollback()
+            except (OSError, ValueError):
+                saved = {"trimmed": 0, "lines": []}  # A damaged file never blocks a live read.
+            screen = read_terminal(agent["pane_id"], saved)[1]
+        except (OSError, HerdrError):
+            print(json.dumps(read_history()))  # The server can end before its workload exits.
+        else:
+            kind = read_state()["agent"]
+            save_state(kind, screen, agent["agent_status"], HOLD.exists())
+            print(json.dumps({**read_history(include_partial=False), "live": True}))
+    elif command == "archive":
+        print(json.dumps(read_history()))
     elif command == "send":
         # Bounded and validated by the broker; this is the operator's own message to the agent.
         request = json.loads(sys.argv[2])

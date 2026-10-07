@@ -1,24 +1,25 @@
 import hmac
-import io
 import json
 import zipfile
 import secrets
+import shutil
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse, quote
 
 from fastapi import APIRouter, Depends, FastAPI, File, Form, Header, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from . import artifacts, cves, domain
+from . import artifacts, cves, domain, prompts
 from .broker import Broker
 from .config import Config
 from .db import make_database
@@ -48,6 +49,9 @@ from .models import (
 )
 from .schemas import (
     AccountInput,
+    BatchAnalysisInput,
+    BatchDeleteInput,
+    BatchReviewInput,
     FindingInput,
     LoginCodeInput,
     LoginInput,
@@ -56,6 +60,8 @@ from .schemas import (
     OPERATIONS,
     OperationInput,
     ProgramInput,
+    PromptInput,
+    PromptPreviewInput,
     ReviewInput,
     SessionInput,
     http_url,
@@ -69,12 +75,15 @@ from .security import (
     token_hash,
     verify_password,
 )
-from .queue import runtime_phases
+from .queue import RUNTIME_EVENTS, runtime_phases
 from .workflows import all_secrets
 
 
 def accepted(job):
     return JSONResponse({"job_id": job.id, "status_url": f"/api/jobs/{job.id}"}, status_code=202)
+
+
+ACTIVE_JOB = ["queued", "running", "cancelling"]
 
 
 def create_app(database_url=None, artifact_root=None, admin_password=None, config=None):
@@ -173,7 +182,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 raise DomainError("csrf_required", "A valid CSRF token is required", 403)
         return row
 
-    def paginate(db, stmt, mapper, cursor=None, limit=50):
+    def paginate(db, stmt, mapper, cursor=None, limit=50, page_mapper=None):
         try:
             offset = int(cursor or "0")
             if offset < 0 or offset > 1000000 or not 1 <= limit <= 200:
@@ -181,10 +190,20 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         except ValueError as exc:
             raise DomainError("invalid_cursor", "Invalid pagination cursor or limit", 422) from exc
         rows = list(db.scalars(stmt.offset(offset).limit(limit + 1)))
+        page = rows[:limit]
+        if page_mapper:  # Shared lookups for the whole page instead of one per row.
+            mapper = page_mapper(page)
         return {
-            "items": [mapper(row) for row in rows[:limit]],
+            "items": [mapper(row) for row in page],
             "next_cursor": str(offset + limit) if len(rows) > limit else None,
         }
+
+    def commit_page(db):
+        def mapper(page):
+            findings = domain.commit_findings(db, [c.id for c in page])
+            return lambda c: domain.commit_json(db, c, findings)
+
+        return mapper
 
     def action(db, resource_type, ident, data):
         db.add(Action(resource_type=resource_type, resource_id=ident, data=data))
@@ -261,7 +280,15 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 domain.get(db, Program, link.program_id), domain.get(db, CVE, link.cve_id), link
             )["eligible"]
         )
-        recent = list(db.scalars(select(JobEvent).order_by(JobEvent.created_at.desc()).limit(20)))
+        recent = list(
+            db.scalars(
+                # Runtime plumbing belongs on a job's own timeline, not in the activity feed.
+                select(JobEvent)
+                .where(JobEvent.data["kind"].as_string().not_in(sorted(RUNTIME_EVENTS)))
+                .order_by(JobEvent.created_at.desc())
+                .limit(20)
+            )
+        )
         due = list(
             db.scalars(
                 select(Program)
@@ -414,7 +441,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             stmt = stmt.where(Commit.program_id == program_id)
         if review_decision:
             stmt = stmt.where(Commit.review_decision == review_decision)
-        return paginate(db, stmt, lambda c: domain.commit_json(db, c), cursor, limit)
+        return paginate(db, stmt, None, cursor, limit, commit_page(db))
 
     @router.get("/programs/{ident}/commits")
     def program_commits(
@@ -424,21 +451,20 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         return paginate(
             db,
             select(Commit).where(Commit.program_id == ident).order_by(Commit.id),
-            lambda c: domain.commit_json(db, c),
+            None,
             cursor,
             limit,
+            commit_page(db),
         )
 
     @router.get("/commits/{ident}")
     def commit(ident: str, db=database_dependency):
         return domain.commit_json(db, domain.get(db, Commit, ident))
 
-    @router.post("/commits/{ident}/review")
-    def review(ident: str, body: ReviewInput, db=database_dependency):
-        row = domain.get(db, Commit, ident)
-        row.review_decision = body.decision
-        action(db, "commit", row.id, {"action": "review", "decision": body.decision})
-        if body.decision == "candidate":
+    def record_review(db, row, decision):
+        row.review_decision = decision
+        action(db, "commit", row.id, {"action": "review", "decision": decision})
+        if decision == "candidate":
             domain.notify(
                 db,
                 f"commit:{row.id}:candidate",
@@ -446,7 +472,92 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 f"/commits/{row.id}",
                 "Operator nominated this change for security review",
             )
+
+    @router.post("/commits/review")
+    def review_batch(body: BatchReviewInput, db=database_dependency):
+        """Applies one decision to many revisions atomically; unknown ids change nothing."""
+        ids = list(dict.fromkeys(body.ids))
+        rows = {c.id: c for c in db.scalars(select(Commit).where(Commit.id.in_(ids)))}
+        missing = [i for i in ids if i not in rows]
+        if missing:
+            raise DomainError(
+                "not_found", f"{len(missing)} of {len(ids)} commits were not found", 404
+            )
+        items = []
+        for ident in ids:
+            row = rows[ident]
+            previous = row.review_decision
+            if previous != body.decision:
+                record_review(db, row, body.decision)
+            items.append({"id": ident, "previous": previous, "review_decision": body.decision})
+        return {"items": items}
+
+    @router.post("/commits/{ident}/review")
+    def review(ident: str, body: ReviewInput, db=database_dependency):
+        row = domain.get(db, Commit, ident)
+        record_review(db, row, body.decision)
         return domain.commit_json(db, row)
+
+    def queue_commit_analysis(db, row, program, profile, key):
+        job = domain.submit_agent(
+            db,
+            "commit_analysis",
+            program,
+            {"commit_id": row.id, "source_ref": row.revision},
+            profile.model_dump() if profile else None,
+            key,
+        )
+        action(db, "commit", row.id, {"action": "analysis_requested", "job_id": job.id})
+        return job
+
+    @router.post("/commits/analyses")
+    def analyze_batch(
+        body: BatchAnalysisInput,
+        key: str | None = Header(None, alias="Idempotency-Key"),
+        db=database_dependency,
+    ):
+        """Queues one commit analysis per revision. A revision from an earlier source generation,
+        or one already being analyzed, is skipped and reported; an unknown id or an unusable
+        profile queues nothing."""
+        ids = list(dict.fromkeys(body.ids))
+        rows = {c.id: c for c in db.scalars(select(Commit).where(Commit.id.in_(ids)))}
+        missing = [i for i in ids if i not in rows]
+        if missing:
+            raise DomainError(
+                "not_found", f"{len(missing)} of {len(ids)} commits were not found", 404
+            )
+        commit_id = Job.input["commit_id"].as_string()
+        active = set(
+            db.scalars(
+                select(commit_id).where(
+                    Job.kind == "commit_analysis",
+                    Job.status.in_(ACTIVE_JOB),
+                    commit_id.in_(ids),
+                )
+            )
+        )
+        programs = {
+            p.id: p
+            for p in db.scalars(
+                select(Program).where(Program.id.in_({r.program_id for r in rows.values()}))
+            )
+        }
+        items = []
+        for ident in ids:
+            row, program = rows[ident], programs[rows[ident].program_id]
+            # Each revision has its own key, so a resubmitted batch returns the same jobs.
+            item_key = f"{key}:{ident}" if key else None
+            replay = item_key and db.scalar(select(Job).where(Job.idempotency_key == item_key))
+            if replay:
+                items.append({"id": ident, "job_id": replay.id, "skipped": None})
+            elif row.source_generation != program.source_generation:
+                items.append({"id": ident, "job_id": None, "skipped": "historical_source"})
+            elif ident in active:
+                items.append({"id": ident, "job_id": None, "skipped": "analysis_active"})
+            else:
+                job = queue_commit_analysis(db, row, program, body.profile, item_key)
+                items.append({"id": ident, "job_id": job.id, "skipped": None})
+        return JSONResponse({"items": items}, status_code=202)
 
     @router.post("/commits/{ident}/analyses")
     def analyze_commit(
@@ -463,16 +574,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 "This commit belongs to a previous source generation; current source context cannot analyze it",
                 422,
             )
-        job = domain.submit_agent(
-            db,
-            "commit_analysis",
-            program,
-            {"commit_id": row.id, "source_ref": row.revision},
-            body.profile.model_dump() if body.profile else None,
-            key,
-        )
-        action(db, "commit", row.id, {"action": "analysis_requested", "job_id": job.id})
-        return accepted(job)
+        return accepted(queue_commit_analysis(db, row, program, body.profile, key))
 
     @router.get("/programs/{ident}/version-recipes")
     def recipes(ident: str, cursor: str | None = None, limit: int = 50, db=database_dependency):
@@ -602,16 +704,23 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         db=database_dependency,
     ):
         row = domain.get(db, Program, ident)
+        inputs = {
+            "focus": body.focus,
+            "max_functions": body.max_functions,
+            **({"fresh": True} if body.fresh else {}),
+        }
+        if body.refresh_from:
+            base = db.get(AuditContext, body.refresh_from)
+            if base is None or base.program_id != row.id:
+                raise DomainError("not_found", "There is no such audit context for this program", 404)
+            # A refresh keeps the scope the context was built with.
+            inputs = domain.audit_refresh_input(db, row, base)
         return accepted(
             domain.submit_agent(
                 db,
                 "audit_context",
                 row,
-                {
-                    "focus": body.focus,
-                    "max_functions": body.max_functions,
-                    **({"fresh": True} if body.fresh else {}),
-                },
+                inputs,
                 body.profile.model_dump() if body.profile else None,
                 key,
             )
@@ -688,11 +797,16 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         program_id: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
+        view: Literal["full", "summary"] = "full",
         db=database_dependency,
     ):
         stmt = select(Finding).order_by(Finding.created_at.desc())
         if program_id:
             stmt = stmt.where(Finding.program_id == program_id)
+        if view == "summary":
+            page = paginate(db, stmt, lambda row: row, cursor, limit)
+            page["items"] = domain.finding_summaries(db, page["items"], config.artifact_root)
+            return page
         return paginate(
             db, stmt, lambda f: domain.finding_json(db, f, config.artifact_root), cursor, limit
         )
@@ -732,13 +846,14 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     @router.patch("/findings/{ident}")
     def patch_finding(ident: str, body: dict, db=database_dependency):
         row = domain.get(db, Finding, ident)
+        db.refresh(row, with_for_update=True)
         old = {
             "program_id": row.program_id,
             "kind": row.kind,
             "cve_id": row.cve_id,
             "title": row.title,
             "status": row.status,
-            **row.data,
+            **domain.finding_data(row),
         }
         data = FindingInput.model_validate({**old, **body})
         validate_finding_refs(db, data)
@@ -748,7 +863,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         for field in ("kind", "cve_id", "title", "status"):
             setattr(row, field, values.pop(field))
         values.pop("program_id")
-        row.data, row.updated_at = values, now()
+        row.data, row.updated_at = {**row.data, **values}, now()
         action(
             db,
             "finding",
@@ -760,6 +875,93 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             },
         )
         return domain.finding_json(db, row, config.artifact_root)
+
+    def finding_jobs(db, ids):
+        """The findings among `ids` that a queued or running job still works on."""
+        finding_id = Job.input["finding_id"].as_string()
+        return set(
+            db.scalars(select(finding_id).where(Job.status.in_(ACTIVE_JOB), finding_id.in_(ids)))
+        )
+
+    def remove_finding(db, row):
+        """Deletes the finding, its lab runs and their artifact records, keeping an audit record
+        of what was deleted. Returns the artifact revisions whose folders the caller removes once
+        the rows are gone."""
+        labs = list(db.scalars(select(LabRun.id).where(LabRun.finding_id == row.id)))
+        owned = or_(
+            and_(Artifact.resource_type == "finding", Artifact.resource_id == row.id),
+            and_(Artifact.resource_type == "lab", Artifact.resource_id.in_(labs)),
+        )
+        revisions = set(db.scalars(select(Artifact.revision).where(owned)))
+        db.execute(delete(Artifact).where(owned))
+        db.execute(delete(LabRun).where(LabRun.finding_id == row.id))
+        action(db, "finding", row.id, {
+            "action": "deleted",
+            "title": row.title,
+            "kind": row.kind,
+            "cve_id": row.cve_id,
+            "status": row.status,
+            "program_id": row.program_id,
+            "source_commit_id": row.data.get("source_commit_id"),
+            "source_analysis_id": row.data.get("source_analysis_id"),
+        })
+        db.delete(row)
+        return revisions
+
+    def remove_revision_folders(revisions):
+        root = Path(config.artifact_root).resolve()
+        for revision in revisions:
+            # Each publication has its own revision folder, so nothing else shares these files.
+            folder = (root / revision).resolve()
+            if folder.parent == root and folder.is_dir():
+                shutil.rmtree(folder, ignore_errors=True)
+
+    @router.delete("/findings/{ident}", status_code=204)
+    def delete_finding(ident: str, db=database_dependency):
+        """Remove a finding recorded in error, such as one a false-positive analysis created:
+        the finding, its lab runs and their artifacts. The analysis that produced it stays as it
+        was, and an audit record keeps what was deleted."""
+        row = domain.get(db, Finding, ident)
+        db.refresh(row, with_for_update=True)
+        if finding_jobs(db, [row.id]):
+            raise DomainError(
+                "finding_busy",
+                "A job is still working on this finding; cancel it or let it finish before deleting the finding",
+                409,
+            )
+        revisions = remove_finding(db, row)
+        db.flush()
+        remove_revision_folders(revisions)
+        return Response(status_code=204)
+
+    @router.post("/findings/delete")
+    def delete_findings(body: BatchDeleteInput, db=database_dependency):
+        """Deletes many findings as one change: an unknown id, or a finding a job still works on,
+        deletes nothing."""
+        ids = list(dict.fromkeys(body.ids))
+        rows = {
+            f.id: f
+            for f in db.scalars(select(Finding).where(Finding.id.in_(ids)).with_for_update())
+        }
+        missing = [i for i in ids if i not in rows]
+        if missing:
+            raise DomainError(
+                "not_found", f"{len(missing)} of {len(ids)} findings were not found", 404
+            )
+        busy = finding_jobs(db, ids)
+        if busy:
+            raise DomainError(
+                "finding_busy",
+                f"Jobs are still working on {len(busy)} of the selected findings; cancel them or "
+                "let them finish, then delete again",
+                409,
+            )
+        revisions = set()
+        for ident in ids:
+            revisions |= remove_finding(db, rows[ident])
+        db.flush()
+        remove_revision_folders(revisions)
+        return {"deleted": ids}
 
     @router.post("/findings/{ident}/artifacts")
     async def upload_artifacts(
@@ -806,7 +1008,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             },
             all_secrets(db, vault),
         )
-        row.artifact_revision, row.updated_at = revision, now()
+        domain.set_finding_artifacts(db, row, revision, values)
+        row.updated_at = now()
         action(db, "finding", row.id, {"action": "artifacts_uploaded", "revision": revision})
         return domain.finding_json(db, row, config.artifact_root)
 
@@ -888,11 +1091,28 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             },
         )
 
+    @router.get("/analyses/{ident}/download")
+    def download_analysis(ident: str, db=database_dependency):
+        row = domain.get(db, Analysis, ident)
+        filename = f"{row.subject_id}-{row.id[:8]}-analysis.zip"
+        return Response(
+            artifacts.resource_zip(db, config.artifact_root, "analysis", row.id),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": (
+                    "attachment; filename=analysis.zip; "
+                    f"filename*=UTF-8''{quote(filename, safe='')}"
+                ),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "private, no-store",
+            },
+        )
+
     @router.get("/findings/{ident}/download")
     def download(ident: str, db=database_dependency):
         row = domain.get(db, Finding, ident)
-        return StreamingResponse(
-            io.BytesIO(artifacts.bundle_zip(db, config.artifact_root, row)),
+        return Response(
+            artifacts.bundle_zip(db, config.artifact_root, row),
             media_type="application/zip",
             headers={
                 "Content-Disposition": f'attachment; filename="{row.id}.zip"',
@@ -930,25 +1150,72 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             limit,
         )
 
-    def session_runs(db, ident):
-        """Broker runs the job's current attempt still owns, oldest first."""
+    def session_runs(db, ident, live=False):
+        """Job-owned runs, using their recorded start order for retained history."""
         row = domain.get(db, Job, ident)
-        if row.status != "running":
-            return []
-        attempt = db.get(JobAttempt, row.attempt_token) if row.attempt_token else None
-        return [run for run in runtime_phases(attempt, row.broker_run_id).values() if run]
+        if live:
+            if row.status != "running":
+                return []
+            attempt = db.scalar(
+                select(JobAttempt).where(
+                    JobAttempt.id == row.attempt_token,
+                    JobAttempt.job_id == row.id,
+                    JobAttempt.status == "running",
+                )
+            )
+            return (
+                [run for run in runtime_phases(attempt, row.broker_run_id).values() if run]
+                if attempt else []
+            )
+        starts, non_agent_runs = {}, set()
+        # Completed phases leave runtime_phases; their timeline records retain run membership.
+        for event in db.scalars(
+            select(JobEvent)
+            .where(JobEvent.job_id == row.id, JobEvent.data["kind"].as_string() == "runtime_started")
+            .order_by(JobEvent.created_at, JobEvent.id)
+        ):
+            run = event.data.get("run_id")
+            if isinstance(run, str) and run:
+                if event.data.get("runtime_kind") not in (None, "agent"):
+                    non_agent_runs.add(run)
+                    continue
+                starts.setdefault(run, (utc(event.created_at), len(starts)))
+        for attempt in db.scalars(
+            select(JobAttempt).where(JobAttempt.job_id == row.id)
+            .order_by(JobAttempt.created_at, JobAttempt.id)
+        ):
+            for run in runtime_phases(attempt).values():
+                if isinstance(run, str) and run and run not in non_agent_runs:
+                    starts.setdefault(run, (utc(attempt.created_at), len(starts)))
+        runs = sorted(starts, key=starts.get)
+        # Older records may have only the job's latest broker run, without a timeline entry.
+        if row.broker_run_id and row.broker_run_id not in starts and row.broker_run_id not in non_agent_runs:
+            runs.append(row.broker_run_id)
+        return runs
 
     @router.get("/jobs/{ident}/session")
     def job_session(ident: str, run: str | None = None, db=database_dependency):
         runs = session_runs(db, ident)
         if not runs:
-            raise DomainError("session_unavailable", "This job has no running agent session", 409)
-        run_id = run if run in runs else runs[-1]
-        return {"runs": runs, "run_id": run_id, **broker.session(run_id)}
+            raise DomainError("session_unavailable", "This job has no recorded agent session", 409)
+        if run is not None and run not in runs:
+            raise DomainError("session_unavailable", "That run does not belong to this job", 409)
+        # Older mixed workloads can end with a probe. Default to the newest readable session.
+        for run_id in [run] if run is not None else reversed(runs.copy()):
+            try:
+                state = broker.session(run_id)
+            except DomainError as exc:
+                if run is not None or exc.code != "session_unavailable" or exc.status != 409:
+                    raise
+                runs.remove(run_id)
+                if not runs:
+                    raise
+            else:
+                return {"runs": runs, "run_id": run_id, **state}
 
     @router.post("/jobs/{ident}/session", status_code=202)
     def job_session_input(ident: str, body: SessionInput, db=database_dependency):
-        if body.run_id not in session_runs(db, ident):
+        if body.run_id not in session_runs(db, ident, live=True):
             raise DomainError("session_unavailable", "That run is not a live session of this job", 409)
         broker.session(body.run_id, body.model_dump(exclude={"run_id"}, exclude_none=True))
         return {"status": "accepted"}
@@ -973,6 +1240,10 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         if row.status not in ("failed", "cancelled"):
             raise DomainError(
                 "job_not_retryable", "Only failed or cancelled jobs can be retried", 409
+            )
+        if row.input.get("finding_id") and db.get(Finding, row.input["finding_id"]) is None:
+            raise DomainError(
+                "finding_removed", "The finding this job worked on has been deleted", 409
             )
         program = domain.get(db, Program, row.program_id) if row.program_id else None
         job = domain.enqueue(db, row.kind, program, row.input, row.profile, key)
@@ -1089,6 +1360,27 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             "webhook_configured": bool(row.webhook_secret),
             "webhook_masked": "Configured" if row.webhook_secret else None,
         }
+
+    @router.get("/prompts")
+    def prompt_templates(db=database_dependency):
+        return {"items": prompts.listing(db), "variables": prompts.VARIABLES}
+
+    @router.put("/prompts/{name}")
+    def save_prompt(name: str, body: PromptInput, db=database_dependency):
+        """Saves the operator's version of a template; the next job that uses it renders it."""
+        previous, row = prompts.store(db, name, body.source)
+        action(db, "prompt", name, {"action": "updated", "previous": previous, "customized": row["customized"]})
+        return row
+
+    @router.delete("/prompts/{name}")
+    def reset_prompt(name: str, db=database_dependency):
+        previous, row = prompts.store(db, name, None)
+        action(db, "prompt", name, {"action": "reset", "previous": previous})
+        return row
+
+    @router.post("/prompts/preview")
+    def preview_prompt(body: PromptPreviewInput, db=database_dependency):
+        return prompts.preview(db, body.operation, body.name, body.source, body.build)
 
     @router.post("/settings/webhook/test")
     def webhook_test(db=database_dependency):

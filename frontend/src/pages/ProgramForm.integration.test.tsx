@@ -88,6 +88,7 @@ it("saves WordPress independently of GitHub and retains field values after serve
   expect(screen.getByLabelText("Asset URL")).toHaveValue(
     "https://portal.example.test",
   );
+  await user.click(screen.getByLabelText("Keep the audit context current"));
   await user.click(screen.getByRole("button", { name: "Save program" }));
   expect(
     await screen.findByRole("heading", { name: "Saved program" }),
@@ -98,5 +99,8 @@ it("saves WordPress independently of GitHub and retains field values after serve
     source_url: null,
     plugin_slug: "example-plugin",
     monitor_interval_days: null,
+    config: expect.objectContaining({ audit_auto_refresh: true }),
   });
+  // Off unless the operator turns it on.
+  expect(submissions[0].config).toMatchObject({ audit_auto_refresh: false });
 });

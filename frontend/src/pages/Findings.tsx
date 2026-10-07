@@ -9,25 +9,30 @@ import {
   Download,
   FlaskConical,
   PencilLine,
+  Trash2,
   Plus,
   Save,
   Sparkles,
   Target,
   Upload,
 } from "lucide-react";
+import { z } from "zod";
 import { mutate, request } from "../api";
 import { useResource } from "../hooks";
 import {
+  findingDeletionSchema,
   findingSchema,
-  findingsSchema,
+  findingSummariesSchema,
   programSchema,
   programsSchema,
 } from "../types";
 import type { Finding, Program } from "../types";
+import { versionLabels } from "../versions";
 import { JobLaunch, queueJob } from "../components/JobLaunch";
 import { ArtifactBrowser } from "../components/ArtifactPreview";
 import {
   ActionButton,
+  announceChange,
   Badge,
   Callout,
   CopyButton,
@@ -42,11 +47,9 @@ import {
   PageHeading,
   Panel,
   Pagination,
-  Tabs,
   Time,
 } from "../components/ui";
-function labState(finding: Finding) {
-  const status = finding.lab_runs[0]?.status;
+function labState(status: unknown) {
   if (typeof status !== "string")
     return { label: "Lab unverified", tone: "neutral" };
   return status === "verified"
@@ -56,8 +59,13 @@ function labState(finding: Finding) {
         tone: status === "failed" ? "danger" : "warm",
       };
 }
-function findingIdentifier(finding: Finding) {
-  return finding.cve_id || `0day · ${finding.id.slice(0, 8)}`;
+function findingIdentifier(
+  finding: Pick<Finding, "id" | "cve_id" | "source_commit_id">,
+) {
+  return (
+    finding.cve_id ||
+    `${finding.source_commit_id ? "Commit finding" : "0day"} · ${finding.id.slice(0, 8)}`
+  );
 }
 export function Findings() {
   return (
@@ -77,17 +85,42 @@ export function Findings() {
     </>
   );
 }
+function findingCount(n: number) {
+  return `${n} ${n === 1 ? "finding" : "findings"}`;
+}
+const noSelection = new Set<string>();
 export function FindingsList({ program }: { program?: Program }) {
   const [cursor, setCursor] = useState("");
-  const params = new URLSearchParams();
+  const params = new URLSearchParams({ view: "summary" });
   if (program) params.set("program_id", program.id);
   if (cursor) params.set("cursor", cursor);
   const resource = useResource(
     `/findings${params.size ? `?${params}` : ""}`,
-    findingsSchema,
+    findingSummariesSchema,
     0,
     true,
   );
+  const items = resource.data?.items || [];
+  // A selection belongs to one page, so a deletion never reaches a finding the
+  // operator cannot see.
+  const [selection, setSelection] = useState({ key: cursor, ids: noSelection });
+  const selectedIds = selection.key === cursor ? selection.ids : noSelection;
+  const selected = items.filter((f) => selectedIds.has(f.id));
+  const allSelected = items.length > 0 && selected.length === items.length;
+  const select = (ids: Set<string>) => setSelection({ key: cursor, ids });
+  const remove = async () => {
+    const { deleted } = await mutate(
+      "/findings/delete",
+      findingDeletionSchema,
+      { ids: selected.map((f) => f.id) },
+    );
+    notify(`Deleted ${findingCount(deleted.length)}.`);
+    select(noSelection);
+    announceChange();
+    // An emptied later page has nothing left to show; start from the first.
+    if (cursor && deleted.length === items.length) setCursor("");
+    else resource.refresh();
+  };
   return (
     <Panel
       title="Finding register"
@@ -110,11 +143,68 @@ export function FindingsList({ program }: { program?: Program }) {
         retry={resource.refresh}
         hasData={!!resource.data}
       >
-        {resource.data?.items.length ? (
+        {items.length > 0 &&
+          (selected.length ? (
+            <div className="queue-bar batch">
+              <span className="queue-bar-count" role="status">
+                <strong>{selected.length}</strong> selected
+              </span>
+              <div className="queue-bar-actions">
+                <ActionButton
+                  className="danger-button"
+                  confirm={`Delete ${findingCount(selected.length)} permanently?`}
+                  title="Remove the selected findings, their bundles and lab runs. The analyses that created them are kept."
+                  onAction={remove}
+                >
+                  <Trash2 size={15} aria-hidden="true" />
+                  Delete {findingCount(selected.length)}
+                </ActionButton>
+              </div>
+              <button
+                type="button"
+                className="text-button queue-bar-clear"
+                onClick={() => select(noSelection)}
+              >
+                Clear selection
+              </button>
+            </div>
+          ) : (
+            <div className="queue-bar">
+              <span>
+                {findingCount(items.length)}
+                {cursor || resource.data?.next_cursor ? " on this page" : ""}
+              </span>
+              <span className="hint queue-bar-hint">
+                Select findings to delete them together.
+              </span>
+            </div>
+          ))}
+        {items.length ? (
           <div className="table-scroll">
-            <table>
+            <table className="finding-table">
               <thead>
                 <tr>
+                  <th scope="col" className="select-cell">
+                    <label className="select-hit">
+                      <input
+                        type="checkbox"
+                        aria-label="Select all findings on this page"
+                        checked={allSelected}
+                        ref={(el) => {
+                          if (el)
+                            el.indeterminate =
+                              selected.length > 0 && !allSelected;
+                        }}
+                        onChange={() =>
+                          select(
+                            allSelected
+                              ? noSelection
+                              : new Set(items.map((f) => f.id)),
+                          )
+                        }
+                      />
+                    </label>
+                  </th>
                   <th scope="col">Finding</th>
                   <th scope="col">Status</th>
                   <th scope="col">Upstream fixed in</th>
@@ -124,10 +214,29 @@ export function FindingsList({ program }: { program?: Program }) {
                 </tr>
               </thead>
               <tbody>
-                {resource.data.items.map((finding) => {
-                  const lab = labState(finding);
+                {items.map((finding) => {
+                  const lab = labState(finding.lab_status);
+                  const isSelected = selectedIds.has(finding.id);
                   return (
-                    <tr key={finding.id}>
+                    <tr
+                      key={finding.id}
+                      className={isSelected ? "is-selected" : undefined}
+                    >
+                      <td className="select-cell">
+                        <label className="select-hit">
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${finding.title}`}
+                            checked={isSelected}
+                            onChange={(e) => {
+                              const next = new Set(selectedIds);
+                              if (e.target.checked) next.add(finding.id);
+                              else next.delete(finding.id);
+                              select(next);
+                            }}
+                          />
+                        </label>
+                      </td>
                       <td>
                         <Link
                           className="table-title"
@@ -143,7 +252,7 @@ export function FindingsList({ program }: { program?: Program }) {
                         <Badge>{finding.status}</Badge>
                       </td>
                       <td>
-                        {finding.fixed_versions.join(", ") || (
+                        {versionLabels(finding.fixed_versions).join(", ") || (
                           <span className="muted">Unknown</span>
                         )}
                       </td>
@@ -223,12 +332,14 @@ function FindingEditor({ finding }: { finding?: Finding }) {
   const [cveId, setCveId] = useState(
     finding?.cve_id || params.get("cve_id") || "",
   );
-  const [title, setTitle] = useState(finding?.title || "");
-  const [status, setStatus] = useState(finding?.status || "open");
-  const [affected, setAffected] = useState(
-    finding?.affected_versions.join("\n") || "",
+  const [title, setTitle] = useState(
+    finding?.title || params.get("title") || "",
   );
-  const [fixed, setFixed] = useState(finding?.fixed_versions.join("\n") || "");
+  const [status, setStatus] = useState(finding?.status || "open");
+  const initialAffected = versionLabels(finding?.affected_versions).join("\n");
+  const initialFixed = versionLabels(finding?.fixed_versions).join("\n");
+  const [affected, setAffected] = useState(initialAffected);
+  const [fixed, setFixed] = useState(initialFixed);
   const [target, setTarget] = useState(
     finding?.target_applicability || "unknown",
   );
@@ -262,8 +373,14 @@ function FindingEditor({ finding }: { finding?: Finding }) {
                 cve_id: cveId || null,
                 title,
                 status,
-                affected_versions: affected.split("\n").filter(Boolean),
-                fixed_versions: fixed.split("\n").filter(Boolean),
+                affected_versions:
+                  finding && affected === initialAffected
+                    ? finding.affected_versions
+                    : affected.split("\n").filter(Boolean),
+                fixed_versions:
+                  finding && fixed === initialFixed
+                    ? finding.fixed_versions
+                    : fixed.split("\n").filter(Boolean),
                 target_applicability: target,
                 source_commit_id:
                   finding?.source_commit_id || params.get("source_commit_id"),
@@ -428,27 +545,6 @@ export function FindingDetail() {
     </DataState>
   );
 }
-const artifactTabs = [
-  {
-    id: "report",
-    label: "Report",
-    noun: "report",
-    match: (path: string) =>
-      path === "report.md" || path.endsWith("/report.md"),
-  },
-  {
-    id: "poc",
-    label: "Python PoC",
-    noun: "PoC",
-    match: (path: string) => path === "poc.py" || path.endsWith("/poc.py"),
-  },
-  {
-    id: "app",
-    label: "Vulnerable app",
-    noun: "vulnerable app",
-    match: (path: string) => path.startsWith("vulnerable-app/"),
-  },
-];
 function FindingBody({
   finding,
   refresh,
@@ -456,15 +552,13 @@ function FindingBody({
   finding: Finding;
   refresh: () => void;
 }) {
-  const [tab, setTab] = useState("report");
   const [generate, setGenerate] = useState(false);
   const [upload, setUpload] = useState(false);
+  const navigate = useNavigate();
   const program = useResource(`/programs/${finding.program_id}`, programSchema);
-  const activeTab = artifactTabs.find((t) => t.id === tab) || artifactTabs[0];
-  const artifacts = finding.artifacts.filter((a) => activeTab.match(a.path));
   const complete = finding.artifact_state.status === "complete";
   const observed = program.data?.version;
-  const lab = labState(finding);
+  const lab = labState(finding.lab_runs[0]?.status);
   return (
     <>
       <PageHeading
@@ -487,14 +581,40 @@ function FindingBody({
               <PencilLine size={15} aria-hidden="true" />
               Edit finding
             </Link>
-            {complete && (
+            <ActionButton
+              className="danger-button"
+              confirm="Delete permanently?"
+              title="Remove this finding, its bundle and lab runs. The analysis that created it is kept."
+              onAction={async () => {
+                await mutate(
+                  `/findings/${finding.id}`,
+                  z.unknown(),
+                  {},
+                  "DELETE",
+                );
+                // A false positive usually came from a commit; return there to dismiss it.
+                if (finding.source_commit_id) {
+                  notify(
+                    "Finding deleted. You can dismiss the revision that produced it here.",
+                  );
+                  navigate(`/commits/${finding.source_commit_id}`);
+                } else {
+                  notify("Finding deleted.");
+                  navigate("/findings");
+                }
+              }}
+            >
+              <Trash2 size={15} aria-hidden="true" />
+              Delete finding
+            </ActionButton>
+            {finding.artifacts.length > 0 && (
               <a
-                className="primary button"
+                className={`${complete ? "primary" : "secondary"} button`}
                 download
                 href={`/api/findings/${finding.id}/download`}
               >
                 <Download size={15} aria-hidden="true" />
-                Download bundle
+                {complete ? "Download bundle" : "Download draft bundle"}
               </a>
             )}
           </>
@@ -537,13 +657,13 @@ function FindingBody({
             items={[
               [
                 "Fixed in",
-                finding.fixed_versions.join(", ") || (
+                versionLabels(finding.fixed_versions).join(", ") || (
                   <span className="muted">Unknown</span>
                 ),
               ],
               [
                 "Affected versions",
-                finding.affected_versions.join(", ") || (
+                versionLabels(finding.affected_versions).join(", ") || (
                   <span className="muted">Unknown</span>
                 ),
               ],
@@ -670,22 +790,16 @@ function FindingBody({
           </>
         }
       >
-        <Tabs
-          label="Artifact type"
-          items={artifactTabs.map((t) => ({
-            id: t.id,
-            label: t.label,
-            count: finding.artifacts.filter((a) => t.match(a.path)).length,
-          }))}
-          active={tab}
-          onChange={setTab}
-        />
-        {artifacts.length ? (
-          <ArtifactBrowser artifacts={artifacts} />
+        {finding.artifacts.length ? (
+          <ArtifactBrowser
+            key={finding.artifact_revision}
+            artifacts={finding.artifacts}
+            grouped
+          />
         ) : (
           <Empty
-            title={`No ${activeTab.noun} yet`}
-            description="Upload files or request generation to prepare this part of the bundle."
+            title="No artifacts yet"
+            description="Upload files or request generation to prepare the report, PoC, and vulnerable application."
           />
         )}
       </Panel>

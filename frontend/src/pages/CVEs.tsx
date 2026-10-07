@@ -29,6 +29,7 @@ import { JobLaunch, queueJob } from "../components/JobLaunch";
 import {
   ActionButton,
   Badge,
+  Callout,
   countBy,
   DataState,
   DetailGrid,
@@ -44,13 +45,14 @@ import {
   ResultSummary,
   SearchField,
   Segmented,
+  Tabs,
   severityLabels,
   severityOf,
   Time,
   useShowMore,
 } from "../components/ui";
 import type { Severity } from "../components/ui";
-import { AnalysisHistory } from "./Commits";
+import { CVEAnalysisResults } from "../components/CVEAnalysisResults";
 type Score = CVE["scores"][number];
 type Row = CVE & { best?: number; severity: Severity; published: number };
 /** Only CVSS v3/v4 Base scores count; v2-only records are unscored. */
@@ -117,6 +119,11 @@ const defaults = {
   cve: "",
   cvep: "",
   act: "",
+  view: "overview",
+  run: "",
+  // Accept links already emitted by job details and CVE notifications.
+  cve_id: "",
+  program_id: "",
 };
 type Filters = typeof defaults;
 const pagerKeys = ["j", "k"];
@@ -189,20 +196,30 @@ export function CVEList({
   const severity = facet("sev", (r) => r.severity);
   const applicability = facet("app", (r) => r.applicability);
   const byProgram = facet("prog", (r) => r.program_id);
-  const selected = filters.cve
+  const selectedId = filters.cve || filters.cve_id;
+  const selectedProgram = filters.cvep || filters.program_id;
+  const selected = selectedId
     ? rows.find(
         (row) =>
-          row.id === filters.cve &&
-          (program || !filters.cvep || row.program_id === filters.cvep),
+          row.id === selectedId &&
+          (program || !selectedProgram || row.program_id === selectedProgram),
       )
     : undefined;
-  const open = (cve?: CVE, act?: "analyze") =>
+  const open = (cve?: CVE, act?: "analyze", view = filters.view) =>
     update({
       cve: cve?.id || null,
       cvep: program ? null : cve?.program_id,
       act: act || null,
+      view: cve ? view : null,
+      run:
+        cve?.id === selected?.id && cve?.program_id === selected?.program_id
+          ? filters.run
+          : null,
+      cve_id: null,
+      program_id: null,
     });
-  const analyze = filters.act === "analyze" ? selected : undefined;
+  const analyze =
+    filters.act === "analyze" && selected?.eligible ? selected : undefined;
   const clear = () =>
     update({ q: "", elig: "all", sev: "all", app: "all", prog: "all" });
   return (
@@ -215,22 +232,37 @@ export function CVEList({
             : "A qualifying score alone does not confirm the deployed asset is affected."
         }
         actions={
-          program && (
-            <ActionButton
+          <>
+            <button
+              type="button"
               className="secondary"
-              onAction={() =>
-                queueJob(
-                  `/programs/${program.id}/cve-sync`,
-                  {},
-                  undefined,
-                  "CVE sync queued.",
-                )
-              }
+              disabled={cves.refreshing}
+              onClick={cves.refresh}
             >
-              <RefreshCw size={15} aria-hidden="true" />
-              Sync CVEs
-            </ActionButton>
-          )
+              <RefreshCw
+                size={15}
+                className={cves.refreshing ? "spin" : undefined}
+                aria-hidden="true"
+              />
+              Refresh records
+            </button>
+            {program && (
+              <ActionButton
+                className="secondary"
+                onAction={() =>
+                  queueJob(
+                    `/programs/${program.id}/cve-sync`,
+                    {},
+                    undefined,
+                    "CVE sync queued.",
+                  )
+                }
+              >
+                <RefreshCw size={15} aria-hidden="true" />
+                Sync CVEs
+              </ActionButton>
+            )}
+          </>
         }
       >
         <div className="explorer-toolbar">
@@ -335,8 +367,8 @@ export function CVEList({
             </div>
           )}
           {visible.length ? (
-            <div className="table-scroll">
-              <table>
+            <div className="table-scroll cve-table-scroll">
+              <table className="cve-table">
                 <thead>
                   <tr>
                     <th scope="col">CVE</th>
@@ -388,13 +420,13 @@ export function CVEList({
                           )}
                         </div>
                       </td>
-                      <td>
+                      <td data-label="Base scores">
                         <ScoreList cve={cve} />
                       </td>
-                      <td>
+                      <td data-label="Product match">
                         <Badge>{cve.match_status}</Badge>
                       </td>
-                      <td>
+                      <td data-label="Score eligibility">
                         <Badge tone={cve.eligible ? "good" : "neutral"}>
                           {cve.eligible ? "Eligible" : "Not eligible"}
                         </Badge>
@@ -407,15 +439,33 @@ export function CVEList({
                           </div>
                         )}
                       </td>
-                      <td>
+                      <td data-label="Target">
                         <Badge>{cve.applicability}</Badge>
                       </td>
                       <td className="cell-actions">
+                        {cve.analyses.length > 0 && (
+                          <button
+                            className="text-button"
+                            onClick={() => open(cve, undefined, "analysis")}
+                            aria-label={`View analysis for ${cve.id}`}
+                          >
+                            View analysis{" "}
+                            <span className="muted">
+                              ({cve.analyses.length})
+                            </span>
+                          </button>
+                        )}
                         <button
                           className="secondary"
                           disabled={!cve.eligible}
                           onClick={() => open(cve, "analyze")}
                           aria-label={`Analyze ${cve.id}`}
+                          title={
+                            !cve.eligible
+                              ? cve.eligibility_reason ||
+                                "Confirm the product match and score criteria to enable analysis."
+                              : undefined
+                          }
                         >
                           <Sparkles size={14} aria-hidden="true" />
                           Analyze
@@ -453,9 +503,14 @@ export function CVEList({
       </Panel>
       {selected && !analyze && (
         <CVEDrawer
+          key={`${selected.program_id}-${selected.id}`}
           cve={selected}
           list={visible.includes(selected) ? visible : rows}
-          programName={programName(selected.program_id)}
+          programName={program?.asset_name || programName(selected.program_id)}
+          view={filters.view}
+          run={filters.run}
+          onViewChange={(view) => update({ view })}
+          onRunChange={(run) => update({ run })}
           onNavigate={open}
           onClose={() => open(undefined)}
           onUpdated={cves.refresh}
@@ -465,7 +520,7 @@ export function CVEList({
       {analyze && (
         <CVEAnalysisLaunch
           cve={analyze}
-          onClose={() => open(undefined)}
+          onClose={() => update({ act: null })}
           onSubmitted={cves.refresh}
         />
       )}
@@ -510,6 +565,10 @@ function CVEDrawer({
   cve,
   list,
   programName,
+  view,
+  run,
+  onViewChange,
+  onRunChange,
   onNavigate,
   onClose,
   onUpdated,
@@ -518,6 +577,10 @@ function CVEDrawer({
   cve: Row;
   list: Row[];
   programName?: string;
+  view: string;
+  run: string;
+  onViewChange: (view: string) => void;
+  onRunChange: (run: string) => void;
   onNavigate: (cve: CVE) => void;
   onClose: () => void;
   onUpdated: () => void;
@@ -537,11 +600,18 @@ function CVEDrawer({
   useShortcut(pagerKeys, step);
   useEffect(() => {
     document.querySelector(".modal-drawer")?.scrollTo({ top: 0 });
-  }, [cve.id]);
-  const references = cve.references.flatMap((reference) => {
-    const url = referenceUrl(reference);
-    return url ? [url] : [];
-  });
+  }, [cve.id, view]);
+  const activeView = ["analysis", "scores", "references"].includes(view)
+    ? view
+    : "overview";
+  const references = [
+    ...new Set(
+      cve.references.flatMap((reference) => {
+        const url = referenceUrl(reference);
+        return url ? [url] : [];
+      }),
+    ),
+  ];
   async function setMatch(confirmed: boolean) {
     await mutate(
       `/programs/${cve.program_id}/cves/${cve.id}/match`,
@@ -553,7 +623,7 @@ function CVEDrawer({
   return (
     <Modal
       title={cve.id}
-      description={cve.title}
+      description={programName || "CVE details and saved analysis"}
       onClose={onClose}
       size="drawer"
       headerActions={
@@ -567,7 +637,7 @@ function CVEDrawer({
               disabled={!previous}
               onClick={() => previous && onNavigate(previous)}
             >
-              <ChevronLeft size={18} />
+              <ChevronLeft size={18} aria-hidden="true" />
             </button>
             <span className="pager-position">
               {index + 1} / {list.length}
@@ -580,150 +650,214 @@ function CVEDrawer({
               disabled={!next}
               onClick={() => next && onNavigate(next)}
             >
-              <ChevronRight size={18} />
+              <ChevronRight size={18} aria-hidden="true" />
             </button>
           </span>
         )
       }
     >
-      <div className="chip-row">
-        <SeverityBadge severity={cve.severity} />
-        {cve.best !== undefined && (
-          <span className="muted">
-            Highest v3/v4 score {cve.best.toFixed(1)}
-          </span>
-        )}
-      </div>
-      <p className="readable-copy drawer-lead">{cve.description}</p>
-      <div className="drawer-actions">
-        <button
-          className="primary"
-          disabled={!cve.eligible}
-          onClick={onAnalyze}
-        >
-          <Sparkles size={15} aria-hidden="true" />
-          Analyze
-        </button>
-        <Link
-          className="secondary button"
-          to={`/findings/new?program_id=${cve.program_id}&cve_id=${cve.id}`}
-        >
-          Create CVE finding
-        </Link>
-      </div>
-      {!cve.eligible && cve.eligibility_reason && (
-        <p className="hint warning">
-          Analysis is unavailable: {cve.eligibility_reason}.
-        </p>
-      )}
-      {cve.eligible && cve.analysis_blocked && (
-        <p className="hint warning">
-          Automatic analysis is waiting: {cve.analysis_blocked.message}.
-        </p>
-      )}
-      <section className="drawer-section">
-        <h3>Assessment</h3>
-        <DetailGrid
-          items={[
-            ["Product match", <Badge>{cve.match_status}</Badge>],
-            [
-              "Score eligibility",
-              <Badge tone={cve.eligible ? "good" : "neutral"}>
-                {cve.eligible ? "Eligible" : "Not eligible"}
-              </Badge>,
-            ],
-            ["Target applicability", <Badge>{cve.applicability}</Badge>],
-            [
-              "Program",
-              <Link to={`/programs/${cve.program_id}`}>
-                {programName || "Program details"}
-              </Link>,
-            ],
-            [
-              "Published",
-              <Time value={cve.published_at} absolute fallback="Unknown" />,
-            ],
-            [
-              "Modified",
-              <Time value={cve.modified_at} absolute fallback="Unknown" />,
-            ],
-          ]}
-        />
-        {cve.applicability === "unknown" && (
-          <p className="hint">
-            Applicability stays unknown until the deployed version is observed.
-            Use the program’s Version tab to generate a recipe or record a
-            manual version.
-          </p>
-        )}
-        <div className="inline-actions">
-          <ActionButton className="secondary" onAction={() => setMatch(true)}>
-            <Check size={14} aria-hidden="true" />
-            Confirm product match
-          </ActionButton>
-          <ActionButton className="secondary" onAction={() => setMatch(false)}>
-            <X size={14} aria-hidden="true" />
-            Reject product match
-          </ActionButton>
-        </div>
-      </section>
-      <section className="drawer-section">
-        <h3>Score evidence</h3>
-        {cve.scores.length ? (
-          cve.scores.map((score, i) => (
-            <div
-              className={`score-evidence ${qualifies(cve, score) ? "qualifying" : ""}`}
-              key={i}
+      <div className="cve-workspace">
+        <div className="cve-workspace-heading">
+          <div className="chip-row">
+            <SeverityBadge severity={cve.severity} />
+            {cve.best !== undefined && (
+              <span className="muted">
+                Highest v3/v4 score {cve.best.toFixed(1)}
+              </span>
+            )}
+            <Badge tone={cve.eligible ? "good" : "neutral"}>
+              {cve.eligible ? "Score eligible" : "Not eligible"}
+            </Badge>
+            <span className="hint">
+              Target <Badge>{cve.applicability}</Badge>
+            </span>
+          </div>
+          {!cve.description.startsWith(cve.title) && (
+            <h3 className="cve-record-title">{cve.title}</h3>
+          )}
+          <div className="drawer-actions">
+            <button
+              className="primary"
+              disabled={!cve.eligible}
+              onClick={onAnalyze}
+              aria-describedby={!cve.eligible ? "cve-analysis-gate" : undefined}
             >
-              <div className="score-evidence-head">
-                <strong>{score.base_score.toFixed(1)}</strong>
-                <span>CVSS {score.version}</span>
-                {qualifies(cve, score) && (
-                  <Badge tone="good">Meets minimum</Badge>
-                )}
-                {!counted(score) && <Badge tone="neutral">Not used</Badge>}
-              </div>
-              <code>{score.vector}</code>
-              <small>{score.source}</small>
-            </div>
-          ))
-        ) : (
-          <p className="muted">
-            No CVSS v3 or v4 Base score. Unscored records stay visible but
-            cannot start analysis.
-          </p>
-        )}
-      </section>
-      <section className="drawer-section">
-        <h3>Version evidence</h3>
-        <DetailGrid
+              <Sparkles size={15} aria-hidden="true" />
+              Analyze CVE
+            </button>
+            <Link
+              className="secondary button"
+              to={`/findings/new?program_id=${cve.program_id}&cve_id=${cve.id}`}
+            >
+              Create CVE finding
+            </Link>
+          </div>
+          {!cve.eligible && cve.eligibility_reason && (
+            <p className="hint warning" id="cve-analysis-gate">
+              Analysis is unavailable: {cve.eligibility_reason}.
+            </p>
+          )}
+          {cve.eligible && cve.analysis_blocked && (
+            <p className="hint warning">
+              Automatic analysis is waiting: {cve.analysis_blocked.message}.
+            </p>
+          )}
+        </div>
+        <Tabs
+          label="CVE details"
           items={[
-            ["Affected", cve.affected_versions.join(", ") || "Unknown"],
-            ["Fixed in", cve.fixed_versions.join(", ") || "Unknown"],
-            ["Observed target", <Badge>{cve.applicability}</Badge>],
+            { id: "overview", label: "Overview" },
+            {
+              id: "analysis",
+              label: "Analysis & artifacts",
+              count: cve.analyses.length,
+            },
+            { id: "scores", label: "Scores", count: cve.scores.length },
+            { id: "references", label: "References", count: references.length },
           ]}
+          active={activeView}
+          onChange={onViewChange}
         />
-      </section>
-      {cve.references.length > 0 && (
-        <section className="drawer-section">
-          <h3>References ({references.length})</h3>
-          <ul className="reference-list">
-            {references.map((href) => (
-              <li key={href}>
-                <ExternalLink href={href}>{href}</ExternalLink>
-              </li>
-            ))}
-          </ul>
-          <Evidence value={cve.references} label="Raw source references" />
-        </section>
-      )}
-      <section className="drawer-section">
-        <h3>Analysis history</h3>
-        <AnalysisHistory analyses={cve.analyses} programId={cve.program_id} />
-      </section>
-      <p className="hint drawer-shortcuts">
-        <Kbd>J</Kbd> next · <Kbd>K</Kbd> previous · <Kbd>Esc</Kbd> close
-      </p>
+        {activeView === "analysis" && (
+          <section role="tabpanel" aria-label="Analysis & artifacts">
+            <CVEAnalysisResults cve={cve} run={run} onRunChange={onRunChange} />
+          </section>
+        )}
+        {activeView === "overview" && (
+          <section role="tabpanel" aria-label="Overview">
+            <p className="readable-copy drawer-lead">{cve.description}</p>
+            <section className="drawer-section">
+              <h3>Assessment</h3>
+              <DetailGrid
+                items={[
+                  ["Product match", <Badge>{cve.match_status}</Badge>],
+                  [
+                    "Score eligibility",
+                    <Badge tone={cve.eligible ? "good" : "neutral"}>
+                      {cve.eligible ? "Eligible" : "Not eligible"}
+                    </Badge>,
+                  ],
+                  ["Target applicability", <Badge>{cve.applicability}</Badge>],
+                  [
+                    "Program",
+                    <Link to={`/programs/${cve.program_id}`}>
+                      {programName || "Program details"}
+                    </Link>,
+                  ],
+                  [
+                    "Published",
+                    <Time
+                      value={cve.published_at}
+                      absolute
+                      fallback="Unknown"
+                    />,
+                  ],
+                  [
+                    "Modified",
+                    <Time
+                      value={cve.modified_at}
+                      absolute
+                      fallback="Unknown"
+                    />,
+                  ],
+                ]}
+              />
+              {cve.applicability === "unknown" && (
+                <p className="hint">
+                  Applicability stays unknown until the deployed version is
+                  observed.
+                  <Link to={`/programs/${cve.program_id}?tab=version`}>
+                    Check the target version
+                  </Link>{" "}
+                  or record a manual observation in the program.
+                </p>
+              )}
+              <div className="inline-actions">
+                <ActionButton
+                  className="secondary"
+                  onAction={() => setMatch(true)}
+                >
+                  <Check size={14} aria-hidden="true" />
+                  Confirm product match
+                </ActionButton>
+                <ActionButton
+                  className="secondary"
+                  onAction={() => setMatch(false)}
+                >
+                  <X size={14} aria-hidden="true" />
+                  Reject product match
+                </ActionButton>
+              </div>
+            </section>
+            <section className="drawer-section">
+              <h3>Version evidence</h3>
+              <DetailGrid
+                items={[
+                  ["Affected", cve.affected_versions.join(", ") || "Unknown"],
+                  ["Fixed in", cve.fixed_versions.join(", ") || "Unknown"],
+                  ["Observed target", <Badge>{cve.applicability}</Badge>],
+                ]}
+              />
+            </section>
+          </section>
+        )}
+        {activeView === "scores" && (
+          <section role="tabpanel" aria-label="Scores">
+            <section className="drawer-section">
+              <h3>Score evidence</h3>
+              {cve.scores.length ? (
+                cve.scores.map((score, i) => (
+                  <div
+                    className={`score-evidence ${qualifies(cve, score) ? "qualifying" : ""}`}
+                    key={i}
+                  >
+                    <div className="score-evidence-head">
+                      <strong>{score.base_score.toFixed(1)}</strong>
+                      <span>CVSS {score.version}</span>
+                      {qualifies(cve, score) && (
+                        <Badge tone="good">Meets minimum</Badge>
+                      )}
+                      {!counted(score) && (
+                        <Badge tone="neutral">Not used</Badge>
+                      )}
+                    </div>
+                    <code>{score.vector}</code>
+                    <small>{score.source}</small>
+                  </div>
+                ))
+              ) : (
+                <p className="muted">
+                  No CVSS v3 or v4 Base score. Unscored records stay visible but
+                  cannot start analysis.
+                </p>
+              )}
+            </section>
+          </section>
+        )}
+        {activeView === "references" && (
+          <section role="tabpanel" aria-label="References">
+            <section className="drawer-section">
+              <h3>References ({references.length})</h3>
+              <ul className="reference-list">
+                {references.map((href) => (
+                  <li key={href}>
+                    <ExternalLink href={href}>{href}</ExternalLink>
+                  </li>
+                ))}
+              </ul>
+              {!references.length && (
+                <p className="hint">
+                  No accessible source links were supplied for this record.
+                </p>
+              )}
+              <Evidence value={cve.references} label="Raw source references" />
+            </section>
+          </section>
+        )}
+        <p className="hint drawer-shortcuts">
+          <Kbd>J</Kbd> next · <Kbd>K</Kbd> previous · <Kbd>Esc</Kbd> close
+        </p>
+      </div>
     </Modal>
   );
 }
@@ -732,7 +866,7 @@ function CVEAnalysisLaunch({
   onClose,
   onSubmitted,
 }: {
-  cve: CVE;
+  cve: Row;
   onClose: () => void;
   onSubmitted: () => void;
 }) {
@@ -763,7 +897,43 @@ function CVEAnalysisLaunch({
       operation="cve_analysis"
       path={`/programs/${cve.program_id}/cves/${cve.id}/analyses`}
       initialProfile={resource.data.config.profiles.cve_analysis}
-      context={`${cve.id} · Product: ${cve.match_status} · Score ${cve.qualifying_score?.base_score ?? "eligible"} · Target: ${cve.applicability}`}
+      context={
+        <div className="cve-launch-context">
+          <div className="chip-row">
+            <strong className="mono">{cve.id}</strong>
+            <SeverityBadge severity={cve.severity} />
+          </div>
+          <p>{cve.title}</p>
+          <DetailGrid
+            items={[
+              ["Program", resource.data.asset_name],
+              ["Product match", <Badge>{cve.match_status}</Badge>],
+              [
+                "Qualifying score",
+                cve.qualifying_score
+                  ? `${cve.qualifying_score.base_score.toFixed(1)} · CVSS ${cve.qualifying_score.version}`
+                  : "Eligible",
+              ],
+              ["Target applicability", <Badge>{cve.applicability}</Badge>],
+            ]}
+          />
+          {(!resource.data.config.version_scheme ||
+            resource.data.config.version_scheme === "unknown") && (
+            <Callout tone="warm" title="Choose a vulnerable revision">
+              This program has no version scheme for resolving an affected
+              release. Enter a vulnerable tag or commit below to avoid analyzing
+              the monitored checkout.
+            </Callout>
+          )}
+          {cve.applicability === "unknown" && (
+            <p className="hint">
+              The deployed version is unknown. This analysis investigates
+              upstream source; it does not establish that the target is
+              affected.
+            </p>
+          )}
+        </div>
+      }
       onClose={onClose}
       onSubmitted={onSubmitted}
     />

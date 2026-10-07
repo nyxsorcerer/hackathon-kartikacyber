@@ -16,9 +16,11 @@ OPERATIONS = (
 CATEGORIES = (
     "Likely vulnerability fix",
     "Potentially introduced vulnerability",
+    "Security hardening",
     "Unrelated change",
     "Insufficient context",
 )
+CHANGE_KINDS = ("vulnerability_fix", "security_hardening", "vulnerability_introduction", "unrelated", "insufficient_context")
 
 
 def http_url(value):
@@ -86,6 +88,8 @@ class ProgramConfig(Strict):
     cve_min_score: float | None = Field(default=None, ge=0, le=10)
     cve_versions: list[Literal["3.0", "3.1", "4.0"]] = Field(default_factory=list)
     cve_auto_analyze: bool = False
+    # Refresh the audit context after each source check that moves the source head.
+    audit_auto_refresh: bool = False
     active_recipe_id: str | None = None
     version_scheme: Literal["semver", "php", "unknown"] = "unknown"
     version_monitor_enabled: bool = True
@@ -244,6 +248,8 @@ class OperationInput(Strict):
     max_functions: int = Field(default=AUDIT_MAX_FUNCTIONS, ge=1, le=100)
     # Audit context only: ignore an interrupted audit of the same request instead of continuing it.
     fresh: bool = False
+    # Audit context only: refresh this context for the current source, reusing unchanged work.
+    refresh_from: str | None = Field(default=None, max_length=64)
     # CVE analysis and finding artifacts only: analyze this revision instead of the resolved
     # affected release, for records whose vulnerable version cannot be ranked automatically.
     source_ref: str | None = Field(default=None, max_length=200)
@@ -256,7 +262,44 @@ class OperationInput(Strict):
 
 
 class ReviewInput(Strict):
-    decision: Literal["pending", "dismissed", "candidate"]
+    # candidate awaits review; confirmed is a real vulnerability, dismissed is not one.
+    decision: Literal["pending", "dismissed", "candidate", "confirmed"]
+
+
+class BatchReviewInput(ReviewInput):
+    ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+# Each revision runs as its own agent job with a build sandbox, so one request queues few.
+ANALYSIS_BATCH_MAX = 50
+
+
+class BatchAnalysisInput(Strict):
+    ids: list[str] = Field(min_length=1, max_length=ANALYSIS_BATCH_MAX)
+    profile: Profile | None = None
+
+
+class BatchDeleteInput(Strict):
+    ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class PromptInput(Strict):
+    source: str = Field(max_length=100_000)
+
+
+class PromptPreviewInput(Strict):
+    operation: str = Field(min_length=1, max_length=100)
+    # An unsaved draft of one template, rendered in place of its saved version.
+    name: str | None = Field(default=None, max_length=100)
+    source: str | None = Field(default=None, max_length=100_000)
+    # Defaults to how the operation's jobs run.
+    build: bool | None = None
+
+    @model_validator(mode="after")
+    def draft(self):
+        if (self.name is None) != (self.source is None):
+            raise ValueError("A draft needs both the template name and its source")
+        return self
 
 
 class MatchInput(Strict):

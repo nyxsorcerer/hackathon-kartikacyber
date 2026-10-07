@@ -264,7 +264,11 @@ function useNavCounts() {
   const { refresh } = dashboard;
   useEffect(() => {
     window.addEventListener("numen:notice", refresh);
-    return () => window.removeEventListener("numen:notice", refresh);
+    window.addEventListener("numen:changed", refresh);
+    return () => {
+      window.removeEventListener("numen:notice", refresh);
+      window.removeEventListener("numen:changed", refresh);
+    };
   }, [refresh]);
   const data = dashboard.data;
   return {

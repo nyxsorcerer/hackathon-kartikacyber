@@ -213,7 +213,7 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
   const user = userEvent.setup();
   render(<App />);
   expect(
-    await screen.findByRole("heading", { name: "Likely vulnerability fix" }),
+    await screen.findByText("Likely vulnerability fix"),
   ).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Create finding" })).toHaveAttribute(
     "href",
@@ -228,7 +228,7 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
   expect(screen.getByLabelText("Model")).toHaveValue("codex-model");
   expect(screen.getByLabelText("Reasoning effort")).toHaveValue("xhigh");
   expect(submissions).toHaveLength(0);
-  await user.click(screen.getByRole("button", { name: "Start job" }));
+  await user.click(screen.getByRole("button", { name: "Start analysis" }));
   expect(
     await screen.findByText("Background job submitted."),
   ).toBeInTheDocument();

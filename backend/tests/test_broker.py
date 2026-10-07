@@ -83,3 +83,27 @@ def test_agent_runs_are_submitted_and_awaited_without_a_deadline(monkeypatch):
         broker_module, "time", SimpleNamespace(monotonic=lambda: next(clock), sleep=lambda _: None)
     )
     assert broker.wait("run", lambda: None, lambda _: None, deadline=None)["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("response,message", [
+    (httpx.Response(422, json={"code": "invalid_run", "message": "Run payload failed execution contract validation: limits: Value error, unknown execution limit"}),
+     "Execution broker returned HTTP 422: Run payload failed execution contract validation: limits: Value error, unknown execution limit"),
+    (httpx.Response(502, text="<html>Bad gateway</html>"), "Execution broker returned HTTP 502"),
+])
+def test_a_broker_rejection_keeps_the_brokers_explanation(response, message):
+    broker = Broker(Config())
+    broker.client = httpx.Client(base_url="http://broker", transport=httpx.MockTransport(lambda _: response))
+    with pytest.raises(DomainError) as raised:
+        broker.request("POST", "/internal/runs", json={})
+    assert raised.value.code == "broker_error" and raised.value.message == message
+    assert raised.value.retryable is (response.status_code >= 500)
+
+
+def test_requested_agent_limits_refine_the_defaults(monkeypatch):
+    sent = {}
+    broker = Broker(Config())
+    monkeypatch.setattr(broker, "request", lambda method, path, json=None: sent.update(json) or {"run_id": "r"})
+    broker.submit("token", "agent", limits={"timeout_seconds": 1800})
+    assert sent["limits"]["timeout_seconds"] == 1800 and sent["limits"]["memory_mb"] == 1024
+    broker.submit("token", "lab", limits={"timeout_seconds": 60})
+    assert sent["limits"] == {"timeout_seconds": 60}  # other kinds name every bound they want

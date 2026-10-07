@@ -5,6 +5,7 @@ import {
   FileSearch,
   FileText,
   LoaderCircle,
+  RefreshCw,
   Search,
   Sparkles,
   X,
@@ -162,7 +163,8 @@ export function organizeDocs(
       }),
     );
   const supporting: Doc[] = artifacts
-    .filter((a) => !used.has(a.path))
+    // Function records are bookkeeping for resuming and refreshing, not a document to read.
+    .filter((a) => !used.has(a.path) && a.path !== "audit-functions.json")
     .sort((a, b) => a.path.localeCompare(b.path))
     .map((artifact) => ({
       key: artifact.path,
@@ -176,9 +178,11 @@ export function organizeDocs(
 export function AuditTab({
   program,
   onGenerate,
+  onRefresh,
 }: {
   program: Program;
   onGenerate: () => void;
+  onRefresh: (context: Context) => void;
 }) {
   const [poll, setPoll] = useState(0);
   const resource = useResource(
@@ -247,13 +251,14 @@ export function AuditTab({
               doc={query.doc}
               onDoc={(doc) => update({ doc })}
               onGenerate={onGenerate}
+              onRefresh={() => onRefresh(selected)}
             />
           </>
         ) : (
           <Empty
             icon={FileSearch}
             title="No audit context yet"
-            description="Generate a source-referenced entry report, system dossier, and per-function documents for the current revision. Commit and CVE analysis use it as grounding."
+            description="Generate a source-referenced entry report, system dossier, and per-function documents for the current revision. CVE analysis and finding artifacts start from it to orient themselves; commit analysis judges each change on its own."
             action={
               <button className="primary" onClick={onGenerate}>
                 <Sparkles size={15} aria-hidden="true" />
@@ -287,6 +292,7 @@ function ContextView({
   doc,
   onDoc,
   onGenerate,
+  onRefresh,
 }: {
   context: Context;
   program: Program;
@@ -294,6 +300,7 @@ function ContextView({
   doc: string;
   onDoc: (doc: string | null) => void;
   onGenerate: () => void;
+  onRefresh: () => void;
 }) {
   const coverage = coverageOf(context);
   const byPath = (path: string) =>
@@ -331,6 +338,7 @@ function ContextView({
         program={program}
         latest={latest}
         onGenerate={onGenerate}
+        onRefresh={onRefresh}
       />
       {(questions.length > 0 || orientation.overview) && (
         <div className="audit-insights">
@@ -401,12 +409,14 @@ function ContextSummary({
   program,
   latest,
   onGenerate,
+  onRefresh,
 }: {
   context: Context;
   coverage: AuditCoverage;
   program: Program;
   latest: boolean;
   onGenerate: () => void;
+  onRefresh: () => void;
 }) {
   const selected = coverage.selected || 0;
   const completed = coverage.completed || 0;
@@ -455,6 +465,27 @@ function ContextSummary({
           Scope:{" "}
           {coverage.scope || "Significant functions selected by orientation"}
         </p>
+        {coverage.refresh && (
+          <p className="audit-summary-meta">
+            Refreshed from{" "}
+            <span className="mono">
+              {shortRef(coverage.refresh.from_revision)}
+            </span>{" "}
+            with its orientation · {coverage.refresh.changed_files_total}{" "}
+            {coverage.refresh.changed_files_total === 1 ? "file" : "files"}{" "}
+            changed · {coverage.reused_functions || 0} reused ·{" "}
+            {Math.max(0, completed - (coverage.reused_functions || 0))} analysed
+            again
+            {coverage.removed ? ` · ${coverage.removed} removed` : ""}
+          </p>
+        )}
+        {(coverage.deferred || 0) > 0 && (
+          <p className="audit-summary-meta">
+            Orientation selected {coverage.deferred} more{" "}
+            {coverage.deferred === 1 ? "function" : "functions"} than the limit;
+            the most significant {selected} were analysed.
+          </p>
+        )}
       </div>
       <ol className="stage-steps" aria-label="Generation stages">
         {stages.map((stage, i) => {
@@ -546,6 +577,7 @@ function ContextSummary({
         program={program}
         generationGap={generationGap}
         onGenerate={onGenerate}
+        onRefresh={onRefresh}
       />
     </div>
   );
@@ -556,12 +588,14 @@ function GapCallout({
   program,
   generationGap,
   onGenerate,
+  onRefresh,
 }: {
   context: Context;
   coverage: AuditCoverage;
   program: Program;
   generationGap: boolean;
   onGenerate: () => void;
+  onRefresh: () => void;
 }) {
   const stage =
     stages.find((s) => s.id === coverage.stage)?.label.toLowerCase() ||
@@ -580,17 +614,39 @@ function GapCallout({
         update while the job runs.
       </Callout>
     );
-  if (context.status === "stale" || generationGap)
+  if (generationGap)
     return (
       <Callout
         tone="warm"
         title="Stale for the current source"
         action={regenerate("Generate current context")}
       >
-        {generationGap
-          ? `Generated for source generation ${context.source_generation}; the program is now at generation ${program.source_generation}.`
-          : `New upstream revisions were imported after ${shortRef(context.source_ref)}.`}{" "}
-        Analysis can still use it with a documented source delta.
+        Generated for source generation {context.source_generation}; the program
+        is now at generation {program.source_generation}, so analyses no longer
+        use it.
+      </Callout>
+    );
+  if (context.status === "stale")
+    return (
+      <Callout
+        tone="warm"
+        title="Behind the current source"
+        action={
+          <div className="inline-actions">
+            {(coverage.completed || 0) > 0 && (
+              <button className="primary" onClick={onRefresh}>
+                <RefreshCw size={14} aria-hidden="true" />
+                Refresh for current source
+              </button>
+            )}
+            {regenerate("Generate fresh context")}
+          </div>
+        }
+      >
+        New upstream revisions were imported after{" "}
+        {shortRef(context.source_ref)}. Analyses still start from it and check
+        what changed. A refresh analyses only the functions in changed files
+        again and reuses the rest.
       </Callout>
     );
   if (context.status === "partial" && coverage.interrupted)

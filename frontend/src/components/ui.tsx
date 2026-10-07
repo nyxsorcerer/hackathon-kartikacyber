@@ -25,6 +25,10 @@ export function notify(message: string, url?: string) {
     new CustomEvent("numen:notice", { detail: { message, url } }),
   );
 }
+/** Signals saved-data changes (refreshing navigation counts) without a toast. */
+export function announceChange() {
+  window.dispatchEvent(new Event("numen:changed"));
+}
 export function date(value: string | null | undefined) {
   if (!value) return "Never";
   const d = new Date(value);

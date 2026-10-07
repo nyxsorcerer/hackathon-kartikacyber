@@ -101,6 +101,9 @@ function ProgramEditor({
   );
   const [versions, setVersions] = useState(program?.config.cve_versions || []);
   const [auto, setAuto] = useState(program?.config.cve_auto_analyze || false);
+  const [auditRefresh, setAuditRefresh] = useState(
+    program?.config.audit_auto_refresh || false,
+  );
   const [selectors, setSelectors] = useState(() =>
     Array.isArray(program?.config.cve_selectors)
       ? program.config.cve_selectors
@@ -191,6 +194,7 @@ function ProgramEditor({
             cve_min_score: minScore === "" ? null : Number(minScore),
             cve_versions: versions,
             cve_auto_analyze: auto,
+            audit_auto_refresh: auditRefresh,
             version_scheme: scheme,
             version_monitor_enabled: versionEnabled,
             asset_origins: origins
@@ -410,6 +414,21 @@ function ProgramEditor({
               </label>
               <span className="hint">
                 When paused, manual checks remain available.
+              </span>
+            </div>
+            <div className="field-stack full">
+              <label className="check-label">
+                <input
+                  type="checkbox"
+                  checked={auditRefresh}
+                  onChange={(e) => setAuditRefresh(e.target.checked)}
+                />
+                Keep the audit context current
+              </label>
+              <span className="hint">
+                After a source check moves the source head, refresh the latest
+                audit context: functions in changed files are analysed again
+                with the Audit context profile, the rest are reused.
               </span>
             </div>
             <label>

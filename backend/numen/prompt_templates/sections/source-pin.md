@@ -1,0 +1,1 @@
+source_pin states what inputs/source is: basis affected_release means its version is the newest release the record still reports as affected, so pin that source_ref; basis unpinned means the supplied checkout is not known to be vulnerable and must not be bundled as such.

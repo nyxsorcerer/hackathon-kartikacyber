@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+import pytest
 from numen.api import create_app
 
 
@@ -119,7 +120,7 @@ def test_commit_constraint_failure_rolls_back_before_http_success(system):
         event.remove(app.state.factory.class_, "before_commit", reject_commit)
 
 
-def test_job_session_proxies_only_runs_of_the_running_attempt(system, monkeypatch):
+def test_job_session_inputs_only_reach_runs_of_the_running_attempt(system, monkeypatch):
     from numen.broker import Broker
     from numen.models import Job, JobAttempt
 
@@ -128,7 +129,10 @@ def test_job_session_proxies_only_runs_of_the_running_attempt(system, monkeypatc
 
     def session(self, run_id, body=None):
         calls.append((run_id, body))
-        return {"agent": "claude", "agent_status": "working", "screen": "thinking", "held": False}
+        return {
+            "agent": "claude", "agent_status": "working", "screen": "thinking",
+            "held": False, "live": True,
+        }
 
     monkeypatch.setattr(Broker, "session", session)
     with app.state.factory.begin() as db:
@@ -143,11 +147,269 @@ def test_job_session_proxies_only_runs_of_the_running_attempt(system, monkeypatc
     assert state["runs"] == ["run-1", "run-2"] and state["run_id"] == "run-2"
     assert client.get(f"/api/jobs/{ident}/session?run=run-1").json()["run_id"] == "run-1"
     url = f"/api/jobs/{ident}/session"
+    before_invalid = list(calls)
+    assert client.get(url, params={"run": "other"}).status_code == 409
+    assert calls == before_invalid
     assert client.post(url, json={"run_id": "other", "action": "hold"}).status_code == 409
     assert client.post(url, json={"run_id": "run-1", "action": "prompt"}).status_code == 422
     response = client.post(url, json={"run_id": "run-1", "action": "prompt", "text": "why?"})
     assert response.status_code == 202
     assert calls[-1] == ("run-1", {"action": "prompt", "text": "why?"})
     with app.state.factory.begin() as db:
+        db.get(JobAttempt, "a").data = {"runtime_phases": {}}
+    assert client.get(url).json()["run_id"] == "run-2"
+    assert client.post(url, json={"run_id": "run-2", "action": "hold"}).status_code == 409
+    with app.state.factory.begin() as db:
         db.get(Job, ident).status = "succeeded"
+    assert client.post(url, json={"run_id": "run-1", "action": "hold"}).status_code == 409
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "cancelled", "cancelling"])
+def test_job_session_retains_full_screen_after_completion_or_cancellation(system, monkeypatch, status):
+    from numen.broker import Broker
+    from numen.models import Job, JobAttempt, JobEvent
+
+    app, client, _ = system
+    screen = "\n".join(f"terminal line {number}" for number in range(1001))
+    retained = {
+        "agent": "codex", "agent_status": "idle", "screen": screen,
+        "held": False, "live": status == "cancelling",
+    }
+    calls = []
+
+    def session(self, run_id, body=None):
+        calls.append((run_id, body))
+        return retained
+
+    monkeypatch.setattr(Broker, "session", session)
+    with app.state.factory.begin() as db:
+        job = Job(kind="commit_analysis", status=status, input_hash="h", attempt_token="a",
+                  broker_run_id="retained-run")
+        db.add(job)
+        db.flush()
+        # Finished phases are removed from runtime_phases but remain on the job timeline.
+        db.add(JobAttempt(id="a", job_id=job.id, status=status, data={"runtime_phases": {}}))
+        db.add(JobEvent(job_id=job.id, data={"kind": "runtime_started", "run_id": "retained-run"}))
+        ident = job.id
+
+    url = f"/api/jobs/{ident}/session"
+    response = client.get(url)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"runs": ["retained-run"], "run_id": "retained-run", **retained}
+    assert client.post(url, json={"run_id": "retained-run", "action": "hold"}).status_code == 409
+    assert calls == [("retained-run", None)]
+
+
+def test_job_session_reads_all_attempts_and_completed_phases_in_start_order(system, monkeypatch):
+    from datetime import timedelta
+    from numen.broker import Broker
+    from numen.models import Job, JobAttempt, JobEvent, now
+
+    app, client, _ = system
+    calls = []
+
+    def session(self, run_id, body=None):
+        calls.append((run_id, body))
+        return {"screen": run_id, "live": run_id == "current-run"}
+
+    monkeypatch.setattr(Broker, "session", session)
+    started = now()
+    with app.state.factory.begin() as db:
+        job = Job(kind="audit_context", status="running", input_hash="h", attempt_token="current",
+                  broker_run_id="current-run")
+        foreign = Job(kind="commit_analysis", status="running", input_hash="other")
+        db.add_all([job, foreign])
+        db.flush()
+        # Deliberately insert newer records first: the API must use recorded chronology.
+        db.add_all([
+            JobAttempt(id="current", job_id=job.id, status="running",
+                       created_at=started + timedelta(seconds=3),
+                       data={"runtime_phases": {"current:1": "current-run"}}),
+            JobAttempt(id="older", job_id=job.id, status="interrupted", created_at=started,
+                       data={"runtime_phases": {"older:1": "older-run", "older:2": None}}),
+            JobAttempt(id="foreign", job_id=foreign.id, status="running",
+                       data={"runtime_phases": {"foreign:1": "foreign-run"}}),
+            JobEvent(job_id=job.id, created_at=started + timedelta(seconds=4),
+                     data={"kind": "runtime_started", "run_id": "current-run"}),
+            JobEvent(job_id=job.id, created_at=started + timedelta(seconds=2),
+                     data={"kind": "runtime_started", "run_id": "finished-run"}),
+            JobEvent(job_id=job.id, created_at=started + timedelta(seconds=1),
+                     data={"kind": "runtime_started", "run_id": "older-run"}),
+            JobEvent(job_id=foreign.id, data={"kind": "runtime_started", "run_id": "foreign-run"}),
+        ])
+        ident = job.id
+
+    url = f"/api/jobs/{ident}/session"
+    response = client.get(url)
+    assert response.status_code == 200, response.text
+    assert response.json()["runs"] == ["older-run", "finished-run", "current-run"]
+    assert response.json()["run_id"] == "current-run"
+    for run in ("older-run", "finished-run"):
+        response = client.get(url, params={"run": run})
+        assert response.status_code == 200, response.text
+        assert response.json()["screen"] == run
+        assert client.post(url, json={"run_id": run, "action": "hold"}).status_code == 409
+    assert client.post(url, json={"run_id": "current-run", "action": "hold"}).status_code == 202
+    assert calls[-1] == ("current-run", {"action": "hold"})
+    before_invalid = list(calls)
+    for run in ("foreign-run", "unknown-run", ""):
+        response = client.get(url, params={"run": run})
+        assert response.status_code == 409, response.text
+        assert response.json()["code"] == "session_unavailable"
+        response = client.post(url, json={"run_id": run, "action": "hold"})
+        assert response.status_code == (409 if run else 422)
+    assert calls == before_invalid
+
+
+def test_job_session_legacy_run_requires_authentication_and_input_requires_csrf(system, monkeypatch):
+    from numen.broker import Broker
+    from numen.models import Job
+
+    app, client, _ = system
+    calls = []
+
+    def session(self, run_id, body=None):
+        calls.append((run_id, body))
+        return {"screen": "retained legacy history", "live": False}
+
+    monkeypatch.setattr(Broker, "session", session)
+    with app.state.factory.begin() as db:
+        job = Job(kind="commit_analysis", status="succeeded", input_hash="h",
+                  broker_run_id="legacy-run")
+        db.add(job)
+        db.flush()
+        ident = job.id
+    url = f"/api/jobs/{ident}/session"
+    with TestClient(app) as unauthenticated:
+        assert unauthenticated.get(url).status_code == 401
+        assert unauthenticated.post(url, json={"run_id": "legacy-run", "action": "hold"}).status_code == 401
+    assert calls == []
+    del client.headers["X-CSRF-Token"]
+    assert client.post(url, json={"run_id": "legacy-run", "action": "hold"}).status_code == 403
+    response = client.get(url)
+    assert response.status_code == 200, response.text
+    assert response.json()["runs"] == ["legacy-run"]
+    assert response.json()["screen"] == "retained legacy history"
+    assert calls == [("legacy-run", None)]
+
+
+def test_job_session_cannot_steer_an_attempt_owned_by_another_job(system, monkeypatch):
+    from numen.broker import Broker
+    from numen.models import Job, JobAttempt
+
+    app, client, _ = system
+    calls = []
+    monkeypatch.setattr(Broker, "session", lambda self, *args: calls.append(args) or {})
+    with app.state.factory.begin() as db:
+        job = Job(kind="commit_analysis", status="running", input_hash="h", attempt_token="foreign")
+        foreign = Job(kind="commit_analysis", status="running", input_hash="other")
+        db.add_all([job, foreign])
+        db.flush()
+        db.add(JobAttempt(id="foreign", job_id=foreign.id, status="running",
+                          data={"runtime_phases": {"foreign:1": "foreign-run"}}))
+        ident = job.id
+    url = f"/api/jobs/{ident}/session"
     assert client.get(url).status_code == 409
+    assert client.post(url, json={"run_id": "foreign-run", "action": "hold"}).status_code == 409
+    assert calls == []
+
+
+@pytest.mark.parametrize("code,status,expected", [
+    ("session_unavailable", 409, 200),
+    ("broker_error", 502, 502),
+    ("broker_unavailable", 503, 503),
+    ("record_conflict", 409, 409),
+])
+def test_job_session_default_skips_only_unavailable_legacy_sessions(
+    system, monkeypatch, code, status, expected
+):
+    from datetime import timedelta
+    from numen.broker import Broker
+    from numen.models import Job, JobEvent, now
+    from numen.security import DomainError
+
+    app, client, _ = system
+    calls = []
+
+    def session(self, run_id, body=None):
+        calls.append(run_id)
+        if run_id == "legacy-probe":
+            raise DomainError(code, "Latest run cannot provide a session", status)
+        return {"screen": "retained agent terminal", "live": False}
+
+    monkeypatch.setattr(Broker, "session", session)
+    started = now()
+    with app.state.factory.begin() as db:
+        job = Job(kind="version_recipe", status="succeeded", input_hash="h",
+                  broker_run_id="legacy-probe")
+        db.add(job)
+        db.flush()
+        db.add_all([
+            JobEvent(job_id=job.id, created_at=started,
+                     data={"kind": "runtime_started", "run_id": "legacy-agent"}),
+            JobEvent(job_id=job.id, created_at=started + timedelta(seconds=1),
+                     data={"kind": "runtime_started", "run_id": "legacy-probe"}),
+        ])
+        ident = job.id
+    url = f"/api/jobs/{ident}/session"
+    response = client.get(url)
+    assert response.status_code == expected, response.text
+    if expected == 200:
+        assert response.json()["run_id"] == "legacy-agent"
+        assert response.json()["runs"] == ["legacy-agent"]
+        assert response.json()["screen"] == "retained agent terminal"
+        assert calls == ["legacy-probe", "legacy-agent"]
+    else:
+        assert response.json()["code"] == code
+        assert calls == ["legacy-probe"]
+    calls.clear()
+    response = client.get(url, params={"run": "legacy-probe"})
+    assert response.status_code == status, response.text
+    assert calls == ["legacy-probe"]
+
+
+def test_job_session_selector_excludes_recorded_non_agent_runtimes(system, monkeypatch):
+    from numen.broker import Broker
+    from numen.models import Job, JobAttempt
+    from numen.queue import ExecutionContext
+
+    app, client, _ = system
+    calls = []
+
+    def session(self, run_id, body=None):
+        calls.append(run_id)
+        assert run_id.startswith("agent-")
+        return {"screen": run_id, "live": False}
+
+    monkeypatch.setattr(Broker, "session", session)
+    runs = [
+        ("agent-older", "agent"), ("probe-older", "probe"),
+        ("agent-current", "agent"), ("probe-current", "probe"),
+        ("capabilities", "capabilities"), ("login", "account_login"), ("lab", "lab"),
+    ]
+    with app.state.factory.begin() as db:
+        job = Job(kind="version_recipe", status="running", input_hash="h", attempt_token="a")
+        db.add(job)
+        db.flush()
+        db.add(JobAttempt(id="a", job_id=job.id, status="running", data={}))
+        ident = job.id
+    context = ExecutionContext(app.state.factory, job, None)
+    for index, (run_id, kind) in enumerate(runs):
+        phase = f"a:{index}"
+        context.set_phase(phase)
+        context.set_run(run_id, phase, kind=kind)
+        if kind == "agent":
+            context.end_phase(phase)
+    with app.state.factory.begin() as db:
+        db.get(Job, ident).status = "succeeded"
+        db.get(JobAttempt, "a").status = "succeeded"
+    url = f"/api/jobs/{ident}/session"
+    response = client.get(url)
+    assert response.status_code == 200, response.text
+    assert response.json()["runs"] == ["agent-older", "agent-current"]
+    assert response.json()["run_id"] == "agent-current"
+    assert calls == ["agent-current"]
+    for run_id, kind in runs:
+        if kind != "agent":
+            assert client.get(url, params={"run": run_id}).status_code == 409
+    assert calls == ["agent-current"]

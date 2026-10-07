@@ -13,7 +13,7 @@ import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 from .adapters import agent_argv, agent_events, codex_models, parse_agent, pi_final_text, pi_repair_argv
-from .contracts import LOGIN_CODE, LOGIN_CODE_BYTES, input_files, safe_path
+from .contracts import LOGIN_CODE, LOGIN_CODE_BYTES, MAX_OUTPUT_FILES, input_files, safe_path
 
 WORK = Path("/workspace")
 PRIVATE = Path("/home/job")
@@ -335,9 +335,13 @@ def output_files(limit):
             raise ValueError("output must be a regular file without hard links")
         relative = safe_path(path.relative_to(WORK / "outputs").as_posix())
         total += path.stat().st_size
-        if total > limit or len(outputs) >= 512:
+        if total > limit or len(outputs) >= MAX_OUTPUT_FILES:
             raise ValueError("output limit exceeded")
-        data = path.read_bytes()
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            # A container the build daemon started writes as its own user, not the workload's.
+            raise ValueError("output file is not readable by the workload") from exc
         outputs.append({"path":relative,"content_base64":base64.b64encode(data).decode(),"sha256":hashlib.sha256(data).hexdigest(),"size":len(data)})
     return outputs
 
@@ -521,8 +525,17 @@ def execute(job):
         if job.get("build"):
             prompt += ("\nThis run has a shell, git and a private Docker daemon at DOCKER_HOST=" + env.get("DOCKER_HOST", "") +
                        ". /workspace is writable: clone, install dependencies, docker build and docker run there to prove the bundle actually works."
-                       " Outbound network reaches source hosting, package registries and image registries only. Images and containers you create are destroyed with this run,"
-                       " so copy anything the finding needs into /workspace/outputs.")
+                       " Outbound network reaches source hosting, package registries and image registries only." +
+                       (" numen-lab:0.1.0 is already loaded in that daemon." if job.get("lab_base_loaded")
+                        else " numen-lab:0.1.0 is NOT available in that daemon, so build against an approved digest-pinned base instead and say so in the report.") +
+                       " A bind mount's source path resolves in the daemon's filesystem, not yours:"
+                       " only /workspace is shared with it, and /workspace/inputs is not part of that share, so a container you mount it into gets an empty directory."
+                       " Containers the daemon starts cannot run as your user, so they can only write into /workspace/share; read their output from there,"
+                       " or docker cp it out of a container to own the copy. You can read and delete what they write but not change its ownership."
+                       " A port you publish with docker run -p 8080:8080 is reachable from here at http://docker:8080, which is what TARGET_URL already points to."
+                       " Resolve every file you place in /workspace/outputs: a symlink or a hard link there fails the whole run."
+                       " Images and containers you create are destroyed with this run, so copy anything the finding needs into /workspace/outputs."
+                       f" The whole run is stopped at {int(job['limits']['timeout_seconds'] or 0)} seconds, so write the report and bundle you already have before chasing a better one.")
         if p["operation"] == "audit_context":
             prompt += "\nBundled authoritative Trail of Bits analysis resources are under /opt/resources/trailofbits. Follow the supplied coordinator phase and write supporting function documents."
         prompt += "\nApplication result JSON schema: " + json.dumps(job["output_schema"])
@@ -539,7 +552,9 @@ def execute(job):
             if code:
                 raise ValueError("native agent exited unsuccessfully (check native sandbox/provider configuration)")
             result = agent_result(p, env, stdout, job["output_schema"], timeout)
-        outputs = output_files(int(job["limits"]["output_bytes"]))
+        # A harvested workspace's outputs are collected from its volume after this process exits,
+        # so they are neither read nor carried through this envelope.
+        outputs = [] if job.get("outputs_harvested") else output_files(int(job["limits"]["output_bytes"]))
         serialized = json.dumps(result) + "".join(base64.b64decode(o["content_base64"]).decode(errors="replace") for o in outputs)
         if any(secret in serialized for secret in secret_values(p["credential"])):
             raise ValueError("credential material detected in output")
@@ -551,15 +566,19 @@ def execute(job):
         return login(env, timeout)
     if kind in {"probe","lab"}:
         script = WORK / "inputs" / ("recipe.py" if kind == "probe" else "poc.py")
+        if kind == "lab" and not script.is_file():
+            script = WORK / "inputs" / "bundle" / "poc.py"  # A bundle submitted as one archive.
         if not script.is_file():
             raise ValueError("required executable input missing")
-        code, stdout, _ = run_process([sys.executable,"-I",str(script)],env,timeout=timeout)
+        code, stdout, stderr = run_process([sys.executable,"-I",str(script)],env,timeout=timeout)
         if kind == "probe":
             if code:
                 raise ValueError("version probe failed")
             result = json.loads(stdout)
         else:
-            result = {"status":"verified" if code==0 else "not_reproduced","verified":code==0,"exit_code":code,"target":"isolated-lab","pinned_image":job.get("lab_image"),"log":stdout[-65536:]}
+            # A PoC that fails reports why on its error stream, so the operator receives it too.
+            log = stdout if code == 0 else (stdout + ("\n--- stderr ---\n" + stderr if stderr else ""))
+            result = {"status":"verified" if code==0 else "not_reproduced","verified":code==0,"exit_code":code,"target":"isolated-lab","pinned_image":job.get("lab_image"),"log":log[-65536:]}
         return {"result":result,"outputs":output_files(int(job["limits"]["output_bytes"]))}
     raise ValueError("unsupported workload kind")
 
@@ -621,6 +640,7 @@ def main():
             "Pi turn did not complete", "Pi agent did not complete its final response", "Codex turn did not complete",
             "Claude turn did not complete", "Claude omitted structured output", "output limit exceeded", "output symlinks are not allowed",
             "output root cannot be a symlink", "output must be a regular file without hard links", "credential material detected in output",
+            "output file is not readable by the workload",
             "agent final response was not valid JSON", "agent session ended without a valid result"} or (
             isinstance(exc, ValueError) and str(exc).startswith("interactive agent session")):
             message = str(exc)[:1].upper() + str(exc)[1:] + "."

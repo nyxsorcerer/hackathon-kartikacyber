@@ -4,7 +4,7 @@ import io
 import tarfile
 import time
 import httpx
-from .artifacts import MAX_SET, MAX_SOURCE_FILES
+from .artifacts import MAX_INPUTS, MAX_SET, MAX_SOURCE_FILES, MAX_SUBMISSION
 from .security import DomainError
 
 
@@ -23,7 +23,8 @@ class Broker:
     def __init__(self, config):
         self.client = httpx.Client(
             base_url=config.broker_url.rstrip("/"),
-            timeout=30,
+            # A build run's outputs are a whole application bundle, so the body takes a while.
+            timeout=httpx.Timeout(600.0, connect=10.0),
             headers={"X-Broker-Token": config.broker_token},
         )
 
@@ -35,9 +36,17 @@ class Broker:
                 "broker_unavailable", "Execution broker is unavailable", 503, retryable=True
             ) from exc
         if response.status_code >= 400:
+            # The broker's own explanation (a contract rule, never a submitted value) makes the
+            # failure diagnosable from the job alone.
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            detail = body.get("message") if isinstance(body, dict) else None
             raise DomainError(
                 "broker_error",
-                f"Execution broker returned HTTP {response.status_code}",
+                f"Execution broker returned HTTP {response.status_code}"
+                + (f": {detail[:500]}" if isinstance(detail, str) and detail else ""),
                 502,
                 retryable=response.status_code >= 500,
             )
@@ -54,18 +63,23 @@ class Broker:
         policy=None,
         limits=None,
         build=False,
+        repository=None,
     ):
         files, source = dict(files or {}), {}
         # Agent source evidence travels as one compressed archive the runner expands read-only.
         for path in list(files):
             if kind == "agent" and path.startswith("source/"):
                 source[path.removeprefix("source/")] = files.pop(path)
+        # A lab bundle is a whole application, so all of it travels the same way.
+        prefix = "source"
+        if kind == "lab":
+            prefix, source, files = "bundle", files, {}
         archive = source_archive(source) if source else b""
         if (
-            len(files) + bool(source) > 512
+            len(files) + bool(source) > MAX_INPUTS
             or len(source) > MAX_SOURCE_FILES
             or sum(len(content) for content in source.values()) > MAX_SET
-            or len(archive) + sum(len(content) for content in files.values()) > 32 * 1024 * 1024
+            or len(archive) + sum(len(content) for content in files.values()) > MAX_SUBMISSION
         ):
             raise DomainError(
                 "runtime_input_limit",
@@ -79,7 +93,7 @@ class Broker:
         if source:
             inputs.append(
                 {
-                    "path": "source",
+                    "path": prefix,
                     "content_base64": base64.b64encode(archive).decode(),
                     "archive": True,
                 }
@@ -94,9 +108,14 @@ class Broker:
         }
         if kind == "agent":
             del defaults["timeout_seconds"]  # Agent runs have no deadline; operators cancel them.
+        if kind == "lab":
+            # A lab run builds and boots a whole application, dependencies and database included.
+            defaults.update({"timeout_seconds": 7200, "memory_mb": 6144, "cpus": 2, "pids": 4096,
+                             "output_bytes": 64 * 1024 * 1024, "input_bytes": MAX_SUBMISSION})
         if build:
             # A build run compiles, installs and runs a real application in its own workspace.
-            defaults.update({"memory_mb": 6144, "cpus": 2, "pids": 2048, "output_bytes": 64 * 1024 * 1024})
+            defaults.update({"memory_mb": 6144, "cpus": 2, "pids": 2048,
+                             "output_bytes": 512 * 1024 * 1024})
         return self.request(
             "POST",
             "/internal/runs",
@@ -107,9 +126,13 @@ class Broker:
                 "prompt": prompt,
                 "output_schema": schema or {},
                 "inputs": inputs,
-                "limits": limits or defaults,
+                # An agent run's requested bounds refine its defaults; other kinds name all of theirs.
+                "limits": {**defaults, **limits} if limits and kind == "agent" else limits or defaults,
                 "target_policy": policy,
                 "build": build,
+                # The runner mirrors this repository and clones it, with full history, into
+                # the workspace, so the agent does not clone it again.
+                **({"repository": repository} if repository else {}),
             },
         )
 

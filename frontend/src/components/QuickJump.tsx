@@ -17,7 +17,7 @@ import { useCollection, useResource } from "../hooks";
 import {
   commitsSchema,
   cvesSchema,
-  findingsSchema,
+  findingSummariesSchema,
   programsSchema,
 } from "../types";
 import { Kbd, matches, Modal } from "./ui";
@@ -89,7 +89,10 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
   const cves = useCollection("/cves", cvesSchema);
   // Commit lists carry full diffs, so the palette searches one page of them.
   const commits = useCollection("/commits", commitsSchema, 0, 200);
-  const findings = useCollection("/findings", findingsSchema);
+  const findings = useCollection(
+    "/findings?view=summary",
+    findingSummariesSchema,
+  );
   const loading =
     programs.loading || cves.loading || commits.loading || findings.loading;
   const results = useMemo(() => {

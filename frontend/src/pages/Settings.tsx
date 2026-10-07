@@ -27,6 +27,7 @@ import type { Account, Profile, Settings as SettingsRecord } from "../types";
 import { ProfileSelect, emptyProfile } from "../components/ProfileSelect";
 import { queueJob } from "../components/JobLaunch";
 import { NativeCacheImport } from "../components/NativeCacheImport";
+import { PromptTemplates } from "./PromptTemplates";
 import {
   ActionButton,
   Badge,
@@ -97,6 +98,7 @@ export function Settings() {
           { id: "accounts", label: "Accounts" },
           { id: "plugins", label: "Pi plugins" },
           { id: "defaults", label: "Defaults" },
+          { id: "prompts", label: "Prompts" },
           { id: "integrations", label: "Integrations" },
           { id: "discord", label: "Discord" },
         ]}
@@ -106,6 +108,7 @@ export function Settings() {
       {tab === "accounts" && <Accounts />}
       {tab === "plugins" && <Plugins />}
       {tab === "defaults" && <Defaults />}
+      {tab === "prompts" && <PromptTemplates />}
       {tab === "integrations" && <Accounts integrations />}
       {tab === "discord" && <Discord />}
     </>

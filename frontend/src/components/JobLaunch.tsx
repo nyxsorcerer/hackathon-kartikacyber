@@ -1,4 +1,6 @@
-import { useState } from "react";
+import { useId, useState } from "react";
+import type { ReactNode } from "react";
+import { LoaderCircle } from "lucide-react";
 import { Link } from "react-router-dom";
 import { mutate } from "../api";
 import { useResource } from "../hooks";
@@ -28,13 +30,21 @@ export function JobLaunch({
   context,
   onClose,
   onSubmitted,
+  submit,
+  submitLabel,
+  refresh,
 }: {
   path: string;
   operation: Operation;
   initialProfile?: Profile;
-  context: string;
+  context: ReactNode;
   onClose: () => void;
   onSubmitted?: () => void;
+  /** Sends the request instead of queueing one job at `path`, e.g. for a batch. */
+  submit?: (body: Record<string, unknown>, key: string) => Promise<void>;
+  submitLabel?: string;
+  /** Audit context only: refresh this context instead of building one. */
+  refresh?: { id: string; revision: string };
 }) {
   const accounts = useResource("/accounts", accountsSchema);
   const settings = useResource("/settings", settingsSchema);
@@ -43,6 +53,8 @@ export function JobLaunch({
   const [maxFunctions, setMaxFunctions] = useState("24");
   const [fresh, setFresh] = useState(false);
   const [sourceRef, setSourceRef] = useState("");
+  const sourceRefLabel = useId();
+  const sourceRefHint = useId();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [key, setKey] = useState(() => crypto.randomUUID());
@@ -57,15 +69,24 @@ export function JobLaunch({
   return (
     <Modal
       title={operationNames[operation]}
-      description="Review the execution profile before starting a background job."
+      description={
+        refresh
+          ? `Analyse again only the functions in files changed since ${refresh.revision.slice(0, 12)}; the rest of that context is reused with its orientation and scope.`
+          : operation === "cve_analysis" || operation === "commit_analysis"
+            ? "Prepare a report, Python PoC, and vulnerable application from the affected source."
+            : "Review the execution profile before starting a background job."
+      }
       onClose={onClose}
     >
       <div className="job-context">
         <span className="eyebrow">Inputs</span>
-        <p>{context}</p>
+        <div className="job-context-body">{context}</div>
         <small>
-          Profile resolution: job selection, then program override, then global
-          default.
+          {override
+            ? "Using your selection for this job."
+            : initialProfile
+              ? "Using the program’s execution profile. You can change it below."
+              : "Using the global execution profile. You can change it below."}
         </small>
       </div>
       <DataState
@@ -78,24 +99,25 @@ export function JobLaunch({
         }}
       >
         <form
+          aria-busy={busy}
           onSubmit={async (e) => {
             e.preventDefault();
+            if (busy) return;
             setBusy(true);
             setError(undefined);
             try {
-              await queueJob(
-                path,
-                {
-                  profile,
-                  ...(operation === "audit_context"
-                    ? { focus, max_functions: Number(maxFunctions), fresh }
-                    : {}),
-                  ...(pinnable && sourceRef.trim()
-                    ? { source_ref: sourceRef.trim() }
-                    : {}),
-                },
-                key,
-              );
+              const body = {
+                profile,
+                ...(operation === "audit_context" && !refresh
+                  ? { focus, max_functions: Number(maxFunctions), fresh }
+                  : {}),
+                ...(refresh ? { refresh_from: refresh.id } : {}),
+                ...(pinnable && sourceRef.trim()
+                  ? { source_ref: sourceRef.trim() }
+                  : {}),
+              };
+              if (submit) await submit(body, key);
+              else await queueJob(path, body, key);
               onSubmitted?.();
               onClose();
             } catch (err) {
@@ -109,16 +131,19 @@ export function JobLaunch({
             }
           }}
         >
-          <ProfileSelect
-            value={profile}
-            accounts={accounts.data?.items || []}
-            onChange={(next) => {
-              setOverride(next);
-              setKey(crypto.randomUUID());
-              setError(undefined);
-            }}
-          />
-          {operation === "audit_context" && (
+          <fieldset className="job-launch-section" disabled={busy}>
+            <legend>Execution profile</legend>
+            <ProfileSelect
+              value={profile}
+              accounts={accounts.data?.items || []}
+              onChange={(next) => {
+                setOverride(next);
+                setKey(crypto.randomUUID());
+                setError(undefined);
+              }}
+            />
+          </fieldset>
+          {operation === "audit_context" && !refresh && (
             <label>
               Focus (optional)
               <textarea
@@ -131,7 +156,7 @@ export function JobLaunch({
               />
             </label>
           )}
-          {operation === "audit_context" && (
+          {operation === "audit_context" && !refresh && (
             <label>
               Max functions
               <input
@@ -146,10 +171,12 @@ export function JobLaunch({
                   setKey(crypto.randomUUID());
                 }}
               />
-              <small>Each selected function is analyzed in its own agent run.</small>
+              <small>
+                Each selected function is analyzed in its own agent run.
+              </small>
             </label>
           )}
-          {operation === "audit_context" && (
+          {operation === "audit_context" && !refresh && (
             <label className="check-label">
               <input
                 type="checkbox"
@@ -159,24 +186,31 @@ export function JobLaunch({
                   setKey(crypto.randomUUID());
                 }}
               />
-              Start fresh instead of continuing an interrupted audit with the same
-              scope and profile
+              Start fresh instead of continuing an interrupted audit with the
+              same scope and profile
             </label>
           )}
           {pinnable && (
             <label>
-              Vulnerable revision (optional)
+              <span id={sourceRefLabel}>Vulnerable revision (optional)</span>
               <input
+                name="source_ref"
+                autoComplete="off"
+                spellCheck={false}
+                aria-labelledby={sourceRefLabel}
+                aria-describedby={sourceRefHint}
+                disabled={busy}
                 value={sourceRef}
                 onChange={(e) => {
                   setSourceRef(e.target.value);
                   setKey(crypto.randomUUID());
                 }}
-                placeholder="Tag, branch, or commit"
+                placeholder="Tag, branch, or commit…"
               />
-              <small>
-                Leave empty to pin the newest release the record still reports as
-                affected. The current checkout already contains the fix.
+              <small id={sourceRefHint}>
+                Use a tag, branch, or commit that contains the vulnerability.
+                Leave empty to resolve an affected release when version criteria
+                are available.
               </small>
             </label>
           )}
@@ -195,7 +229,17 @@ export function JobLaunch({
               Cancel
             </button>
             <button className="primary" disabled={!valid || busy}>
-              {busy ? "Submitting…" : "Start job"}
+              {busy && (
+                <LoaderCircle size={15} className="spin" aria-hidden="true" />
+              )}
+              {busy
+                ? "Submitting…"
+                : submitLabel ||
+                  (refresh && "Start refresh") ||
+                  (operation === "cve_analysis" ||
+                  operation === "commit_analysis"
+                    ? "Start analysis"
+                    : "Start job")}
             </button>
           </div>
         </form>

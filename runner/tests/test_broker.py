@@ -31,6 +31,19 @@ def test_validation_errors_never_echo_secret_fields(tmp_path):
         assert response.status_code==422 and 'secret-must-never-return' not in response.text and 'another-secret' not in response.text
 
 
+def test_a_rejected_run_names_the_rule_it_broke_without_its_values(tmp_path, caplog):
+    app=create_app("test-token",tmp_path,engine=OfflineEngine(),execute=False)
+    body={"attempt_token":"x","kind":"probe","inputs":[{"path":"a.txt","content_base64":"c2VjcmV0LXZhbHVl"}],
+          "limits":{"timeout_seconds":"secret-limit-value"}}
+    with TestClient(app) as client:
+        response=client.post('/internal/runs',headers={"X-Broker-Token":"test-token"},json=body)
+    assert response.status_code==422
+    message=response.json()["message"]
+    assert message.startswith("Run payload failed execution contract validation: ") and "limits" in message
+    assert "secret-limit-value" not in response.text and "c2VjcmV0LXZhbHVl" not in response.text
+    assert "Rejected run payload" in caplog.text and "secret-limit-value" not in caplog.text
+
+
 def test_native_credential_ingress_is_separate_deleted_and_not_persisted(tmp_path):
     app=create_app("test-token",tmp_path,engine=OfflineEngine(),execute=False)
     with TestClient(app) as client:

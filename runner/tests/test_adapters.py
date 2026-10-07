@@ -1,6 +1,6 @@
 import json
 import pytest
-from numen_runner.adapters import agent_argv, parse_agent, codex_models
+from numen_runner.adapters import agent_argv, agent_argv as _agent_argv, parse_agent, codex_models
 
 def test_codex_preserves_native_sandbox_and_exact_effort():
     p = {"agent":"codex", "model_id":"account-model", "reasoning_effort":"xhigh", "operation":"commit_triage"}
@@ -57,3 +57,30 @@ def test_pi_final_json_is_found_after_prose_and_the_last_object_wins():
     final = 'Recipe written.\n\n```json\n{"metadata": {"a": 1}}\n```\nDone, see {notes}.'
     assert parse_agent("pi", pi_stream(final), None) == {"metadata": {"a": 1}}
     assert parse_agent("pi", pi_stream('{"draft": 1} then {"metadata": {}}'), None) == {"metadata": {}}
+
+
+def test_build_runs_grant_a_shell_and_the_private_daemon_to_each_runtime(tmp_path):
+    schema = tmp_path / "schema.json"
+    schema.write_text('{"type":"object"}')
+    profile = {"provider_id":"openai","model_id":"m","auth_type":"api_key","reasoning_effort":None,
+               "operation":"cve_analysis","enabled_plugins":[]}
+    def agent_argv(p, build=False):
+        return _agent_argv(p, str(schema), build=build)
+    codex = agent_argv({**profile, "agent":"codex"}, build=True)
+    assert any(a.startswith("shell_environment_policy.include_only=") and "DOCKER_HOST" in a for a in codex), codex
+    assert "sandbox_workspace_write.network_access=true" in codex
+    plain = agent_argv({**profile, "agent":"codex"})
+    assert not any("DOCKER_HOST" in a for a in plain)
+    assert "sandbox_workspace_write.network_access=false" in plain
+    claude = agent_argv({**profile, "agent":"claude", "provider_id":"claude"}, build=True)
+    assert "Bash" in claude[claude.index("--tools") + 1]
+    assert "Bash" not in agent_argv({**profile, "agent":"claude", "provider_id":"claude"})[2:]
+    pi = agent_argv({**profile, "agent":"pi"}, build=True)
+    assert "numen_shell" in pi[pi.index("--tools") + 1]
+    assert "numen_shell" not in agent_argv({**profile, "agent":"pi"})[pi.index("--tools") + 1]
+    # An interactive session is the path a build run actually takes on this branch.
+    interactive = _agent_argv({**profile, "agent":"pi"}, str(schema), build=True, session=True)
+    assert "numen_shell" in interactive[interactive.index("--tools") + 1]
+    assert "numen_shell" not in _agent_argv(
+        {**profile, "agent":"pi"}, str(schema), session=True
+    )[interactive.index("--tools") + 1]

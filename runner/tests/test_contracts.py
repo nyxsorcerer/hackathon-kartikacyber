@@ -91,10 +91,14 @@ def test_build_is_limited_to_supported_agent_operations_and_raises_the_ceiling()
     agent = {"attempt_token":"t","kind":"agent","profile":{"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}}}
     run = RunRequest(**agent, build=True, limits={"memory_mb":6144,"pids":2048})
     assert run.bounds["memory_mb"] == 6144 and run.bounds["pids"] == 2048
-    assert run.bounds["timeout_seconds"] is None  # Agent runs still have no deadline unless asked.
+    # An ordinary agent run has no deadline; a build run keeps one, because its daemon is privileged.
+    assert run.bounds["timeout_seconds"] == contracts.BUILD_MAXIMA["timeout_seconds"]
+    assert RunRequest(**agent).bounds["timeout_seconds"] is None
     with pytest.raises(ValueError):  # The same limits exceed an ordinary run's ceiling.
         RunRequest(**agent, limits={"memory_mb":6144,"pids":2048})
+    commit = RunRequest(**{**agent, "profile":{**agent["profile"], "operation":"commit_analysis"}}, build=True, limits={"memory_mb":6144,"pids":2048})
+    assert commit.bounds == run.bounds
     with pytest.raises(ValueError):
-        RunRequest(**{**agent, "profile":{**agent["profile"], "operation":"commit_analysis"}}, build=True)
+        RunRequest(**{**agent, "profile":{**agent["profile"], "operation":"commit_triage"}}, build=True)
     with pytest.raises(ValueError):
         RunRequest(attempt_token="t", kind="lab", build=True)

@@ -1,6 +1,7 @@
 import json
+from urllib.parse import quote
 from datetime import timedelta
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from . import artifacts, cves
 from .models import (
@@ -9,6 +10,8 @@ from .models import (
     Analysis,
     Artifact,
     CVE,
+    Commit,
+    Finding,
     Job,
     JobEvent,
     LabRun,
@@ -21,7 +24,7 @@ from .models import (
     now,
     utc,
 )
-from .schemas import OPERATIONS, Profile
+from .schemas import AUDIT_MAX_FUNCTIONS, OPERATIONS, Profile
 from .security import DomainError, fingerprint
 
 
@@ -259,6 +262,31 @@ def submit_agent(db, operation, program, inputs=None, submitted=None, key=None):
     return enqueue(db, operation, program, job_input(program, **(inputs or {})), profile, key)
 
 
+def audit_refresh_input(db, program, base):
+    """Job input that refreshes `base` for the current source revision, keeping its scope."""
+    if base.source_generation != program.source_generation:
+        raise DomainError(
+            "refresh_unavailable",
+            "That audit context belongs to an earlier source generation; build a fresh context",
+            409,
+        )
+    if not base.coverage.get("completed"):
+        raise DomainError(
+            "refresh_unavailable", "That audit context has no analysed functions to reuse", 409
+        )
+    if base.source_ref == program.cursor:
+        raise DomainError(
+            "context_current", "That audit context is already built at the current source revision", 409
+        )
+    origin = db.get(Job, base.job_id)
+    scope = origin.input if origin else {}
+    return {
+        "refresh_from": base.id,
+        "focus": scope.get("focus"),
+        "max_functions": scope.get("max_functions") or AUDIT_MAX_FUNCTIONS,
+    }
+
+
 def queue_cve(db, program, cve, link, submitted=None, key=None, source_ref=None):
     decision = cves.gate(program, cve, link)
     if not decision["eligible"]:
@@ -393,7 +421,7 @@ def artifact_rows(db, resource_type, ident, revision=None):
     return [artifact_json(a) for a in db.scalars(stmt)]
 
 
-def analysis_json(db, row):
+def analysis_json(db, row, with_artifacts=True):
     superseded = False
     if row.kind == "cve_analysis":
         cve = db.get(CVE, row.subject_id)
@@ -405,7 +433,7 @@ def analysis_json(db, row):
         )
         if cve and program and link:
             superseded = cves.analysis_superseded(program, cve, link, row.result.get("gate_hash"))
-    return {
+    result = {
         "superseded": superseded,
         "id": row.id,
         "program_id": row.program_id,
@@ -416,11 +444,32 @@ def analysis_json(db, row):
         "profile": row.profile,
         "result": row.result,
         "created_at": utc(row.created_at),
-        "artifacts": artifact_rows(db, "analysis", row.id),
     }
+    linked = (row.result or {}).get("finding_id")
+    if linked and db.get(Finding, linked) is None:
+        # The stored analysis stays as it was; only its link to a deleted finding is withdrawn.
+        result["result"] = {**row.result, "finding_id": None, "finding_removed": True}
+    if with_artifacts:
+        result["artifacts"] = artifact_rows(db, "analysis", row.id)
+    return result
 
 
-def commit_json(db, row):
+def commit_findings(db, ids):
+    """The findings each commit produced, keyed by commit id."""
+    linked = {}
+    if not ids:
+        return linked
+    source = Finding.data["source_commit_id"].as_string()
+    for finding in db.scalars(select(Finding).where(source.in_(list(ids))).order_by(Finding.created_at)):
+        linked.setdefault(finding.data.get("source_commit_id"), []).append(
+            {"id": finding.id, "title": finding.title, "status": finding.status, "kind": finding.kind}
+        )
+    return linked
+
+
+def commit_json(db, row, findings=None):
+    if findings is None:
+        findings = commit_findings(db, [row.id])
     analyses = list(
         db.scalars(
             select(Analysis)
@@ -438,6 +487,7 @@ def commit_json(db, row):
         "triage_result": row.triage_result,
         "review_decision": row.review_decision,
         "analyses": [analysis_json(db, a) for a in analyses],
+        "findings": findings.get(row.id, []),
     }
 
 
@@ -467,15 +517,84 @@ def cve_json(db, cve, link):
     }
 
 
-def finding_json(db, row, root):
-    files = (
-        artifacts.resource_files(db, root, "finding", row.id, row.artifact_revision)
-        if row.artifact_revision
-        else {}
+# Fields every finding presents, whichever path created it. A commit analysis records only the
+# evidence it established, so a finding it created starts without version ranges.
+FINDING_DEFAULTS = {"affected_versions": [], "fixed_versions": [], "evidence": [], "target_applicability": "unknown"}
+
+
+def finding_data(row):
+    data = {key: value for key, value in row.data.items() if key != "_artifact_state"}
+    return {**FINDING_DEFAULTS, **{key: value for key, value in data.items() if value is not None}}
+
+
+def set_finding_artifacts(db, row, revision, files):
+    # Publishing flushes the artifact metadata first. Refresh and lock before
+    # adding the summary: generation may have loaded this finding before an edit.
+    db.refresh(row, with_for_update=True)
+    state = artifacts.completeness(files)
+    row.artifact_revision = revision
+    row.data = {**row.data, "_artifact_state": {"revision": revision, "state": state}}
+    return state
+
+
+def finding_artifact_state(db, row, root):
+    if not row.artifact_revision:
+        return artifacts.completeness({})
+    cached = row.data.get("_artifact_state")
+    if isinstance(cached, dict) and cached.get("revision") == row.artifact_revision:
+        return cached["state"]
+    return artifacts.resource_completeness(db, root, "finding", row.id, row.artifact_revision)
+
+
+def finding_summaries(db, rows, root):
+    if not rows:
+        return []
+    latest = (
+        select(
+            LabRun.finding_id,
+            LabRun.status,
+            func.row_number().over(
+                partition_by=LabRun.finding_id,
+                order_by=(LabRun.created_at.desc(), LabRun.id.desc()),
+            ).label("rank"),
+        )
+        .where(LabRun.finding_id.in_([row.id for row in rows]))
+        .subquery()
     )
+    statuses = dict(
+        db.execute(
+            select(latest.c.finding_id, latest.c.status).where(latest.c.rank == 1)
+        ).all()
+    )
+    return [
+        {
+            "id": row.id,
+            "program_id": row.program_id,
+            "kind": row.kind,
+            "cve_id": row.cve_id,
+            "title": row.title,
+            "status": row.status,
+            "affected_versions": row.data.get("affected_versions", []),
+            "fixed_versions": row.data.get("fixed_versions", []),
+            "target_applicability": row.data.get("target_applicability", "unknown"),
+            "source_commit_id": row.data.get("source_commit_id"),
+            "source_analysis_id": row.data.get("source_analysis_id"),
+            "artifact_revision": row.artifact_revision,
+            "artifact_state": finding_artifact_state(db, row, root),
+            "lab_status": statuses.get(row.id),
+            "created_at": utc(row.created_at),
+            "updated_at": utc(row.updated_at),
+        }
+        for row in rows
+    ]
+
+
+def finding_json(db, row, root):
     labs = list(
         db.scalars(
-            select(LabRun).where(LabRun.finding_id == row.id).order_by(LabRun.created_at.desc())
+            select(LabRun)
+            .where(LabRun.finding_id == row.id)
+            .order_by(LabRun.created_at.desc(), LabRun.id.desc())
         )
     )
     actions = list(
@@ -492,8 +611,8 @@ def finding_json(db, row, root):
         "cve_id": row.cve_id,
         "title": row.title,
         "status": row.status,
-        **row.data,
-        "artifact_state": artifacts.completeness(files),
+        **finding_data(row),
+        "artifact_state": finding_artifact_state(db, row, root),
         "artifact_revision": row.artifact_revision,
         "artifacts": artifact_rows(db, "finding", row.id, row.artifact_revision),
         "lab_runs": [
@@ -513,7 +632,99 @@ def finding_json(db, row, root):
     }
 
 
+def source_label(program):
+    if program.source_kind == "wordpress":
+        return f"WordPress · {program.plugin_slug}"
+    return (program.source_url or program.asset_name).removeprefix("https://github.com/")
+
+
+# Program-level operations act on one part of the program; link to its tab.
+PROGRAM_SUBJECTS = {
+    "source_check": ("source", "commits"),
+    "version_recipe": ("version", "version"),
+    "version_check": ("version", "version"),
+    "audit_context": ("audit", "audit"),
+}
+
+
+def job_subject(db, row, program):
+    """What a job acts on, as a readable label, short reference, and dashboard link."""
+    data = row.input if isinstance(row.input, dict) else {}
+    ref = data.get("source_ref")
+    if data.get("commit_id"):
+        commit = db.get(Commit, data["commit_id"])
+        if not commit:
+            return {"type": "commit", "label": "Removed commit", "ref": None, "link": None}
+        triage = commit.triage_result if isinstance(commit.triage_result, dict) else {}
+        message = (commit.data.get("message") or commit.revision).split("\n")[0]
+        return {
+            "type": "commit",
+            "label": (triage.get("title") or message)[:240],
+            "ref": commit.revision[:10],
+            "link": f"/commits/{commit.id}",
+        }
+    if data.get("cve_id"):
+        cve = db.get(CVE, data["cve_id"])
+        query = f"cve={quote(data['cve_id'])}"
+        if row.program_id:
+            query += f"&cvep={quote(row.program_id)}"
+        if row.kind == "cve_analysis":
+            query += "&view=analysis"
+        return {
+            "type": "cve",
+            "label": data["cve_id"],
+            "detail": (cve.data.get("description") or cve.data.get("title")) if cve else None,
+            "ref": None,
+            "link": f"/cves?{query}",
+        }
+    if data.get("finding_id"):
+        finding = db.get(Finding, data["finding_id"])
+        return {
+            "type": "finding",
+            "label": finding.title[:240] if finding else "Removed finding",
+            "ref": None,
+            "link": f"/findings/{finding.id}" if finding else None,
+        }
+    if data.get("account_id"):
+        account = db.get(Account, data["account_id"])
+        return {
+            "type": "account",
+            "label": account.label if account else "Removed connection",
+            "ref": account.provider if account else None,
+            "link": "/settings?tab=accounts",
+        }
+    if data.get("notification_id"):
+        notification = db.get(Notification, data["notification_id"])
+        details = notification.data if notification else {}
+        link = details.get("link")
+        return {
+            "type": "notification",
+            "label": (details.get("title") or "Removed notification").split("\n")[0],
+            "ref": None,
+            "link": link if isinstance(link, str) and link.startswith("/") else None,
+        }
+    if program and row.kind in PROGRAM_SUBJECTS:
+        kind, tab = PROGRAM_SUBJECTS[row.kind]
+        # A source check's input ref is where it started, not what it found.
+        pinned = isinstance(ref, str) and row.kind != "source_check"
+        return {
+            "type": kind,
+            "label": source_label(program),
+            "ref": ref[:10] if pinned else None,
+            "link": f"/programs/{program.id}?tab={tab}",
+        }
+    if program and row.kind == "cve_sync":
+        return {
+            "type": "cves",
+            "label": program.product_name,
+            "ref": None,
+            "link": f"/cves?prog={quote(program.id)}",
+        }
+    return None
+
+
 def job_json(db, row, with_events=True):
+    program = db.get(Program, row.program_id) if row.program_id else None
     result = {
         name: getattr(row, name)
         for name in (
@@ -532,6 +743,8 @@ def job_json(db, row, with_events=True):
     }
     for name in ("created_at", "started_at", "finished_at"):
         result[name] = utc(result[name])
+    result["program_name"] = program.asset_name if program else None
+    result["subject"] = job_subject(db, row, program)
     result["events"] = (
         [
             {"id": e.id, "created_at": utc(e.created_at), **e.data}

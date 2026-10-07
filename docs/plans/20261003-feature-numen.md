@@ -206,6 +206,10 @@ This is a high-cost new application because no code or harness exists and severa
 
 ## Completion checklist
 
+The 2026-10-06 CVE UI/UX correction follows this order: reproduce the saved-run and large-bundle presentation failures; add focused navigation, launch, preview, and immutable-download regressions; implement URL-selected CVE detail tabs, one-run result viewing, searchable/paged shared artifact browsing, and analysis-resource ZIP downloads; verify frontend/API tests, repository lint/type/build checks, and desktop/mobile Chrome behavior. Its scope is CVE details/launch, the shared artifact browser and launch form, finding downloads, job-to-result links, analysis response typing, and the authenticated hash-checked archive read path. Source ingestion, scoring gates, agent execution, and lab policy retain their contracts.
+
+The 2026-10-05 agent-session correction follows this dependency order: enable full native history in private per-run storage and durable redacted broker archives; expose job-owned historical agent runs with live-only steering; implement completion polling, safe composer/actions, latest/selected-run viewing and stable scrolling; verify focused frontend/API regressions plus actual Docker exit/cancellation and a Chrome layout inspection. The implementation scope is the session component and its shared response type/styles, job detail mounting, session API/runtime-start metadata, and runner history collection/retention. Existing unrelated application and build changes remain outside this correction. Evidence is recorded in [verification](../verification.md).
+
 - [x] Every PRD AC has an implementation task and an observable repository proof boundary.
 - [x] Requested workflows are implemented, including WordPress without GitHub and optional AI-off/manual review.
 - [x] Pi, Claude Code, and Codex CLI version/protocol/container behavior has compatibility evidence; live connections require operator credentials.

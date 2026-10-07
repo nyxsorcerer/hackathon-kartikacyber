@@ -7,7 +7,7 @@ import tarfile
 import threading
 import uuid
 import pytest
-from numen_runner.contracts import RunRequest
+from numen_runner.contracts import RunRequest, validate_outputs
 from numen_runner.engine import DockerEngine, RuntimeFailure, LABEL, INSTANCE, VERSION
 
 pytestmark = pytest.mark.skipif(os.getenv("NUMEN_DOCKER_TESTS") != "1", reason="explicit Docker Engine verification only")
@@ -352,27 +352,36 @@ def test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed(
             engine.cleanup(run_id)
 
 
-def test_build_run_gets_a_private_daemon_and_a_writable_nonroot_workspace(engine):
+def test_build_run_shares_its_workspace_and_carries_the_offline_lab_base(engine):
     run_id = str(uuid.uuid4())
     job = RunRequest(attempt_token=run_id, kind="agent", build=True,
                      profile={"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}})
     labels = {LABEL:run_id, INSTANCE:engine.instance}
+    events = []
     try:
         network = engine.client.networks.create("numen-job-" + run_id, internal=True, labels=labels)
-        engine.start_build_daemon(run_id, job, network, labels)
+        workspace = engine.prepare_workspace(run_id, "numen-codex:" + VERSION, labels)
+        daemon = engine.start_build_daemon(run_id, job, network, labels, workspace)
+        engine.load_lab_base(daemon, events.append)
+        assert [e["type"] for e in events] == ["build_base_loaded"], events
         spec = engine.spec(job, network, labels)
         # The workspace is disk backed for a build run, and the workload itself stays unprivileged.
         assert "/workspace" not in spec["tmpfs"] and spec["read_only"] and spec["user"] == "10001:10001"
         assert spec["cap_drop"] == ["ALL"] and "no-new-privileges:true" in spec["security_opt"]
-        workspace = engine.client.volumes.create("numen-workspace-" + run_id, labels=labels)
         observed = engine.client.containers.run(
             "numen-codex:" + VERSION,
-            ["sh","-c","id -u; git --version >/dev/null && echo git-ok; test -e /var/run/docker.sock && echo SOCKET || echo no-host-socket; "
-                       "touch /workspace/writable && echo workspace-writable; docker run --rm alpine:3.20 echo nested-ok"],
+            ["sh","-c",
+             "id -u; git --version >/dev/null && echo git-ok; "
+             "test -e /var/run/docker.sock && echo SOCKET || echo no-host-socket; "
+             "echo shared > /workspace/share/from-agent.txt; "
+             # A bind mount source resolves in the daemon, so this only works because it shares the volume.
+             "docker run --rm -v /workspace/share:/s numen-lab:" + VERSION + " "
+             "sh -c 'cat /s/from-agent.txt; echo written-by-container > /s/from-container.txt'; "
+             "cat /workspace/share/from-container.txt"],
             environment={"DOCKER_HOST":"tcp://docker:2375"}, network=network.name,
             volumes={workspace.name:{"bind":"/workspace","mode":"rw"}}, user="10001:10001",
             labels=labels, remove=True)
-        assert observed.decode().split() == ["10001","git-ok","no-host-socket","workspace-writable","nested-ok"]
+        assert observed.decode().split() == ["10001","git-ok","no-host-socket","shared","written-by-container"]
     finally:
         engine.cleanup(run_id)
         assert not engine.client.containers.list(all=True,filters={"label":f"{LABEL}={run_id}"})
@@ -380,20 +389,25 @@ def test_build_run_gets_a_private_daemon_and_a_writable_nonroot_workspace(engine
         assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
 
 
-def test_build_agent_run_wires_the_daemon_and_workspace_before_the_provider_step(engine):
+@pytest.mark.parametrize("operation", ["cve_analysis", "commit_analysis"])
+def test_build_agent_run_wires_the_daemon_and_workspace_before_the_provider_step(engine, operation):
     run_id = str(uuid.uuid4())
-    job = RunRequest(attempt_token=run_id, kind="agent", build=True, limits={"timeout_seconds":120},
+    job = RunRequest(attempt_token=run_id, kind="agent", build=True, limits={"timeout_seconds":600},
                      profile={"agent":"codex","provider_id":"openai","model_id":"m",
-                              "operation":"cve_analysis","credential":{"api_key":"fixture-key-no-real-access"}})
+                              "operation":operation,"credential":{"api_key":"fixture-key-no-real-access"}})
     events = []
     try:
         # The run cannot reach a provider with a fixture credential; its capability wiring still must hold.
         with pytest.raises(RuntimeFailure):
             engine.run(run_id, job, lambda: False, events.append)
-        assert any(e["type"] == "build_daemon_started" for e in events), events
+        kinds = [e["type"] for e in events]
+        assert "build_daemon_started" in kinds and "build_base_loaded" in kinds, events
         workload = next(c for c in engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})
                         if c.image.tags and c.image.tags[0].startswith("numen-codex"))
-        assert "DOCKER_HOST=tcp://docker:2375" in workload.attrs["Config"]["Env"]
+        environment = workload.attrs["Config"]["Env"]
+        assert "DOCKER_HOST=tcp://docker:2375" in environment
+        # The daemon is reached directly, never through the credential-free provider proxy.
+        assert any(v.startswith("NO_PROXY=") and v.endswith(",docker") for v in environment), environment
         workspace = [m for m in workload.attrs["Mounts"] if m["Destination"] == "/workspace"]
         assert workspace and workspace[0]["Type"] == "volume" and workspace[0]["RW"]
         assert workload.attrs["HostConfig"]["ReadonlyRootfs"] and workload.attrs["HostConfig"]["CapDrop"] == ["ALL"]
@@ -401,3 +415,106 @@ def test_build_agent_run_wires_the_daemon_and_workspace_before_the_provider_step
     finally:
         engine.cleanup(run_id)
         assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})
+
+
+PHP_BASE = "php@sha256:8c0ac7363ba26de6279a0614a9072277e3c86f90d11447002bdf74ad7db9aac3"
+
+
+def test_lab_builds_and_verifies_an_application_with_its_own_database(engine):
+    """The reported blocker: a bundle that installs dependencies, runs a database and serves."""
+    run_id = str(uuid.uuid4())
+    start = """#!/bin/sh
+set -e
+mkdir -p /run/mysqld /var/lib/mysql
+mariadb-install-db --user=root --datadir=/var/lib/mysql >/dev/null 2>&1 || true
+mariadbd --user=root --datadir=/var/lib/mysql --skip-networking=0 --bind-address=127.0.0.1 &
+for i in $(seq 1 60); do mariadb -u root -e 'select 1' >/dev/null 2>&1 && break; sleep 1; done
+mariadb -u root -e "create database app; create user 'app'@'%' identified by 'app'; grant all on app.* to 'app'@'%'; create table app.note (body text); insert into app.note values ('uTimezone-sink');"
+exec php -S 0.0.0.0:8080 -t /app /app/index.php
+"""
+    index = """<?php
+$db = new mysqli('127.0.0.1', 'app', 'app', 'app');
+$row = $db->query('select body from app.note')->fetch_assoc();
+// The sink the finding is about: the stored value is rendered without encoding.
+echo "<div>" . $row['body'] . "</div>";
+"""
+    poc = """import os, time, urllib.request
+target = os.environ["TARGET_URL"]
+for _ in range(240):
+    try:
+        body = urllib.request.urlopen(target, timeout=5).read().decode()
+        break
+    except Exception:
+        time.sleep(1)
+else:
+    raise SystemExit("application never answered")
+assert "uTimezone-sink" in body, body[:200]
+print("observed the stored value rendered by the application")
+"""
+    dockerfile = (
+        f"FROM {PHP_BASE}\n"
+        "RUN apt-get update && apt-get install -y --no-install-recommends mariadb-server \\\n"
+        "    && rm -rf /var/lib/apt/lists/* && docker-php-ext-install mysqli >/dev/null\n"
+        "COPY app/ /app/\n"
+        "COPY start.sh /start.sh\n"
+        "EXPOSE 8080\n"
+        'CMD ["sh", "/start.sh"]\n'
+    )
+    bundle = {
+        "poc.py": poc.encode(),
+        "report.md": b"# Fixture reproduction\n",
+        "vulnerable-app/Dockerfile": dockerfile.encode(),
+        "vulnerable-app/compose.yaml": b"services:\n  app:\n    build: .\n",
+        "vulnerable-app/README.md": b"Fixture application with its own database.\n",
+        "vulnerable-app/application.lock.json": b'{"version":"9.5.3","source_ref":"' + b"9" * 40 + b'","images":[]}',
+        "vulnerable-app/start.sh": start.encode(),
+        "vulnerable-app/app/index.php": index.encode(),
+    }
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+        for path, data in bundle.items():
+            info = tarfile.TarInfo(path)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    job = RunRequest(
+        attempt_token=run_id, kind="lab",
+        inputs=[{"path":"bundle","content_base64":base64.b64encode(payload.getvalue()).decode(),"archive":True}],
+        limits={"timeout_seconds":2400,"memory_mb":4096,"cpus":2,"pids":4096})
+    events = []
+    try:
+        result = engine.run(run_id, job, lambda: False, events.append)
+        assert result["result"]["verified"] is True, result["result"]
+        assert "observed the stored value" in result["result"]["log"], result["result"]["log"][-400:]
+        assert [e["type"] for e in events if e["type"].startswith("lab_")] == ["lab_build","lab_built","lab_started"]
+    finally:
+        engine.cleanup(run_id)
+        assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
+
+
+def test_build_run_outputs_a_whole_application_bundle_past_the_log_bound(engine):
+    """The reported failure: a bundle of thousands of files died on 'output limit exceeded'."""
+    run_id = str(uuid.uuid4())
+    job = RunRequest(attempt_token=run_id, kind="agent", build=True,
+                     profile={"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}})
+    labels = {LABEL:run_id, INSTANCE:engine.instance}
+    try:
+        workspace = engine.prepare_workspace(run_id, "numen-codex:" + VERSION, labels)
+        # Stand in for the agent: write an application-sized bundle into its workspace.
+        engine.client.containers.run(
+            "numen-codex:" + VERSION,
+            ["sh","-c","mkdir -p /workspace/outputs/vulnerable-app/app && "
+                       "for i in $(seq 1 1200); do echo \"<?php // $i\" > /workspace/outputs/vulnerable-app/app/f$i.php; done && "
+                       "dd if=/dev/urandom of=/workspace/outputs/vulnerable-app/vendor.bin bs=1M count=80 2>/dev/null && "
+                       "printf '# Report' > /workspace/outputs/report.md"],
+            volumes={workspace.name:{"bind":"/workspace","mode":"rw"}}, user="10001:10001",
+            network_mode="none", labels=labels, remove=True)
+        outputs = engine.harvest_outputs(job, workspace, labels)
+        assert len(outputs) == 1202, len(outputs)
+        total = sum(o["size"] for o in outputs)
+        # Past both the former 512-file cap and the 16MB container log the envelope used to carry.
+        assert total > 80 * 1024 * 1024, total
+        assert any(o["path"] == "report.md" for o in outputs)
+        assert all(not o["path"].startswith("outputs/") for o in outputs)
+        validate_outputs(outputs, int(job.bounds["output_bytes"]))
+    finally:
+        engine.cleanup(run_id)

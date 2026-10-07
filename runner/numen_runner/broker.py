@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -18,6 +20,8 @@ from .contracts import LoginInput, RunRequest, SessionInput, validate_outputs
 from .workload import secret_values
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
+# Whitespace or a terminal escape sequence (CSI such as SGR colors, or OSC) between characters.
+TERMINAL_GAP = r"(?:\s|\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))*"
 
 
 class Store:
@@ -47,6 +51,20 @@ class Store:
             value = self.runs[run_id]
             value.update(fields)
             self.save(value)
+
+    def save_session(self, run_id, state):
+        with self.lock:
+            directory = self.path / "sessions"
+            directory.mkdir(exist_ok=True, mode=0o700)
+            target = directory / (run_id + ".json")
+            temp = target.with_suffix(".tmp")
+            temp.write_text(json.dumps(state), encoding="utf-8")
+            temp.chmod(0o600)
+            temp.replace(target)
+
+    def read_session(self, run_id):
+        target = self.path / "sessions" / (run_id + ".json")
+        return json.loads(target.read_text()) if target.exists() else None
 
 
 def create_app(token=None, state_path=None, engine=None, execute=True, reconcile_interval=2, concurrency=None):
@@ -97,7 +115,29 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
             if entry:
                 store.credentials[run_id] = (time.monotonic() + 600, entry[1])
 
+    def retain_session(run_id, state, final=False):
+        with store.lock:
+            value = get(run_id)
+            if not final and (value.get("_session_final") or value["status"] != "running"):
+                archived = store.read_session(run_id)
+                if archived is None:
+                    raise HTTPException(409, "run has no retained agent session")
+                return {**archived, "live": False}
+            state = dict(state)
+            for secret in store.session_secrets.get(run_id, ()):
+                # Terminal wrapping can split a credential across whitespace in the saved viewport,
+                # and terminal styling can put escape sequences between its characters.
+                pattern = TERMINAL_GAP.join(re.escape(char) for char in secret)
+                state["screen"] = re.sub(pattern, "[redacted]", state.get("screen", ""))
+            store.save_session(run_id, state)
+            if final:
+                store.change(run_id, _session_final=True)
+            return state
+
     def report(run_id, event):
+        if "session" in event:
+            retain_session(run_id, event["session"])
+            return  # Terminal history never enters progress events or ordinary run responses.
         store.change(run_id, events=(get(run_id)["events"] + [event])[-100:],
                      **({"execution": event["execution"]} if "execution" in event else {}))
 
@@ -117,6 +157,7 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
                                   lambda event: report(run_id, event), **login)
             credential = envelope.pop("credential", None)
             if credential is not None:
+                store.session_secrets[run_id].extend(secret_values(credential))
                 store.credentials[run_id] = (time.monotonic() + 600, credential)
                 store.change(run_id, credential_updated=True)
             outputs = validate_outputs(envelope.get("outputs", []), int(request.bounds["output_bytes"]))
@@ -134,12 +175,20 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
             message = getattr(exc, "safe_message", "Workload failed. Check runtime configuration and provider access.")
             refreshed = getattr(exc, "credential", None)
             if refreshed:
+                store.session_secrets[run_id].extend(secret_values(refreshed))
                 store.credentials[run_id] = (time.monotonic() + 600, refreshed)
                 store.change(run_id, credential_updated=True)
             completion = {"status": "failed", "error": {"code": code, "message": message,
                           "retryable": code in {"engine_unavailable", "runtime_error"}}}
         finally:
             if completion is not None:
+                if hasattr(engine, "session"):
+                    try:
+                        retain_session(run_id, {**engine.session(run_id, "read"), "live": False, "held": False}, final=True)
+                    except Exception as exc:
+                        if getattr(exc, "code", "no_session") != "no_session":
+                            report(run_id, {"type": "session_history_unavailable",
+                                "message": "Final session history could not be read; the last saved session remains available."})
                 retain_completion(run_id, completion)
                 try:
                     engine.cleanup(run_id)
@@ -236,8 +285,15 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
     app.state.reconcile = reconcile_once
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_request, _exc):
-        return JSONResponse(status_code=422, content={"code": "invalid_run", "message": "Run payload failed execution contract validation."})
+    async def validation_error(_request, exc):
+        # Where the payload broke the contract and which rule it broke, never the submitted values:
+        # payloads carry source evidence and credentials.
+        problems = "; ".join(
+            ".".join(str(part)[:64] for part in error.get("loc", ())[1:]) + ": " + str(error.get("msg", "invalid"))[:200]
+            for error in exc.errors()[:3]
+        )
+        logging.getLogger("uvicorn.error").warning("Rejected run payload: %s", problems)
+        return JSONResponse(status_code=422, content={"code": "invalid_run", "message": "Run payload failed execution contract validation: " + problems})
 
     @app.get("/health")
     def health():
@@ -318,11 +374,14 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
 
     @app.get("/internal/runs/{run_id}/session", dependencies=[Depends(auth)])
     def session(run_id: str):
+        value = get(run_id)
+        if value["status"] != "running":
+            state = store.read_session(run_id)
+            if state is None:
+                raise HTTPException(409, "run has no retained agent session")
+            return {**state, "live": False}
         state = session_call(run_id, "read")
-        # ponytail: exact-match redaction; a secret the TUI wraps across lines would pass through.
-        for secret in store.session_secrets.get(run_id, ()):
-            state["screen"] = state.get("screen", "").replace(secret, "[redacted]")
-        return state
+        return retain_session(run_id, {**state, "live": state.get("live", True)})
 
     @app.post("/internal/runs/{run_id}/session", dependencies=[Depends(auth)], status_code=202)
     def session_input(run_id: str, body: SessionInput):

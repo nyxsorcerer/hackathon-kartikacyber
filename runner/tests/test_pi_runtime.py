@@ -601,3 +601,42 @@ console.log(child.stdout.trim().split('\\n').pop()||JSON.stringify({{stderr:chil
                             env={"OPENAI_API_KEY": "synthetic-pi-key-no-access"})
     assert observed.get("code") == 0, observed
     assert observed["result"] == {"metadata": {"restated": True, "tools": 0}}
+
+
+@DOCKER
+def test_pi_build_run_writes_scratch_files_but_never_evidence_or_private_paths():
+    script = """
+import register from '/opt/numen/pi-tools.ts';
+import {mkdir,writeFile} from 'node:fs/promises';
+import {validateToolCall} from '@earendil-works/pi-ai/compat';
+await mkdir('/workspace/inputs',{recursive:true});await mkdir('/workspace/outputs',{recursive:true});
+await mkdir('/workspace/repo/.git',{recursive:true});
+await writeFile('/workspace/repo/.git/config','cloned history');await writeFile('/home/job/private.txt','fixture private marker');
+let tools=[];register({registerTool:t=>tools.push(t)});
+async function call(name,args){const tool=tools.find(t=>t.name===name);return tool.execute('1',validateToolCall(tools,{id:'1',name,arguments:args}));}
+async function denied(name,args){try{await call(name,args);return false;}catch{return true;}}
+const {readFile,symlink}=await import('node:fs/promises');
+await symlink('/workspace/inputs','/workspace/evidence');
+const clone=await call('numen_read',{path:'repo/.git/config'});
+await call('numen_write',{path:'outputs/report.md',content:'# Report'});
+await call('numen_write',{path:'dev/Dockerfile',content:'FROM numen-lab:0.1.0'});
+console.log(JSON.stringify({
+  clone:clone.content[0].text,
+  wrote:await readFile('/workspace/outputs/report.md','utf8'),
+  scratch:await readFile('/workspace/dev/Dockerfile','utf8'),
+  denied_inputs:await denied('numen_write',{path:'inputs/source.txt',content:'mutated'}),
+  denied_inputs_via_link:await denied('numen_write',{path:'evidence/source.txt',content:'mutated'}),
+  denied_private:await denied('numen_write',{path:'/home/job/private.txt',content:'mutated'}),
+  denied_private_read:await denied('numen_read',{path:'/home/job/private.txt'}),
+  shell_enabled:!(await denied('numen_shell',{command:'echo shell-ok'})),
+}));
+"""
+    # A build run is the only run where DOCKER_HOST is set. Its shell can already write anywhere
+    # in /workspace, so the write tool may too, except the read-only evidence; only outputs/ is
+    # ever published.
+    observed = image_script(script, env={"DOCKER_HOST": "tcp://docker:2375"})
+    assert observed["clone"] == "cloned history"
+    assert observed["wrote"] == "# Report" and observed["scratch"] == "FROM numen-lab:0.1.0"
+    assert observed["denied_inputs"] and observed["denied_inputs_via_link"]
+    assert observed["denied_private"] and observed["denied_private_read"]
+    assert observed["shell_enabled"]

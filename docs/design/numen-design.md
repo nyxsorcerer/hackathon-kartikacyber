@@ -73,7 +73,7 @@ backend/migrations/       Alembic migrations
 frontend/src/             React screens and shared interactions
 runner/                   broker, fetch gateway, entrypoints, images
 skills/trailofbits/        pinned skill/plugin content and licenses
-prompts/                  versioned operation templates and output schemas
+backend/numen/prompt_templates/  default operation and section prompt templates (operator edits override them)
 tests/                    unit, integration, browser, and fixture sources
 compose.yaml              production/self-hosted runtime
 compose.test.yaml         deterministic fixture/test overrides
@@ -129,7 +129,7 @@ All browser endpoints require the operator session except login and a minimal he
 | `GET/POST /api/findings`, `PATCH /api/findings/{id}` | Finding and operator status; CVE linkage preserves original 0day history |
 | `POST /api/findings/{id}/artifacts`, `POST /api/findings/{id}/artifact-generations` | Safe upload or agent generation into a new artifact revision |
 | `POST /api/findings/{id}/lab-runs` | Explicit verification of a particular complete artifact set |
-| `GET /api/artifacts/{id}/content`, `GET /api/artifact-sets/{id}/download` | Authorized preview/download; safe content types and filenames |
+| `GET /api/artifacts/{id}/content`, `GET /api/findings/{id}/download`, `GET /api/analyses/{id}/download` | Authorized file preview and finding/current or analysis/immutable ZIP downloads; safe content types and filenames |
 | `GET /api/jobs/{id}`, `GET /api/jobs/{id}/events`, `POST /api/jobs/{id}/cancel`, `POST /api/jobs/{id}/retry` | Truthful state/progress and bounded sanitized logs; retry creates another attempt with the same immutable input/profile |
 | `/api/settings`, `/api/accounts`, `/api/plugins`, `/api/accounts/{id}/check`, `/api/accounts/{id}/capabilities` | Validated write-only credentials and redacted connection/plugin/profile state |
 | `POST /api/settings/webhook/test` | Queue a named test event only when explicitly submitted |
@@ -187,31 +187,34 @@ Label this source as WordPress release history. Support it independently of GitH
 
 ## Commit triage and analysis
 
-Triage inputs are bounded commit metadata, changed paths, diff sections, and a completeness flag. Results are `security_candidate`, `unrelated_change`, or `insufficient_context`. Missing context overrides an apparent unrelated classification. Each input/result is immutable and operator decisions are separate.
+Triage inputs are bounded commit metadata, changed paths, diff sections, and a completeness flag. Results include a potential issue title and fix/hardening/introduction classification, alongside `security_candidate`, `unrelated`, or `insufficient_context`. Complete unrelated changes are dismissed; uncertain or incomplete input stays pending, and later manual decisions are preserved. Missing context overrides an apparent unrelated classification. Each input/result is immutable and operator decisions are separate.
 
-For Jev, send one typed Choice question through its evaluation API. The `state` contains the structured input; the question's `instructions` define what security relevance means, and its `criteria` map contains the three application labels with explicit descriptions. Preserve the returned choice, probability distribution, model version, and confidence if present. Jev does not generate the narrative report. [Jev API](https://docs.typesafe.ai/api)
+For Jev, send three typed Choice questions for security relevance, change kind, and potential vulnerability family in one request. Titles are formed from the selected family and product, since Jev returns typed choices rather than generated text. The `state` contains the structured input; the question's `instructions` define what security relevance means, and its `criteria` map contains the three application labels with explicit descriptions. Preserve the returned choice, probability distribution, model version, and confidence if present. Jev does not generate the narrative report. [Jev API](https://docs.typesafe.ai/api)
 
 Pi/Claude/Codex triage uses a read-only profile and returns the same application contract with explanation/evidence when available. AI triage disabled means no classifier job; the operator can manually nominate a commit. Candidate and insufficient-context review items remain visible. A candidate creates its Discord outbox entry transactionally.
 
-Detailed analysis begins only from an explicit authenticated Analyze submission. Materialize the commit and its selected parent; for a merge, retain the comparison parent choice. Supply relevant source context, exact before/after references, and the audit context's revision/coverage. If a context is stale, either supply the required delta with its provenance or regenerate the necessary scope; the report must state any remaining gap.
+Detailed analysis begins only from an explicit authenticated Analyze submission. Provide the immutable commit snapshot and diff. Imported Git parent references are retained; the build agent can clone the registered source and inspect its exact parent history. WordPress supplies the preceding SVN source when available. Validate a supported finding against its vulnerable parent for a fix, or the selected revision for an introduction. Supply relevant source context, exact before/after references, and the audit context's revision/coverage. If a context is stale, either supply the required delta with its provenance or regenerate the necessary scope; the report must state any remaining gap.
 
 Detailed commit result contract:
 
 ```json
 {
+  "title": "Path traversal through template file inclusion",
   "category": "Likely vulnerability fix",
   "summary": "Evidence-grounded assessment",
-  "before_ref": "immutable-reference",
-  "after_ref": "immutable-reference",
-  "evidence": [{"path": "src/file", "ref": "immutable-reference", "lines": [12, 18], "observation": "..."}],
-  "affected_versions": [],
-  "fixed_versions": [],
-  "confidence": {"level": "medium", "basis": "..."},
+  "before_after": "The patch rejects traversal accepted by its parent",
+  "affected_behavior": "Template file selection",
+  "finding_decision": "finding",
+  "finding_reason": "A reachable include was reproduced against the pinned parent",
+  "vulnerable_ref": "ffffffffffffffffffffffffffffffffffffffff",
+  "reproduction": {"status": "reproduced", "summary": "Observed in the isolated build lab"},
+  "evidence": [{"path": "src/file", "revision": "ffffffffffffffffffffffffffffffffffffffff", "lines": [12, 18], "observation": "..."}],
+  "confidence": {"level": "high", "basis": "Source and observed reproduction"},
   "open_questions": []
 }
 ```
 
-Validate the category against the four exact PRD labels and source citations against available inputs. Persist a Markdown report alongside the structured result. A malformed response fails validation; permit one bounded repair attempt using the validation errors and record that attempt. Creating/updating a finding is a separate operator decision.
+Validate the category against the five PRD labels and source citations against available inputs. Persist a Markdown report alongside the structured result. A malformed response fails validation; permit one bounded repair attempt using the validation errors and record that attempt. Detailed commit analysis requests the same isolated build capability as CVE analysis. Its explicit finding verdict automatically creates or updates a linked local finding when supported; pure hardening/unrelated results create none. Vulnerability titles, finding reasons, reproduction status, and validated vulnerable references are persisted. Confirmed findings require complete pinned report/PoC/application bundles; incomplete bundles keep linked drafts and fail visibly. Re-analysis preserves operator finding title/status and immutable historical artifacts. Independent lab verification stays separate from agent reproduction.
 
 ## Accounts, plugins, and agent adapters
 
@@ -240,6 +243,16 @@ API keys are encrypted with a Fernet authenticated encryption envelope. The gene
 The broker supplies only that job's credential to its runtime. Connection checks and job logs expose status/usage through allowlisted, redacted fields. Artifact publication scans for supplied secret values and rejects credential-bearing output. Provider usage/cost is nullable and labeled estimated where appropriate.
 
 Bundle Pi plugins in runner images at pinned versions. Settings controls enabled resources for new jobs and displays health. Refresh a catalog without silently updating plugin code. A package upgrade rebuilds the image and records a new bundle hash. [Specified Command Code provider](https://github.com/patlux/pi-commandcode-provider/)
+
+### Retained interactive agent history (2026-10-05 correction)
+
+The operator requested stable frontend session controls and history without dashboard truncation. Herdr's bounded viewport/scrollback is unsuitable as the complete conversation source. Keep native agent conversation records in their original append order, including records preceding compaction, supported text tool-output sidecars, and the latest captured terminal viewport. Pi's Herdr invocation enables native session persistence. Claude/Pi temporary output directories remain within the private home.
+
+Reuse the runner's per-run volume and durable state patterns: a private home volume survives exit/cancellation; checkpoints flow through a private broker callback independently of browser reads; final redacted history is written under runner-state `sessions/` before workload cleanup. A post-exit helper mounts only that run's home read-only, runs without network/capabilities, and returns text through private exec stdout. Final archives are immutable against late reads, including during cleanup recovery. The broker retains its existing startup reconciliation; an abrupt restart exposes the last redacted checkpoint rather than raw orphan credentials.
+
+Authenticated API reads enumerate job-owned runtime-start events and attempts, excluding known non-agent runtime kinds. Historical sessions are inspectable after completion; steering remains restricted to the current running attempt. The frontend owns serialized completion polling, run isolation, pending actions, draft preservation, and scroll following. It stops polling completed archives and follows the latest agent phase unless the operator selects an earlier run. No new frontend dependency or schema migration is needed.
+
+Verification covers slow polling, safe steering, large transcripts/sidecars, completed/cancelled history, immutable final archives, credential redaction, API ownership, and real Docker reads after exit/cancellation. Native tool omissions and preexisting discarded history remain explicit limitations.
 
 ## Container execution and network boundary
 
@@ -298,7 +311,7 @@ Pin a portable Trail of Bits skill/plugin snapshot and preserve its license/revi
 3. Persist full function documents to artifacts and return compact records to synthesis. Track selected, completed, failed, and omitted units; bounded concurrency and cumulative operation limits apply.
 4. Synthesis emits the dossier, structural assumptions, evidence references, and open questions. Produce `audit-context-building.md` as the entry document referencing that dossier and its function documents.
 
-A report is current only relative to its exact pinned snapshot/scope. Partial coverage and stale context remain explicit. Detailed investigations consume applicable context plus a documented source delta. The [inspected skill](../references.md#trail-of-bits-audit-context-building) determines the analysis content; the architecture adds provenance, persistence, and job lifecycle.
+A report is current only relative to its exact pinned snapshot/scope. Partial coverage and stale context remain explicit. CVE analysis and finding artifact generation consume the closest applicable context (exact revision first, else the newest complete one) as untrusted orientation, while commit analysis judges the change without it; when it was built at another revision, the build agent derives the source delta itself by diffing the two revisions in its repository clone. A refresh reuses orientation and the documents of functions whose file is unchanged. The [inspected skill](../references.md#trail-of-bits-audit-context-building) determines the analysis content; the architecture adds provenance, persistence, and job lifecycle.
 
 ## CVE ingestion, gates, and applicability
 
@@ -322,13 +335,19 @@ Validate scores as decimal values in `[0,10]` and retain the witness source/vect
 
 Automatically analyze only when the operator enabled that setting and a valid profile exists. Repeated records are deduplicated by analysis-relevant hash; administrative changes alone do not spend another agent run. Newly eligible or materially changed records create a visible event and, when enabled, a new analysis request.
 
-The CVE agent result contains `cve_id`, `source_record_hash`, `summary`, `affected_versions`, `fixed_versions`, `evidence` in the same cited format as commit analysis, `confidence`, and `open_questions`, plus `report.md`. Product eligibility and remote applicability are supplied as deterministic input facts with their evidence; the agent's narrative does not replace those fields. The four commit categories are not reused as a CVE verdict enum.
+The CVE agent result contains `cve_id`, `source_record_hash`, `summary`, `affected_versions`, `fixed_versions`, `evidence` in the same cited format as commit analysis, `confidence`, and `open_questions`, plus `report.md`. Product eligibility and remote applicability are supplied as deterministic input facts with their evidence; the agent's narrative does not replace those fields. The five commit categories are not reused as a CVE verdict enum.
 
 Compute remote applicability separately. Use a declared version scheme and trusted comparator: SemVer for explicitly SemVer products; PHP's `version_compare` semantics for WordPress versions, invoked through a bundled trusted comparator. Apply inclusive/exclusive bounds and compound configuration logic. Missing environmental conditions, unsupported vendor ordering, ambiguous remote candidates, or absent version evidence produce Unknown. Agent explanations cannot override the deterministic score gate.
 
 ## Findings and reproducible artifacts
 
 Findings are operator-created or operator-confirmed from an analysis. Store the original local identity even if a CVE is later linked. Keep upstream status/fixed versions, observed-target applicability, artifact completeness, and lab verification as distinct fields.
+
+Finding read performance follows the register's projection: `view=summary` excludes artifact inventories and histories and fetches latest lab statuses in one query for the page. The default full response remains compatible. Upload and generation store a private completeness summary in the existing finding JSON, paired with the immutable artifact revision in the same transaction. A summary for another revision is never used. Older publishers and existing records can derive equivalent completeness from artifact paths/sizes plus only the Dockerfile and application lock, without reading the application tree. Reads expose published completeness, while every artifact use retains the full integrity check. This removes the measured 24,126-file/171 MB scan from ordinary reads without adding a schema migration or shared cache service.
+
+Publication refreshes and locks the finding before merging its completeness record so an operator's newer evidence cannot be overwritten by a finding loaded before generation. Operator edits also lock the current row and preserve the private revision summary.
+
+Commit finding validation finishes network-dependent parent resolution and source snapshotting before taking the job publication lock. The source client's heartbeat writes through a separate database connection; invoking it under that lock blocks the worker on its own transaction. Keep validation errors until the analysis/report is published, then retain the report and fail the unsupported proposal without creating a finding.
 
 Completed bundle:
 
@@ -348,6 +367,10 @@ finding-id/revision/
 `manifest.json` lists file SHA-256/size/type, program/source/analysis references, declared vulnerable version, generation profile, and reproduction prerequisites. `application.lock.json` pins source refs and relevant base/dependency digests or includes exact required local inputs. A PoC and Docker stub with unavailable software remain a Draft bundle, not a reproducible completed finding.
 
 Validate uploads and generated archives for path traversal, symlinks/hardlinks, unexpected device files, size limits, and declared required files. Render Markdown with HTML sanitization; serve executable files as downloads/source text. Every artifact revision is immutable.
+
+The CVE investigation UI presents URL-selected detail tabs and one saved analysis run at a time. It keeps current product/score/target judgments distinct from the selected run's historical status and version evidence. The shared artifact browser groups reports, PoCs, applications, and supporting files, pages file navigation in sets of 50, and resolves supporting report links within that artifact set. The main report and application instructions take precedence over nested application documents. Cancelling a launch returns to the selected CVE. Analysis ZIP downloads use the analysis resource's immutable files through the existing hash-checked archive path, while finding ZIP downloads use the finding's current revision; both retain drafts without implying lab verification. Focused frontend tests prove navigation, launch submission, file selection, and report previews; API tests prove historical ZIP bytes, draft retention, authentication, and corruption rejection. Desktop/mobile Chrome inspection uses the existing large application bundle.
+
+ZIP bytes are fully validated and prepared before returning a response. Send that prepared byte body directly with its Content-Length so the browser can show download size/progress. Iterating a BytesIO through StreamingResponse splits binary ZIP data at newline bytes and incurs a thread-pool dispatch per tiny chunk; the existing 80 MB bundle produced over 285,000 chunks. Avoid that transfer path for both analysis and finding downloads.
 
 Verification builds the declared vulnerable application through the broker's isolated build profile with bounded approved registry access and no real credentials. After dependency acquisition, start the vulnerable service and PoC container on an internal lab network with outbound access disabled. Use dummy fixtures and pin the executed input set. The PoC's target is the lab service; no registered remote asset is substituted. Record health, exit status, declared success conditions, observed evidence, and reproduction limitations. Verification success means those conditions were observed for this pinned artifact set; it does not prove every claim in the report.
 
@@ -398,3 +421,9 @@ Use a hybrid sequence: a small persisted/login foundation, then an observable mo
 ## References and update history
 
 The [PRD](../prd/numen-prd.md), [UI spec](../ui-spec/numen-ui-spec.md), proposed ADRs, and [evidence register](../references.md) govern this design. Initial version written 2026-10-03; amended the same day to include Codex CLI across agent-backed workflows. Runtime claims remain subject to the work plan's proofs.
+
+## External Resources Used
+
+| Project Resource Label | Feature Identifier | Purpose |
+|------------------------|--------------------|---------|
+| [typesafe-jev-schema](../project-context/external-resources.md) | `POST /v1/systemone`, `ChoiceQuestion`, `ChoiceAnswer`, multiple named questions | Program-scoped commit triage kinds and potential issue titles without unsupported free-text generation |

@@ -78,6 +78,54 @@ def create_program(db, name="Fixture"):
     return program
 
 
+def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(postgres, monkeypatch):
+    import httpx
+    from numen.models import Commit
+    from numen.sources import Sources
+    from numen.worker import run_once
+    from test_commit_review import assessment, pinned_bundle, prepared
+
+    original, _ = postgres
+    url = make_url(original.database_url)
+    options = url.query.get("options", "") + " -clock_timeout=750ms -cstatement_timeout=5000"
+    config = replace(
+        original,
+        database_url=url.update_query_dict({"options": options}).render_as_string(hide_password=False),
+        secret_key=Fernet.generate_key().decode(),
+        test_mode=True,
+    )
+    app = create_app(config=config, admin_password="test-password-long")
+    lookups = []
+
+    def source_get(self, url, **kwargs):
+        # The real heartbeat uses another PostgreSQL connection. Looking up parents
+        # after fencing this job used to wait forever on the publication transaction.
+        self.heartbeat()
+        lookups.append(url)
+        return httpx.Response(200, json={"sha": "a" * 40, "parents": [{"sha": "f" * 40}]})
+
+    monkeypatch.setattr(Sources, "get", source_get)
+    try:
+        with TestClient(app) as client:
+            session = client.post("/api/auth/login", json={
+                "username": "admin", "password": "test-password-long"}).json()
+            client.headers["X-CSRF-Token"] = session["csrf_token"]
+            _, ident, _ = prepared((app, client, config))
+            with app.state.factory.begin() as db:
+                row = db.get(Commit, ident)
+                row.data = {key: value for key, value in row.data.items() if key != "parent_revisions"}
+            job_id = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
+            run_once(config, app.state.factory, FixtureBroker(assessment(), pinned_bundle()))
+            job = client.get(f"/api/jobs/{job_id}").json()
+            assert job["status"] == "succeeded", job
+            assert lookups == ["https://api.github.com/repos/demo/plugin/commits/" + "a" * 40]
+            finding = client.get(f"/api/findings/{job['result']['finding_id']}").json()
+            assert finding["source_commit_id"] == ident
+            assert finding["artifact_state"]["status"] == "complete"
+    finally:
+        app.state.factory.kw["bind"].dispose()
+
+
 def test_postgres_skip_locked_claims_and_fenced_recovery(postgres):
     config, factory = postgres
     with factory.begin() as db:

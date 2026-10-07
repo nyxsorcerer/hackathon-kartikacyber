@@ -218,6 +218,11 @@ def test_explicit_commit_analysis_retains_report_and_category(system):
     ]
     result = {
         "category": "Likely vulnerability fix",
+        "title": "Potential input validation weakness",
+        "finding_decision": "needs_more_evidence",
+        "finding_reason": "Before/after evidence does not yet establish an exploit",
+        "vulnerable_ref": None,
+        "reproduction": {"status": "not_run", "summary": "Source comparison only"},
         "summary": "Input conversion prevents misuse",
         "evidence": [{"path": "main.py", "lines": [1, 2]}],
         "confidence": {"level": "medium", "basis": "Before/after source"},
@@ -577,16 +582,21 @@ def test_audit_function_limit_is_configurable_and_records_reach_synthesis_as_a_f
             "audit-context/DOSSIER.md": b"# Dossier"
         }
 
-    for limit, status in ((1, "failed"), (2, "succeeded")):
+    for limit in (1, 2):
         queued = client.post(
             f"/api/programs/{p['id']}/audit-contexts", json={"max_functions": limit}
         ).json()["job_id"]
         run_once(config, app.state.factory, FixtureBroker(handler=handler))
         job = client.get(f"/api/jobs/{queued}").json()
-        assert job["status"] == status, job
+        assert job["status"] == "succeeded", job
         assert f'"max_functions": {limit}' in seen["orientation"]
-        if status == "failed":
-            assert "more than 1 bounded" in job["error"]["message"]
+        coverage = job["result"]["coverage"]
+        if limit == 1:
+            # Over-selection keeps the most significant functions and records the rest.
+            assert coverage["completed"] == 1 and coverage["deferred"] == 1
+            assert coverage["deferred_units"] == [{"name": "parse1", "path": "main.py"}]
+        else:
+            assert coverage["deferred"] == 0
     records = json.loads(seen["synthesis"]["files"]["audit-functions.json"])
     assert [record["unit"]["name"] for record in records] == ["parse0", "parse1"]
     assert "x" * 5000 not in seen["synthesis"]["prompt"]
@@ -1394,6 +1404,8 @@ def test_genuine_head_advance_automatic_triage_runs_broker(system, monkeypatch):
     broker = FixtureBroker(
         {
             "decision": "security_candidate",
+            "change_kind": "vulnerability_fix",
+            "title": "Potential input trust boundary vulnerability",
             "reason": "Input trust boundary changed",
             "confidence": {"level": "medium", "basis": "Complete diff"},
         }
@@ -1448,6 +1460,11 @@ def test_historical_pinned_commit_job_remains_valid_after_current_head_advances(
         )
     result = {
         "category": "Likely vulnerability fix",
+        "title": "Potential input validation weakness",
+        "finding_decision": "needs_more_evidence",
+        "finding_reason": "Before/after evidence does not yet establish an exploit",
+        "vulnerable_ref": None,
+        "reproduction": {"status": "not_run", "summary": "Source comparison only"},
         "summary": "Input conversion",
         "evidence": [{"path": "main.py", "lines": [1, 2]}],
         "confidence": {"level": "medium", "basis": "Pinned complete source"},
@@ -1461,10 +1478,8 @@ def test_historical_pinned_commit_job_remains_valid_after_current_head_advances(
     assert job["status"] == "succeeded", job
     assert len(broker.calls) == 1 and pinned in broker.calls[0]["prompt"]
     assert "source/main.py" in broker.calls[0]["files"]
-    assert (
-        broker.calls[0]["files"]["context/audit-context-building.md"]
-        == b"# Historical context pinned to revision A"
-    )
+    # Commit analysis judges the change itself, without the audit context.
+    assert not any(path.startswith("context/") for path in broker.calls[0]["files"])
     analysis = client.get(f"/api/commits/{commit_id}").json()["analyses"][0]
     manifest = next(
         artifact for artifact in analysis["artifacts"] if artifact["path"] == "manifest.json"

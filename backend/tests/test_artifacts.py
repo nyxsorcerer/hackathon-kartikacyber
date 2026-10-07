@@ -13,7 +13,7 @@ def bundle(version="1.0.0"):
     return {
         "poc.py": b"print('proof')",
         "report.md": b"# Report\nFixture vulnerable behavior",
-        "vulnerable-app/Dockerfile": b"FROM scratch\nCOPY fixture /fixture\n",
+        "vulnerable-app/Dockerfile": b"FROM numen-lab:0.1.0\nCOPY fixture /fixture\n",
         "vulnerable-app/compose.yaml": b"services:\n  app:\n    build: .\n",
         "vulnerable-app/README.md": b"Use the supplied local fixture",
         "vulnerable-app/fixture": b"fixture bytes",
@@ -99,6 +99,7 @@ def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(sy
         assert archive.read("report.md") == bundle()["report.md"]
     analyses = client.get("/api/cves").json()["items"][0]["analyses"]
     assert analyses[0]["result"]["finding_id"] == row["id"]
+    original_analysis_id = analyses[0]["id"]
     original_report = next(a for a in analyses[0]["artifacts"] if a["path"] == "report.md")
     client.patch(f"/api/findings/{row['id']}", json={"status": "fixed", "title": "Reviewed title"})
     again = client.post(
@@ -117,6 +118,16 @@ def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(sy
         == bundle()["report.md"]
     )
     assert len(client.get("/api/findings").json()["items"]) == 1
+    # A historical run downloads its own output, even after the linked finding changes.
+    downloaded = client.get(f"/api/analyses/{original_analysis_id}/download")
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"] == "application/zip"
+    assert downloaded.headers.get("content-length") == str(len(downloaded.content))
+    assert result["cve_id"] in downloaded.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+        assert archive.read("report.md") == bundle()["report.md"]
+        assert archive.read("vulnerable-app/fixture") == b"fixture bytes"
+        assert "manifest.json" in archive.namelist()
 
 
 @pytest.mark.parametrize("defect", ["missing_poc", "missing_dockerfile", "unpinned_image"])
@@ -142,8 +153,44 @@ def test_cve_analysis_incomplete_bundle_fails_and_retains_report(system, defect)
         == job["result"]["analysis_id"]
     )
     events = client.get(f"/api/jobs/{queued}/events").json()["items"]
-    assert events[-1]["partial_output_retained"] is True
+    assert any(event.get("partial_output_retained") is True for event in events)
     assert client.post(f"/api/findings/{row['id']}/lab-runs").status_code == 422
+
+
+def test_analysis_download_retains_drafts_and_enforces_auth_and_integrity(system):
+    from fastapi.testclient import TestClient
+    from numen.models import Artifact
+
+    app, client, config = system
+    _, queued, result = queue_cve_analysis(system)
+    run_once(config, app.state.factory, FixtureBroker(result, {"report.md": b"# Draft evidence"}))
+    job = client.get(f"/api/jobs/{queued}").json()
+    assert job["status"] == "failed"
+    ident = job["result"]["analysis_id"]
+    url = f"/api/analyses/{ident}/download"
+    downloaded = client.get(url)
+    assert downloaded.status_code == 200
+    assert downloaded.headers["cache-control"] == "private, no-store"
+    assert downloaded.headers.get("content-length") == str(len(downloaded.content))
+    with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
+        assert archive.read("report.md") == b"# Draft evidence"
+        assert "manifest.json" in archive.namelist()
+        assert "poc.py" not in archive.namelist()
+    with TestClient(app) as unauthenticated:
+        assert unauthenticated.get(url).status_code == 401
+    assert client.get("/api/analyses/missing/download").status_code == 404
+    analysis = client.get("/api/cves").json()["items"][0]["analyses"][0]
+    report = next(a for a in analysis["artifacts"] if a["path"] == "report.md")
+    with app.state.factory() as db:
+        path = config.artifact_root / db.get(Artifact, report["id"]).storage_path
+    original = path.read_bytes()
+    try:
+        path.write_bytes(b"tampered")
+        response = client.get(url)
+        assert response.status_code == 409
+        assert response.json()["code"] == "artifact_corrupt"
+    finally:
+        path.write_bytes(original)
 
 
 def test_cve_analysis_pins_newest_affected_release_not_the_fixed_checkout(system, monkeypatch):
@@ -246,6 +293,34 @@ def test_finding_generation_uses_linked_cve_analysis_and_rejects_incomplete_outp
     assert job["result"]["artifact_state"]["missing"]
 
 
+def test_finding_generation_keeps_large_artifact_inventories_out_of_the_prompt(system):
+    from numen.models import Finding
+
+    app, client, config = system
+    _, queued, result = queue_cve_analysis(system)
+    files = {**bundle(), **{f"vulnerable-app/tree/file-{index:04}.php": b"source" for index in range(2000)}}
+    run_once(config, app.state.factory, FixtureBroker(result, files))
+    original = client.get(f"/api/jobs/{queued}").json()["result"]
+    with app.state.factory.begin() as db:
+        row = db.get(Finding, original["finding_id"])
+        row.data = {**row.data, "evidence": [{"source_notes": "evidence " * 40000}]}
+    generation = client.post(f"/api/findings/{original['finding_id']}/artifact-generations", json={}).json()["job_id"]
+    broker = FixtureBroker({"summary": "Regenerated bundle"}, bundle())
+    run_once(config, app.state.factory, broker)
+    call = broker.calls[0]
+    assert len(call["prompt"]) < 262144  # The actual runner's RunRequest prompt bound.
+    assert "finding.json" in call["files"]
+    finding = json.loads(call["files"]["finding.json"])
+    assert finding["evidence"] == [{"source_notes": "evidence " * 40000}]
+    assert finding["id"] == original["finding_id"]
+    assert "artifacts" not in finding and "lab_runs" not in finding
+    analysis = json.loads(call["files"]["analysis.json"])
+    assert analysis["result"]["cve_id"] == result["cve_id"]
+    assert "artifacts" not in analysis
+    assert call["files"]["analysis-report.md"] == files["report.md"]
+    assert client.get(f"/api/jobs/{generation}").json()["status"] == "succeeded"
+
+
 def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
     app, client, config = system
     p = program(client)
@@ -259,6 +334,7 @@ def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
     assert complete["status"] == "open" and complete["target_applicability"] == "affected"
     assert client.get(f"/api/artifacts/{first_artifact['id']}/content").content == b"first proof"
     downloaded = client.get(f"/api/findings/{row['id']}/download")
+    assert downloaded.headers.get("content-length") == str(len(downloaded.content))
     with zipfile.ZipFile(io.BytesIO(downloaded.content)) as archive:
         assert {"poc.py", "report.md", "vulnerable-app/Dockerfile", "manifest.json"}.issubset(
             archive.namelist()
@@ -355,3 +431,99 @@ def test_inherited_interval_tracks_global_and_explicit_stays(system):
         changed.status_code == 200
         and changed.json()["config"]["monitor_interval_inherited"] is True
     )
+
+
+LAB_BASES = [
+    ("numen-lab:0.1.0", True),
+    ("scratch", True),
+    ("python@sha256:" + "a" * 64, True),
+    ("docker.io/library/php@sha256:" + "b" * 64, True),
+    ("python:3.12.12-slim-bookworm@sha256:" + "d" * 64, True),
+    # A vulnerable application needs its own database and toolchain images, pinned by digest.
+    ("mariadb@sha256:" + "c" * 64, True),
+    ("python:3.12", False),
+    ("mysql:latest", False),
+]
+
+
+@pytest.mark.parametrize("base,accepted", LAB_BASES)
+def test_completeness_accepts_exactly_the_bases_the_lab_verifier_builds(base, accepted):
+    from numen.artifacts import completeness
+
+    files = {**bundle(), "vulnerable-app/Dockerfile": f"FROM {base}\nCOPY fixture /fixture\n".encode()}
+    state = completeness(files)
+    assert (state["status"] == "complete") is accepted, state["limitations"]
+
+
+@pytest.mark.parametrize(
+    "line,refused",
+    [
+        ("RUN composer install", False),
+        ("ADD https://example.com/x /x", False),
+        ("HEALTHCHECK CMD true", False),
+        ("RUN --mount=type=secret,id=k cat /run/secrets/k", True),
+        ('ENV OPTS="--mount=nothing"', False),
+        ("COPY /etc/passwd /app/", True),
+        ("ENV A=b", False),
+        ("EXPOSE 8080", False),
+    ],
+)
+def test_completeness_refuses_directives_the_lab_verifier_rejects(line, refused):
+    from numen.artifacts import completeness
+
+    files = {
+        **bundle(),
+        "vulnerable-app/Dockerfile": f"FROM numen-lab:0.1.0\n{line}\nCOPY fixture /fixture\n".encode(),
+    }
+    state = completeness(files)
+    assert (state["status"] != "complete") is refused, state["limitations"]
+
+
+def test_completeness_accepts_a_whole_application_sized_bundle():
+    """A real vulnerable application is tens of thousands of files; that is not a defect."""
+    from numen.artifacts import completeness
+
+    padded = {**bundle(), **{f"vulnerable-app/app/src/File{i}.php": b"<?php\n" for i in range(20000)}}
+    assert completeness(padded)["status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    "dockerfile,complete",
+    [
+        (b"FROM numen-lab:0.1.0\nCOPY fixture /fixture\n", True),
+        (b"# comment\n\tFROM numen-lab:0.1.0\r\nCOPY fixture /fixture\n", True),
+        (b"FROM numen-lab:0.1.0\nCOPY . /app/\n", True),
+        (b"FROM numen-lab:0.1.0\nCOPY *.py /app/\n", True),
+        (b"FROM numen-lab:0.1.0\nCOPY vendor/ /app/vendor/\n", False),
+        (b"FROM numen-lab:0.1.0\nCOPY .fixture /app/.fixture\n", True),
+        (b"FROM numen-lab:0.1.0\nCOPY fixture /f\nENTRYPOINT [\"sh\", \"/f\"]\n", True),
+        (b"FROM numen-lab:0.1.0\nRUN composer install --no-dev\nCOPY fixture /f\n", True),
+        (b"FROM numen-lab:0.1.0\nENV A=1 \\\n  B=2\nCOPY fixture /f\n", True),
+        (b"FROM --platform=linux/amd64 numen-lab:0.1.0\nCOPY fixture /f\n", False),
+        (b"FROM numen-lab:0.1.0\nUSER www-data\nCOPY fixture /f\n", True),
+        (b"FROM numen-lab:0.1.0\nCOPY --from=build /x /y\n", False),
+    ],
+)
+def test_completeness_reads_the_dockerfile_shapes_the_verifier_will_see(dockerfile, complete):
+    from numen.artifacts import completeness
+
+    files = {**bundle(), "vulnerable-app/.fixture": b"dotfile", "vulnerable-app/Dockerfile": dockerfile}
+    state = completeness(files)
+    assert (state["status"] == "complete") is complete, state["limitations"]
+    assert len(state["limitations"]) <= 20 and all(len(item) < 200 for item in state["limitations"])
+
+
+def test_completeness_requires_the_lock_keys_at_its_top_level():
+    """A live run published a lock whose version and source_ref sat under a nested object."""
+    from numen.artifacts import completeness
+
+    nested = json.dumps(
+        {"upstream_application": {"version": "9.5.3", "source_ref": "9379c29cb26a1054208b37507b6869811aa75a32"}}
+    ).encode()
+    state = completeness({**bundle(), "vulnerable-app/application.lock.json": nested})
+    assert state["status"] == "draft"
+    assert any("vulnerable version" in item for item in state["limitations"])
+    flat = json.dumps(
+        {"version": "9.5.3", "source_ref": "9379c29cb26a1054208b37507b6869811aa75a32", "images": []}
+    ).encode()
+    assert completeness({**bundle(), "vulnerable-app/application.lock.json": flat})["status"] == "complete"

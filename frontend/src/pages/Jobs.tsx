@@ -1,6 +1,7 @@
 import { useMemo } from "react";
+import type { ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
-import { Activity, RotateCcw, Square } from "lucide-react";
+import { Activity, ArrowUpRight, RotateCcw, Square } from "lucide-react";
 import { useCollection, useQueryState, useResource } from "../hooks";
 import {
   jobSchema,
@@ -9,7 +10,17 @@ import {
   programsSchema,
   recordsSchema,
 } from "../types";
-import type { Job } from "../types";
+import type { Job, JobSubject } from "../types";
+import {
+  duration,
+  jobError,
+  jobName,
+  jobOutcome,
+  jobTitle,
+  subjectLinkText,
+  subjectRefText,
+} from "../jobSummary";
+import type { JobOutcome } from "../jobSummary";
 import { queueJob } from "../components/JobLaunch";
 import { AgentSession } from "../components/AgentSession";
 import {
@@ -18,10 +29,8 @@ import {
   Callout,
   countBy,
   DataState,
-  describeError,
   DetailGrid,
   Empty,
-  ErrorNote,
   Evidence,
   FilterSelect,
   humanize,
@@ -35,11 +44,6 @@ import {
   useShowMore,
 } from "../components/ui";
 import { ActivityEvent } from "./Dashboard";
-export function jobName(kind: string) {
-  return kind in operationNames
-    ? operationNames[kind as keyof typeof operationNames]
-    : humanize(kind);
-}
 const statuses = [
   "queued",
   "running",
@@ -49,9 +53,6 @@ const statuses = [
   "cancelled",
 ];
 type JobFilters = { status: string; kind: string; program: string; q: string };
-function jobError(job: Job) {
-  return job.error ? describeError(job.error) || "Failed without a reason" : "";
-}
 function resultId(result: unknown, key: string) {
   if (typeof result !== "object" || !result || !(key in result)) return;
   const value: unknown = Reflect.get(result, key);
@@ -60,7 +61,17 @@ function resultId(result: unknown, key: string) {
 function applyJobFilters(items: Job[], f: JobFilters, skip?: keyof JobFilters) {
   return items.filter(
     (job) =>
-      matches(f.q, job.id, job.kind, jobName(job.kind), jobError(job)) &&
+      matches(
+        f.q,
+        job.id,
+        job.kind,
+        jobName(job.kind),
+        jobError(job),
+        job.program_name,
+        job.subject?.label,
+        job.subject?.ref,
+        job.subject?.detail,
+      ) &&
       (skip === "status" || f.status === "all" || job.status === f.status) &&
       (skip === "kind" || f.kind === "all" || job.kind === f.kind) &&
       (skip === "program" ||
@@ -72,13 +83,20 @@ function applyJobFilters(items: Job[], f: JobFilters, skip?: keyof JobFilters) {
 export function failureGroups(jobs: Job[]) {
   const groups = new Map<
     string,
-    { reason: string; count: number; kinds: Set<string>; latest: string }
+    {
+      reason: string;
+      hint?: string;
+      count: number;
+      kinds: Set<string>;
+      latest: string;
+    }
   >();
   for (const job of jobs) {
     if (job.status !== "failed") continue;
     const reason = jobError(job);
     const group = groups.get(reason) || {
       reason,
+      hint: jobOutcome(job).hint,
       count: 0,
       kinds: new Set<string>(),
       latest: job.created_at,
@@ -122,8 +140,6 @@ export function Jobs() {
     (j) => j.program_id || "none",
   );
   const failures = failureGroups(applyJobFilters(items, filters, "status"));
-  const programName = (id: string | null | undefined) =>
-    id ? programs.data?.items.find((p) => p.id === id)?.asset_name : undefined;
   const clear = () =>
     update({ status: "all", kind: "all", program: "all", q: "" });
   return (
@@ -144,6 +160,9 @@ export function Jobs() {
                 <span className="failure-count">{group.count}×</span>
                 <div className="failure-main">
                   <strong>{group.reason}</strong>
+                  {group.hint && (
+                    <span className="failure-hint">{group.hint}</span>
+                  )}
                   <span className="muted">
                     {[...group.kinds].join(", ")} · latest{" "}
                     <Time value={group.latest} />
@@ -165,7 +184,7 @@ export function Jobs() {
         <div className="explorer-toolbar">
           <SearchField
             label="Search jobs"
-            placeholder="Search operation, error, or job ID"
+            placeholder="Search subject, operation, error, or job ID"
             value={filters.q}
             onChange={(q) => update({ q })}
           />
@@ -247,74 +266,98 @@ export function Jobs() {
           )}
           {visible.length ? (
             <div className="table-scroll">
-              <table>
+              <table className="jobs-table">
                 <thead>
                   <tr>
-                    <th scope="col">Operation</th>
-                    <th scope="col">Status</th>
+                    <th scope="col">Job</th>
+                    <th scope="col">Outcome</th>
                     <th scope="col">Profile</th>
-                    <th scope="col">Submitted</th>
-                    <th scope="col">Finished</th>
+                    <th scope="col">When</th>
                     <th scope="col">
                       <span className="sr-only">Actions</span>
                     </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {shown.map((job) => (
-                    <tr key={job.id}>
-                      <td>
-                        <Link className="table-title" to={`/jobs/${job.id}`}>
-                          {jobName(job.kind)}
-                        </Link>
-                        <div className="table-subtitle">
-                          <span className="mono">{job.id.slice(0, 8)}</span>
-                          {job.program_id && (
+                  {shown.map((job) => {
+                    const outcome = jobOutcome(job);
+                    const took = duration(job.started_at, job.finished_at);
+                    return (
+                      <tr key={job.id}>
+                        <td className="job-cell">
+                          <div className="job-kicker">
+                            {jobName(job.kind)}
+                            {job.program_id && (
+                              <>
+                                {" · "}
+                                <Link to={`/programs/${job.program_id}`}>
+                                  {job.program_name || "Program"}
+                                </Link>
+                              </>
+                            )}
+                          </div>
+                          <Link
+                            className="table-title clamp"
+                            to={`/jobs/${job.id}`}
+                            title={jobTitle(job)}
+                          >
+                            {job.subject?.label || jobName(job.kind)}
+                          </Link>
+                          {job.subject?.detail && (
+                            <div className="table-subtitle clamp">
+                              {job.subject.detail}
+                            </div>
+                          )}
+                          <div className="table-subtitle job-refs">
+                            {job.subject && (
+                              <SubjectLink subject={job.subject} />
+                            )}
+                            <span className="mono">{job.id.slice(0, 8)}</span>
+                          </div>
+                        </td>
+                        <td>
+                          <Badge>{job.status}</Badge>
+                          <div
+                            className={`table-subtitle clamp job-outcome ${outcome.tone}`}
+                          >
+                            {outcome.summary}
+                          </div>
+                        </td>
+                        <td>
+                          {job.profile ? (
                             <>
-                              {" · "}
-                              <Link to={`/programs/${job.program_id}`}>
-                                {programName(job.program_id) || "Program"}
-                              </Link>
+                              {job.profile.agent} · {job.profile.model_id}
+                              <div className="table-subtitle">
+                                {job.profile.reasoning_effort ||
+                                  "Provider managed"}
+                              </div>
+                            </>
+                          ) : (
+                            <span className="muted">No coding agent</span>
+                          )}
+                        </td>
+                        <td>
+                          {job.finished_at ? (
+                            <>
+                              Finished <Time value={job.finished_at} />
+                              {took && (
+                                <div className="table-subtitle">
+                                  took {took}
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <>
+                              Submitted <Time value={job.created_at} />
                             </>
                           )}
-                        </div>
-                      </td>
-                      <td>
-                        <Badge>{job.status}</Badge>
-                        {!!job.error && (
-                          <div className="table-subtitle danger-text clamp">
-                            {jobError(job)}
-                          </div>
-                        )}
-                      </td>
-                      <td>
-                        {job.profile ? (
-                          <>
-                            {job.profile.agent} · {job.profile.model_id}
-                            <div className="table-subtitle">
-                              {job.profile.reasoning_effort ||
-                                "Provider managed"}
-                            </div>
-                          </>
-                        ) : (
-                          <span className="muted">No coding agent</span>
-                        )}
-                      </td>
-                      <td>
-                        <Time value={job.created_at} />
-                      </td>
-                      <td>
-                        {job.finished_at ? (
-                          <Time value={job.finished_at} />
-                        ) : (
-                          <span className="muted">—</span>
-                        )}
-                      </td>
-                      <td className="cell-actions">
-                        <JobActions job={job} refresh={jobs.refresh} />
-                      </td>
-                    </tr>
-                  ))}
+                        </td>
+                        <td className="cell-actions">
+                          <JobActions job={job} refresh={jobs.refresh} />
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
               {footer}
@@ -385,6 +428,79 @@ function JobActions({ job, refresh }: { job: Job; refresh: () => void }) {
     </div>
   );
 }
+/** Link to what a job acted on, e.g. "Open commit 74481f468d". */
+function SubjectLink({ subject }: { subject: JobSubject }) {
+  const label = (
+    <>
+      {subjectLinkText(subject)}
+      {subject.ref && " "}
+      {subject.ref && (
+        <span className={subject.type === "account" ? "" : "mono"}>
+          {subjectRefText(subject)}
+        </span>
+      )}
+    </>
+  );
+  return subject.link ? (
+    <Link className="subject-link" to={subject.link}>
+      {label}
+      <ArrowUpRight size={13} aria-hidden="true" />
+    </Link>
+  ) : (
+    <span>{label}</span>
+  );
+}
+const outcomeTitles: Record<string, string> = {
+  failed: "failed",
+  succeeded: "succeeded",
+  cancelled: "was cancelled",
+  cancelling: "is being cancelled",
+  running: "is running",
+  queued: "is queued",
+};
+/** Where the job stands, what it produced or why it failed, and what to do next. */
+function OutcomePanel({
+  job,
+  outcome,
+  links,
+}: {
+  job: Job;
+  outcome: JobOutcome;
+  links: ReactNode;
+}) {
+  const tone = outcome.tone === "neutral" ? "info" : outcome.tone;
+  return (
+    <section
+      className={`job-outcome-panel ${outcome.tone}`}
+      aria-label="Job outcome"
+    >
+      <Callout
+        tone={tone}
+        title={`${jobName(job.kind)} ${outcomeTitles[job.status] || humanize(job.status).toLowerCase()}: ${outcome.summary}`}
+      >
+        {outcome.hint && <p className="outcome-hint">{outcome.hint}</p>}
+        {outcome.facts.length > 0 && (
+          <ul className="outcome-facts">
+            {outcome.facts.map((fact) => (
+              <li key={fact}>{fact}</li>
+            ))}
+          </ul>
+        )}
+        {(outcome.action || links) && (
+          <div className="inline-actions outcome-actions">
+            {outcome.action && (
+              <Link className="secondary button" to={outcome.action.to}>
+                {outcome.action.label}
+              </Link>
+            )}
+            {links}
+          </div>
+        )}
+        {!!job.error && <Evidence value={job.error} label="Failure details" />}
+      </Callout>
+    </section>
+  );
+}
 export function JobDetail() {
   const { id } = useParams();
   const resource = useResource(
@@ -400,6 +516,41 @@ export function JobDetail() {
   const job = resource.data;
   const findingId = resultId(job?.result, "finding_id");
   const cveId = resultId(job?.result, "cve_id");
+  const analysisId = resultId(job?.result, "analysis_id");
+  const commitId = resultId(job?.result, "commit_id");
+  const resultLinks = job && (
+    <>
+      {job.kind === "commit_analysis" && commitId && (
+        <Link
+          className="secondary button"
+          to={`/commits/${encodeURIComponent(commitId)}${analysisId ? `?run=${encodeURIComponent(analysisId)}` : ""}`}
+        >
+          View commit analysis and report
+        </Link>
+      )}
+      {job.kind === "cve_analysis" && cveId && job.program_id && (
+        <Link
+          className="secondary button"
+          to={`/cves?cve=${encodeURIComponent(cveId)}&cvep=${encodeURIComponent(job.program_id)}&view=analysis${analysisId ? `&run=${encodeURIComponent(analysisId)}` : ""}`}
+        >
+          View CVE analysis and report
+        </Link>
+      )}
+      {findingId && (
+        <Link
+          className="secondary button"
+          to={`/findings/${encodeURIComponent(findingId)}`}
+        >
+          View finding artifacts
+        </Link>
+      )}
+    </>
+  );
+  const hasResultLinks =
+    !!job &&
+    ((job.kind === "commit_analysis" && !!commitId) ||
+      (job.kind === "cve_analysis" && !!cveId && !!job.program_id) ||
+      !!findingId);
   return (
     <DataState
       loading={resource.loading}
@@ -411,9 +562,23 @@ export function JobDetail() {
         <>
           <PageHeading
             back={{ to: "/jobs", label: "All jobs" }}
-            eyebrow={`Job ${job.id.slice(0, 12)}`}
-            title={jobName(job.kind)}
-            description="Profile and inputs are immutable. Retry reuses the recorded configuration."
+            eyebrow={`${jobName(job.kind)} · Job ${job.id.slice(0, 12)}`}
+            title={jobTitle(job)}
+            description={
+              <>
+                {job.subject?.detail && (
+                  <p className="job-subject-detail">{job.subject.detail}</p>
+                )}
+                <p className="job-refs">
+                  {job.subject && <SubjectLink subject={job.subject} />}
+                  {job.program_id && (
+                    <Link to={`/programs/${job.program_id}`}>
+                      {job.program_name || "Program"}
+                    </Link>
+                  )}
+                </p>
+              </>
+            }
             actions={<JobActions job={job} refresh={resource.refresh} />}
             meta={
               <>
@@ -429,29 +594,32 @@ export function JobDetail() {
               </>
             }
           />
-          {job.status === "cancelling" && (
-            <Callout tone="warm" title="Cancelling">
-              Cancellation was requested. The workload is still being stopped
-              and reconciled; partial output will be retained.
-            </Callout>
-          )}
-          {job.status === "cancelled" && !!job.result && (
-            <Callout tone="info" title="Cancelled">
-              Partial output produced before cancellation is retained below.
-            </Callout>
-          )}
-          {!!job.error && (
-            <ErrorNote>
-              <strong>
-                {describeError(job.error) || "The operation failed."}
-              </strong>
-              <Evidence value={job.error} label="Failure details" />
-            </ErrorNote>
-          )}
+          <OutcomePanel
+            job={job}
+            outcome={jobOutcome(job)}
+            links={hasResultLinks ? resultLinks : undefined}
+          />
           <Panel padded>
             <DetailGrid
               items={[
-                ["Status", <Badge>{job.status}</Badge>],
+                [
+                  "Program",
+                  job.program_id ? (
+                    <Link to={`/programs/${job.program_id}`}>
+                      {job.program_name || "Program"}
+                    </Link>
+                  ) : (
+                    "Installation operation"
+                  ),
+                ],
+                [
+                  "Subject",
+                  job.subject ? (
+                    <SubjectLink subject={job.subject} />
+                  ) : (
+                    "Not applicable"
+                  ),
+                ],
                 ["Submitted", <Time value={job.created_at} absolute />],
                 [
                   "Started",
@@ -469,6 +637,11 @@ export function JobDetail() {
                     fallback="Not finished"
                   />,
                 ],
+                [
+                  "Duration",
+                  duration(job.started_at, job.finished_at) ||
+                    (job.started_at ? "In progress" : "Not started"),
+                ],
                 ["Agent", job.profile?.agent || "No coding agent"],
                 ["Model", job.profile?.model_id || "Not applicable"],
                 [
@@ -477,37 +650,16 @@ export function JobDetail() {
                     ? job.profile.reasoning_effort || "Provider managed"
                     : "Not applicable",
                 ],
-                [
-                  "Program",
-                  job.program_id ? (
-                    <Link to={`/programs/${job.program_id}`}>
-                      Program details
-                    </Link>
-                  ) : (
-                    "Installation operation"
-                  ),
-                ],
               ]}
             />
-            <Progress value={job.progress} />
-            <div className="inline-actions">
-              {job.kind === "cve_analysis" && cveId && job.program_id && (
-                <Link
-                  className="secondary button"
-                  to={`/cves?program_id=${encodeURIComponent(job.program_id)}&cve_id=${encodeURIComponent(cveId)}`}
-                >
-                  View CVE analysis and report
-                </Link>
-              )}
-              {findingId && (
-                <Link
-                  className="secondary button"
-                  to={`/findings/${encodeURIComponent(findingId)}`}
-                >
-                  View finding artifacts
-                </Link>
-              )}
-            </div>
+            <p className="hint job-immutable">
+              Profile and inputs are immutable. Retry reuses the recorded
+              configuration.
+            </p>
+            {(["queued", "running", "cancelling"].includes(job.status) ||
+              isProgressReported(job.progress)) && (
+              <Progress value={job.progress} />
+            )}
             {!!job.result && (
               <Evidence
                 value={job.result}
@@ -515,8 +667,12 @@ export function JobDetail() {
               />
             )}
           </Panel>
-          {job.status === "running" && !!job.profile && (
-            <AgentSession jobId={job.id} />
+          {job.kind in operationNames && !!job.profile && (
+            <AgentSession
+              jobId={job.id}
+              active={job.status === "running"}
+              polling={["queued", "running", "cancelling"].includes(job.status)}
+            />
           )}
           <Panel
             title="Execution events"
@@ -549,6 +705,9 @@ export function JobDetail() {
       )}
     </DataState>
   );
+}
+function isProgressReported(value: unknown) {
+  return typeof value === "object" && value !== null && "stage" in value;
 }
 function Progress({ value }: { value: unknown }) {
   const text = (key: string) =>

@@ -69,7 +69,7 @@ Jev is the TypeSafe AI service supplied by the user. Its typed decisions support
 
 ### R05 — Alert and decide whether to analyze a commit
 
-Send security-candidate notifications to Discord. The notification opens the authenticated commit review page. The operator chooses analyze, leave pending, or dismiss. Analyze opens the agent/account/model/effort selector before submitting the job.
+Send security-candidate notifications to Discord. The notification opens the authenticated commit review page. The operator chooses analyze, leave pending, dismiss, or confirm the revision as a real vulnerability; a supported analysis finding waits for that confirmation. Analyze opens the agent/account/model/effort selector before submitting the job.
 
 Detailed commit analysis returns exactly one of:
 
@@ -77,10 +77,11 @@ Detailed commit analysis returns exactly one of:
 2. **Potentially introduced vulnerability**
 3. **Unrelated change**
 4. **Insufficient context**
+5. **Security hardening**
 
-The report includes supporting source locations, the before/after comparison, the affected behavior, confidence with its basis, and open questions. A category is an analysis judgment and does not automatically create a confirmed 0day.
+The report includes a concise potential vulnerability/security-change title, supporting source locations, the before/after comparison, the affected behavior, confidence with its basis, open questions, and an explicit finding/no-finding/needs-more-evidence verdict. Detailed commit analysis has the same isolated build/lab capability as CVE analysis. A supported vulnerability automatically creates or updates a linked local finding with its report, Python PoC, and pinned vulnerable application. Hardening and unrelated results create no finding; uncertain results remain pending. Incomplete bundles retain linked drafts and report a failed job. Agent reproduction and independent lab verification remain distinct, and a subsequent analysis never automatically changes the operator's finding status.
 
-**AC-05:** A candidate produces a review item and a recorded notification attempt. It creates no detailed-analysis job until the operator submits Analyze in the dashboard. The result preserves one of the four exact category labels and the evidence used to reach it. A dismissed revision remains in history and can be reconsidered.
+**AC-05:** Review starts with program selection so different programs' commits do not mix. Security candidates have a potential issue title and fix/hardening/introduction classification. Complete unrelated triage is dismissed; incomplete evidence stays pending. A candidate produces a review item and a recorded notification attempt, with no detailed-analysis job until explicit Analyze submission. Analysis preserves one of the five category labels, its evidence and finding verdict, and automatically links supported findings to reproducible artifacts. A dismissed revision remains in history and can be reconsidered; later manual decisions are preserved against in-flight automatic assessments.
 
 ### R06 — Agent, model, and reasoning selection
 
@@ -102,7 +103,7 @@ A result contains the detected version or candidate versions, method, evidence, 
 
 Generate `audit-context-building.md` using the Trail of Bits audit-context-building skill with Pi, Claude Code, or Codex CLI. Preserve its supporting function documents and source evidence. Record the source revision, skill revision, selected agent/model/effort, coverage, unresolved questions, and generation time.
 
-The context-building operation describes structure and assumptions; commit/CVE investigation is a separate operation. New source revisions mark prior context as stale relative to that revision and preserve it for historical comparison. See the [skill evidence](../references.md#trail-of-bits-audit-context-building).
+The context-building operation describes structure and assumptions; CVE analysis and finding artifact generation start from the program's latest context as untrusted orientation, even when it was built at another revision; commit analysis judges each change on its own without it. New source revisions mark prior context as stale relative to that revision and preserve it for historical comparison; a refresh re-analyses only the functions in changed files, reusing the rest, and a program can ask for that refresh after every source change. See the [skill evidence](../references.md#trail-of-bits-audit-context-building).
 
 **AC-08:** The context file opens from the program page with supporting documents and source references. A report for revision A cannot be labeled as context for revision B. An interrupted or limited run exposes its coverage and missing work.
 

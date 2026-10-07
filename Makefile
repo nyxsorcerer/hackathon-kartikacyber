@@ -2,13 +2,18 @@ SHELL := /bin/sh
 COMPOSE := ./scripts/compose.sh
 CASE ?= all
 
-.PHONY: init build up down logs check test test-unit test-integration test-runtime test-ui test-journey backup restore reset-password
+.PHONY: init build up down logs check test test-unit test-integration test-runtime test-ui test-journey backup restore reset-password prune
 
 init:
 	./scripts/init.sh
 
 build: init
 	$(COMPOSE) --profile images build
+	$(MAKE) prune
+
+# Each rebuild leaves the previous Numen images untagged; remove only those, never other projects'.
+prune:
+	docker image prune -f --filter label=org.pruferva.numen.image=true
 
 up: build
 	$(COMPOSE) up -d --wait app worker scheduler runner-broker fetch-gateway
