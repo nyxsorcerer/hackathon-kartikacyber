@@ -483,13 +483,13 @@ class DockerEngine:
             egress = self.client.networks.create("numen-egress-" + run_id, labels=labels)
             proxy_spec = self.spec(request, egress, labels)
             proxy_spec["tmpfs"] = {"/tmp":"rw,nosuid,nodev,size=16777216,uid=10001,gid=10001"}
-            proxy = self.client.containers.create("numen-gateway:" + VERSION, command=["python","-m","numen_runner.gateway"],
+            proxy = self.client.containers.create("asset-monitor-gateway:" + VERSION, command=["python","-m","numen_runner.gateway"],
                                                    environment={"NUMEN_GATEWAY_CONFIG":json.dumps(config)}, **proxy_spec)
             job_network.connect(proxy, aliases=["gateway"])
             proxy.start()
             environment.update({"HTTP_PROXY":"http://gateway:8082","HTTPS_PROXY":"http://gateway:8082","ALL_PROXY":"http://gateway:8082","NO_PROXY":"gateway,localhost,127.0.0.1",
                                 "NODE_OPTIONS":"--require=/opt/numen/proxy-preload.cjs","NODE_USE_ENV_PROXY":"1"})
-        image = "numen-" + (profile["agent"] if kind in {"agent","capabilities","account_login"} else kind) + ":" + VERSION
+        image = "asset-monitor-" + (profile["agent"] if kind in {"agent","capabilities","account_login"} else kind) + ":" + VERSION
         lab_image = None
         build_daemon = None
         lab_application = None

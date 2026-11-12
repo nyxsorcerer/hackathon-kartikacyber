@@ -110,7 +110,7 @@ def test_output_limit_and_symlink_are_truthful_failures(engine):
 
 @pytest.mark.parametrize("agent,version", [("pi","1.0.0"),("claude","2.1.288"),("codex","0.160.0")])
 def test_actual_native_cli_version(engine,agent,version):
-    output = engine.client.containers.run("numen-"+agent+":0.1.0",[agent,"--version"],network_mode="none",user="10001:10001",cap_drop=["ALL"],security_opt=["no-new-privileges:true"],remove=True)
+    output = engine.client.containers.run("asset-monitor-"+agent+":0.1.0",[agent,"--version"],network_mode="none",user="10001:10001",cap_drop=["ALL"],security_opt=["no-new-privileges:true"],remove=True)
     assert version in output.decode()
 
 
@@ -193,7 +193,7 @@ HTTPServer(('0.0.0.0',8080),H).serve_forever()
     ip=target.attrs['NetworkSettings']['Networks'][outside.name]['IPAddress']
     url='http://'+ip+':8080'
     config={"provider_hosts":["api.openai.com"],"fetch_token":"capability-for-test","target_policy":{"origins":[url],"allowed_private_cidrs":[ip+'/32'],"max_requests":4}}
-    gateway=engine.client.containers.create('numen-gateway:0.1.0',['python','-m','numen_runner.gateway'],environment={"NUMEN_GATEWAY_CONFIG":json.dumps(config)},**engine.spec(request(''),outside,labels))
+    gateway=engine.client.containers.create('asset-monitor-gateway:0.1.0',['python','-m','numen_runner.gateway'],environment={"NUMEN_GATEWAY_CONFIG":json.dumps(config)},**engine.spec(request(''),outside,labels))
     inside.connect(gateway,aliases=['gateway'])
     gateway.start()
     script='''import http.client,json,time

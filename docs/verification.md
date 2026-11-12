@@ -2,6 +2,12 @@
 
 Date: 2026-10-04. The application is implemented and deployed locally. This record distinguishes executed repository proofs from account-dependent checks.
 
+## Asset Monitor fork baseline (2026-11-12)
+
+Forked from Numen `experiment/herdr-agent-sessions` at `4970c7b` (ADR-0003). Before any feature change, the fork's Docker project, images, labels and ports were renamed (`asset-monitor`, `asset-monitor-*`, 8788, 18788, 18091) so it can run beside a Numen deployment, and `undici` was raised from 8.11.2 to 8.12.4 in the Pi, Claude Code and Codex runtime locks (with an npm override for Pi's nested copy), because the image build's `npm audit --audit-level=high` now fails on advisories published against 8.0.0 to 8.12.1.
+
+On Docker Desktop (Engine 20.10.22, 10 CPUs, 8 GB): `make build` and `make check` passed; backend unit 133 passed; runner unit 122 passed, 58 skipped; backend integration 227 passed; runtime 179 passed, 1 failed; frontend 96 passed in 18 files. The one failure is the already recorded `test_pinned_claude_restricted_tools_and_structured_result_with_loopback_provider` (the pinned Claude CLI no longer advertises Grep/Glob). No paid inference and no production-target request was made.
+
 ## Commit review correction (2026-10-06)
 
 Program selection now precedes global review and only that program's records are fetched; switching programs clears the previous queue. New triage output includes a potential issue title and fix/hardening/introduction kind. Complete unrelated results are dismissed, incomplete evidence stays pending, and manual review actions after job submission take precedence. Jev's three typed questions follow its official contract; existing source messages and legacy reports remain readable without inventing classifications.

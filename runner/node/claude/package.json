@@ -1,1 +1,1 @@
-{"name":"asset-monitor-claude-runtime","private":true,"version":"0.1.0","dependencies":{"@anthropic-ai/claude-code":"2.1.288","undici":"8.11.2"}}
+{"name":"asset-monitor-claude-runtime","private":true,"version":"0.1.0","dependencies":{"@anthropic-ai/claude-code":"2.1.288","undici":"8.12.4"},"overrides":{"undici":"8.12.4"}}

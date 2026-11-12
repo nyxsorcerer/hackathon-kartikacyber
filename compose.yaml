@@ -107,7 +107,7 @@ services:
       timeout: 5s
       retries: 20
   fetch-gateway:
-    image: numen-gateway:0.1.0
+    image: asset-monitor-gateway:0.1.0
     build:
       context: .
       dockerfile: Dockerfile.runner
