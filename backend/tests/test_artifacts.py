@@ -4,7 +4,7 @@ import zipfile
 
 import pytest
 
-from conftest import FixtureBroker, connection, program, source_snapshot
+from conftest import FixtureBroker, connection, application, source_snapshot
 from test_workflows import cve_raw, seed_cve
 from numen.worker import run_once
 
@@ -27,7 +27,7 @@ def finding(client, ident):
     response = client.post(
         "/api/findings",
         json={
-            "program_id": ident,
+            "application_id": ident,
             "kind": "0day",
             "title": "Fixture finding",
             "fixed_versions": ["2.0.0"],
@@ -48,7 +48,7 @@ def upload(client, ident, files):
 def queue_cve_analysis(system, extra_config=None, body=None):
     app, client, _ = system
     connection(app)
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
@@ -61,7 +61,7 @@ def queue_cve_analysis(system, extra_config=None, body=None):
     raw = cve_raw()
     seed_cve(app, p["id"], raw)
     cve = client.get("/api/cves").json()["items"][0]
-    job = client.post(f"/api/programs/{p['id']}/cves/{cve['id']}/analyses", json=body or {})
+    job = client.post(f"/api/applications/{p['id']}/cves/{cve['id']}/analyses", json=body or {})
     from numen.security import fingerprint
 
     result = {
@@ -103,7 +103,7 @@ def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(sy
     original_report = next(a for a in analyses[0]["artifacts"] if a["path"] == "report.md")
     client.patch(f"/api/findings/{row['id']}", json={"status": "fixed", "title": "Reviewed title"})
     again = client.post(
-        f"/api/programs/{p['id']}/cves/{result['cve_id']}/analyses", json={}
+        f"/api/applications/{p['id']}/cves/{result['cve_id']}/analyses", json={}
     ).json()["job_id"]
     run_once(
         config,
@@ -323,7 +323,7 @@ def test_finding_generation_keeps_large_artifact_inventories_out_of_the_prompt(s
 
 def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
     app, client, config = system
-    p = program(client)
+    p = application(client)
     row = finding(client, p["id"])
     assert row["status"] == "open" and row["artifact_state"]["status"] == "draft"
     assert client.post(f"/api/findings/{row['id']}/lab-runs").status_code == 422
@@ -370,7 +370,7 @@ def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
 def test_paths_archives_and_configured_secrets_rejected(system):
     app, client, _ = system
     connection(app)
-    p = program(client)
+    p = application(client)
     row = finding(client, p["id"])
     assert upload(client, row["id"], {"../escape.py": b"unsafe"}).status_code == 422
     assert (
@@ -420,16 +420,18 @@ def test_webhook_failure_retry_retains_candidate_identity(system, monkeypatch):
 
 def test_inherited_interval_tracks_global_and_explicit_stays(system):
     _, client, _ = system
-    inherited = program(client, monitor_interval_days=None)
-    explicit = program(client, asset_name="Explicit", monitor_interval_days=3)
+    inherited = application(client, monitor_interval_seconds=None)
+    explicit = application(client, asset_name="Explicit", monitor_interval_seconds=3 * 3600)
     assert inherited["config"]["monitor_interval_inherited"] is True
-    client.patch("/api/settings", json={"monitor_interval_days": 5})
-    assert client.get(f"/api/programs/{inherited['id']}").json()["monitor_interval_days"] == 5
-    assert client.get(f"/api/programs/{explicit['id']}").json()["monitor_interval_days"] == 3
-    changed = client.patch(f"/api/programs/{explicit['id']}", json={"monitor_interval_days": None})
+    assert inherited["monitor_interval_seconds"] == 2 * 86400
+    client.patch("/api/settings", json={"monitor_interval_seconds": 900})
+    assert client.get(f"/api/applications/{inherited['id']}").json()["monitor_interval_seconds"] == 900
+    assert client.get(f"/api/applications/{explicit['id']}").json()["monitor_interval_seconds"] == 3 * 3600
+    changed = client.patch(f"/api/applications/{explicit['id']}", json={"monitor_interval_seconds": None})
     assert (
         changed.status_code == 200
         and changed.json()["config"]["monitor_interval_inherited"] is True
+        and changed.json()["monitor_interval_seconds"] == 900
     )
 
 

@@ -41,27 +41,34 @@ from .models import (
     Observation,
     Operator,
     Plugin,
-    Program,
-    ProgramCVE,
+    Application,
+    ApplicationCVE,
+    ApplicationRepository,
+    Repository,
     VersionRecipe,
     now,
     utc,
 )
 from .schemas import (
     AccountInput,
+    BackfillInput,
     BatchAnalysisInput,
     BatchDeleteInput,
     BatchReviewInput,
     FindingInput,
     LoginCodeInput,
     LoginInput,
+    MAX_INTERVAL,
+    MIN_INTERVAL,
     ManualObservation,
     MatchInput,
     OPERATIONS,
     OperationInput,
-    ProgramInput,
+    ApplicationInput,
     PromptInput,
     PromptPreviewInput,
+    RepositoryInput,
+    RepositoryPatch,
     ReviewInput,
     SessionInput,
     http_url,
@@ -275,9 +282,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
         eligible = sum(
             1
-            for link in db.scalars(select(ProgramCVE))
+            for link in db.scalars(select(ApplicationCVE))
             if cves.gate(
-                domain.get(db, Program, link.program_id), domain.get(db, CVE, link.cve_id), link
+                domain.get(db, Application, link.application_id), domain.get(db, CVE, link.cve_id), link
             )["eligible"]
         )
         recent = list(
@@ -291,17 +298,17 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         )
         due = list(
             db.scalars(
-                select(Program)
+                select(Application)
                 .where(
-                    Program.archived.is_(False),
-                    Program.monitor_enabled.is_(True),
-                    (Program.next_check_at <= now()) | (Program.next_check_at.is_(None)),
+                    Application.archived.is_(False),
+                    Application.monitor_enabled.is_(True),
+                    (Application.next_check_at <= now()) | (Application.next_check_at.is_(None)),
                 )
                 .limit(20)
             )
         )
         return {
-            "programs": count(Program, Program.archived.is_(False)),
+            "applications": count(Application, Application.archived.is_(False)),
             "security_reviews": count(Commit, Commit.review_decision == "candidate"),
             "eligible_cves": eligible,
             "open_findings": count(Finding, Finding.status == "open"),
@@ -311,146 +318,265 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 {"id": e.id, "job_id": e.job_id, "created_at": utc(e.created_at), **e.data}
                 for e in recent
             ],
-            "due_programs": [domain.program_json(db, p) for p in due],
+            "due_applications": [domain.application_json(db, p) for p in due],
         }
 
-    @router.get("/programs")
-    def programs(
+    @router.get("/applications")
+    def applications(
         q: str | None = None, cursor: str | None = None, limit: int = 50, db=database_dependency
     ):
-        stmt = select(Program).order_by(Program.asset_name, Program.id)
+        stmt = select(Application).order_by(Application.asset_name, Application.id)
         if q:
             query = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            linked = (
+                select(ApplicationRepository.application_id)
+                .join(Repository, Repository.id == ApplicationRepository.repository_id)
+                .where(
+                    or_(
+                        Repository.source_url.ilike(query, escape="\\"),
+                        Repository.plugin_slug.ilike(query, escape="\\"),
+                    )
+                )
+            )
             stmt = stmt.where(
                 or_(
                     *(
-                        getattr(Program, field).ilike(query, escape="\\")
-                        for field in (
-                            "asset_name",
-                            "asset_url",
-                            "product_name",
-                            "source_url",
-                            "plugin_slug",
-                        )
-                    )
+                        getattr(Application, field).ilike(query, escape="\\")
+                        for field in ("asset_name", "asset_url", "product_name")
+                    ),
+                    Application.id.in_(linked),
                 )
             )
         return paginate(
             db,
             stmt,
-            lambda p: domain.program_json(db, p),
+            lambda p: domain.application_json(db, p),
             cursor,
             limit,
         )
 
-    @router.post("/programs", status_code=201)
-    def create_program(body: ProgramInput, db=database_dependency):
+    @router.post("/applications", status_code=201)
+    def create_application(body: ApplicationInput, db=database_dependency):
         data = body.model_dump()
-        days = data.get("monitor_interval_days") or domain.settings(db, config).data.get(
-            "monitor_interval_days"
+        seconds = data.get("monitor_interval_seconds") or domain.settings(db, config).data.get(
+            "monitor_interval_seconds"
         )
-        if not days:
+        if not seconds:
             raise DomainError(
                 "monitor_interval_required",
-                "Set a global monitoring interval or enter one for this program",
+                "Set a global monitoring interval or enter one for this Application",
                 422,
-                {"monitor_interval_days": "Positive whole days required"},
+                {"monitor_interval_seconds": "Enter an interval or configure the global default"},
             )
-        data["config"]["monitor_interval_inherited"] = data.get("monitor_interval_days") is None
-        data["monitor_interval_days"] = days
+        data["config"]["monitor_interval_inherited"] = data.get("monitor_interval_seconds") is None
+        data["monitor_interval_seconds"] = seconds
         for operation, profile in data["config"]["profiles"].items():
             domain.resolve_profile(db, None, operation, profile)
-        program = Program(**data, next_check_at=now())
-        db.add(program)
+        application = Application(**data, next_check_at=now())
+        db.add(application)
         db.flush()
-        action(db, "program", program.id, {"action": "created"})
-        return domain.program_json(db, program)
+        action(db, "application", application.id, {"action": "created"})
+        return domain.application_json(db, application)
 
-    @router.get("/programs/{ident}")
-    def program(ident: str, db=database_dependency):
-        return domain.program_json(db, domain.get(db, Program, ident))
+    @router.get("/applications/{ident}")
+    def application(ident: str, db=database_dependency):
+        return domain.application_json(db, domain.get(db, Application, ident))
 
-    @router.patch("/programs/{ident}")
-    def patch_program(ident: str, body: dict, db=database_dependency):
-        row = domain.get(db, Program, ident)
-        current = {name: getattr(row, name) for name in ProgramInput.model_fields}
+    @router.patch("/applications/{ident}")
+    def patch_application(ident: str, body: dict, db=database_dependency):
+        row = domain.get(db, Application, ident)
+        current = {name: getattr(row, name) for name in ApplicationInput.model_fields}
         if "config" in body:
             if not isinstance(body["config"], dict):
-                raise DomainError("validation_error", "Program config must be an object", 422)
+                raise DomainError("validation_error", "Application config must be an object", 422)
             body = {**body, "config": {**current["config"], **body["config"]}}
-        data = ProgramInput.model_validate({**current, **body}).model_dump()
-        if "monitor_interval_days" in body:
-            inherited = body["monitor_interval_days"] is None
+        data = ApplicationInput.model_validate({**current, **body}).model_dump()
+        if "monitor_interval_seconds" in body:
+            inherited = body["monitor_interval_seconds"] is None
             data["config"]["monitor_interval_inherited"] = inherited
             if inherited:
-                data["monitor_interval_days"] = domain.settings(db, config).data.get(
-                    "monitor_interval_days"
+                data["monitor_interval_seconds"] = domain.settings(db, config).data.get(
+                    "monitor_interval_seconds"
                 )
-        if not data["monitor_interval_days"]:
+        if not data["monitor_interval_seconds"]:
             raise DomainError(
                 "monitor_interval_required", "Configure a global interval before inheriting it", 422
             )
-        source_changed = any(
-            getattr(row, k) != data[k]
-            for k in ("source_kind", "source_url", "source_ref", "source_path", "plugin_slug")
-        )
         for operation, profile in data["config"]["profiles"].items():
             if profile != row.config.get("profiles", {}).get(operation):
                 domain.resolve_profile(db, row, operation, profile)
         if data["config"].get("active_recipe_id"):
             recipe = domain.get(db, VersionRecipe, data["config"]["active_recipe_id"])
-            if recipe.program_id != row.id or recipe.source_generation != row.source_generation:
+            if recipe.application_id != row.id or recipe.source_generation != row.source_generation:
                 raise DomainError(
-                    "invalid_recipe", "Recipe must belong to this program source", 422
+                    "invalid_recipe", "Recipe must belong to this Application's source", 422
                 )
         for name, value in data.items():
             setattr(row, name, value)
-        if source_changed:
-            row.source_generation += 1
-            row.cursor, row.cve_cursor, row.last_error = None, {}, None
-            row.config = {**row.config, "active_recipe_id": None}
-            for context in db.scalars(
-                select(AuditContext).where(AuditContext.program_id == row.id)
-            ):
-                context.status = "stale"
         row.next_check_at = now() if row.monitor_enabled and not row.archived else None
-        action(db, "program", row.id, {"action": "updated", "source_changed": source_changed})
-        for linked in db.scalars(select(ProgramCVE).where(ProgramCVE.program_id == row.id)):
+        action(db, "application", row.id, {"action": "updated"})
+        for linked in db.scalars(select(ApplicationCVE).where(ApplicationCVE.application_id == row.id)):
             domain.refresh_cve_policy(db, row, domain.get(db, CVE, linked.cve_id), linked)
-        return domain.program_json(db, row)
+        return domain.application_json(db, row)
 
-    @router.post("/programs/{ident}/checks")
-    def check_program(
+    def application_link(db, ident, repository_id):
+        link = db.scalar(
+            select(ApplicationRepository).where(
+                ApplicationRepository.application_id == ident,
+                ApplicationRepository.repository_id == repository_id,
+            )
+        )
+        if link is None:
+            raise DomainError("not_found", "This repository is not linked to this Application", 404)
+        return link
+
+    def changed_link(db, application, link, previous, change):
+        db.flush()
+        domain.source_changed(db, application, previous.id if previous else None)
+        action(db, "application", application.id, {"repository_id": link.repository_id, **change})
+        return domain.link_json(link, db.get(Repository, link.repository_id))
+
+    @router.post("/applications/{ident}/repositories", status_code=201)
+    def add_repository(ident: str, body: RepositoryInput, db=database_dependency):
+        application = domain.get(db, Application, ident)
+        previous = domain.source_repository(db, application)
+        current = {link.repository_id: link for link, _ in domain.links(db, application)}
+        if body.role == "own" and any(
+            link.role == "own" and link.removed_at is None for link in current.values()
+        ):
+            raise DomainError(
+                "own_repository_exists",
+                "This Application already has an Own repository; remove it first",
+                409,
+            )
+        repository = domain.repository_for(
+            db, body.source_url, **body.model_dump(exclude={"role", "locked_version", "source_url"})
+        )
+        link = current.get(repository.id)
+        if link and link.removed_at is None:
+            raise DomainError(
+                "repository_linked", "This repository is already linked to this Application", 409
+            )
+        if link is None:
+            link = ApplicationRepository(application_id=application.id, repository_id=repository.id)
+            db.add(link)
+        # A removed link is restored with its history, as a hand-added link: derivation state
+        # from its earlier role is dropped.
+        link.role, link.enabled, link.removed_at = body.role, True, None
+        link.packages, link.derived_revision, link.unresolved = [], None, []
+        link.locked_version = body.locked_version or None
+        link.locked_version_source = "operator" if link.locked_version else None
+        if application.monitor_enabled and not application.archived:
+            application.next_check_at = now()
+        if body.role == "own" and repository.cursor and link.derived_revision is None:
+            # Already past its Baseline for another Application: derive its Upstream repositories
+            # now, since an unchanged repository answers 304 and queues nothing.
+            domain.enqueue(
+                db,
+                "derive_upstreams",
+                application,
+                domain.repository_input(repository),
+                idempotency_key=f"derive:{application.id}:{repository.cursor}",
+            )
+        return changed_link(
+            db, application, link, previous, {"action": "repository_added", "role": body.role}
+        )
+
+    @router.patch("/applications/{ident}/repositories/{repository_id}")
+    def patch_repository(
+        ident: str, repository_id: str, body: RepositoryPatch, db=database_dependency
+    ):
+        application = domain.get(db, Application, ident)
+        link = application_link(db, ident, repository_id)
+        previous = domain.source_repository(db, application)
+        if body.enabled is not None:
+            link.enabled = body.enabled
+            if body.enabled and application.monitor_enabled and not application.archived:
+                application.next_check_at = now()  # a link turned on gets its Baseline now
+        if "locked_version" in body.model_fields_set:
+            link.locked_version = body.locked_version or None
+            link.locked_version_source = "operator" if link.locked_version else None
+        return changed_link(
+            db, application, link, previous,
+            {"action": "repository_updated", "changes": body.model_dump(exclude_unset=True)},
+        )
+
+    @router.delete("/applications/{ident}/repositories/{repository_id}")
+    def remove_repository(ident: str, repository_id: str, db=database_dependency):
+        """Removes the link; the repository's commits stay in the Application's history."""
+        application = domain.get(db, Application, ident)
+        link = application_link(db, ident, repository_id)
+        previous = domain.source_repository(db, application)
+        link.removed_at = link.removed_at or now()
+        return changed_link(db, application, link, previous, {"action": "repository_removed"})
+
+    @router.post("/applications/{ident}/repositories/{repository_id}/backfills")
+    def backfill_repository(
+        ident: str, repository_id: str, body: BackfillInput, db=database_dependency
+    ):
+        """Backfill: imports and triages the last `count` commits up to the Baseline."""
+        application = domain.get(db, Application, ident)
+        application_link(db, ident, repository_id)
+        repository = db.get(Repository, repository_id)
+        if repository.baseline_revision is None:
+            raise DomainError(
+                "source_not_checked", "Check this repository once to set its Baseline first", 422
+            )
+        return accepted(domain.enqueue(
+            db, "backfill", application, domain.repository_input(repository, count=body.count)
+        ))
+
+    @router.post("/applications/{ident}/checks")
+    def check_application(
         ident: str, key: str | None = Header(None, alias="Idempotency-Key"), db=database_dependency
     ):
-        row = domain.get(db, Program, ident)
-        return accepted(
-            domain.enqueue(db, "source_check", row, domain.job_input(row), idempotency_key=key)
-        )
+        """Check now: one source check per polled repository, reusing a check already active."""
+        row = domain.get(db, Application, ident)
+        repositories = domain.active_repositories(db, row)
+        if not repositories:
+            raise DomainError(
+                "repository_required", "Link a repository to this Application first", 422
+            )
+        items = []
+        for repository in repositories:
+            item_key = f"{key}:{repository.id}" if key else None
+            job = (
+                item_key and db.scalar(select(Job).where(Job.idempotency_key == item_key))
+            ) or domain.active_source_check(db, repository) or domain.enqueue(
+                db, "source_check", row, domain.repository_input(repository), idempotency_key=item_key
+            )
+            items.append(
+                {"repository_id": repository.id, "job_id": job.id, "status_url": f"/api/jobs/{job.id}"}
+            )
+        row.last_check_at = now()
+        row.next_check_at = now() + timedelta(seconds=row.monitor_interval_seconds)
+        return JSONResponse({"items": items}, status_code=202)
 
     @router.get("/commits")
     def all_commits(
-        program_id: str | None = None,
+        application_id: str | None = None,
         review_decision: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
         db=database_dependency,
     ):
         stmt = select(Commit).order_by(Commit.id)
-        if program_id:
-            stmt = stmt.where(Commit.program_id == program_id)
+        if application_id:
+            stmt = stmt.where(Commit.repository_id.in_(domain.linked_repository_ids(application_id)))
         if review_decision:
             stmt = stmt.where(Commit.review_decision == review_decision)
         return paginate(db, stmt, None, cursor, limit, commit_page(db))
 
-    @router.get("/programs/{ident}/commits")
-    def program_commits(
+    @router.get("/applications/{ident}/commits")
+    def application_commits(
         ident: str, cursor: str | None = None, limit: int = 50, db=database_dependency
     ):
-        domain.get(db, Program, ident)
+        domain.get(db, Application, ident)
         return paginate(
             db,
-            select(Commit).where(Commit.program_id == ident).order_by(Commit.id),
+            select(Commit)
+            .where(Commit.repository_id.in_(domain.linked_repository_ids(ident)))
+            .order_by(Commit.id),
             None,
             cursor,
             limit,
@@ -498,11 +624,11 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         record_review(db, row, body.decision)
         return domain.commit_json(db, row)
 
-    def queue_commit_analysis(db, row, program, profile, key):
+    def queue_commit_analysis(db, row, application, profile, key):
         job = domain.submit_agent(
             db,
             "commit_analysis",
-            program,
+            application,
             {"commit_id": row.id, "source_ref": row.revision},
             profile.model_dump() if profile else None,
             key,
@@ -536,26 +662,21 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 )
             )
         )
-        programs = {
-            p.id: p
-            for p in db.scalars(
-                select(Program).where(Program.id.in_({r.program_id for r in rows.values()}))
-            )
-        }
         items = []
         for ident in ids:
-            row, program = rows[ident], programs[rows[ident].program_id]
+            row = rows[ident]
+            application = domain.commit_application(db, row)
             # Each revision has its own key, so a resubmitted batch returns the same jobs.
             item_key = f"{key}:{ident}" if key else None
             replay = item_key and db.scalar(select(Job).where(Job.idempotency_key == item_key))
             if replay:
                 items.append({"id": ident, "job_id": replay.id, "skipped": None})
-            elif row.source_generation != program.source_generation:
+            elif row.source_generation != db.get(Repository, row.repository_id).source_generation:
                 items.append({"id": ident, "job_id": None, "skipped": "historical_source"})
             elif ident in active:
                 items.append({"id": ident, "job_id": None, "skipped": "analysis_active"})
             else:
-                job = queue_commit_analysis(db, row, program, body.profile, item_key)
+                job = queue_commit_analysis(db, row, application, body.profile, item_key)
                 items.append({"id": ident, "job_id": job.id, "skipped": None})
         return JSONResponse({"items": items}, status_code=202)
 
@@ -567,22 +688,22 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         db=database_dependency,
     ):
         row = domain.get(db, Commit, ident)
-        program = domain.get(db, Program, row.program_id)
-        if row.source_generation != program.source_generation:
+        application = domain.commit_application(db, row)
+        if row.source_generation != db.get(Repository, row.repository_id).source_generation:
             raise DomainError(
                 "historical_source",
                 "This commit belongs to a previous source generation; current source context cannot analyze it",
                 422,
             )
-        return accepted(queue_commit_analysis(db, row, program, body.profile, key))
+        return accepted(queue_commit_analysis(db, row, application, body.profile, key))
 
-    @router.get("/programs/{ident}/version-recipes")
+    @router.get("/applications/{ident}/version-recipes")
     def recipes(ident: str, cursor: str | None = None, limit: int = 50, db=database_dependency):
-        domain.get(db, Program, ident)
+        domain.get(db, Application, ident)
         return paginate(
             db,
             select(VersionRecipe)
-            .where(VersionRecipe.program_id == ident)
+            .where(VersionRecipe.application_id == ident)
             .order_by(VersionRecipe.created_at.desc()),
             lambda r: {
                 "id": r.id,
@@ -598,14 +719,14 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             limit,
         )
 
-    @router.post("/programs/{ident}/version-recipes")
+    @router.post("/applications/{ident}/version-recipes")
     def generate_recipe(
         ident: str,
         body: OperationInput = OperationInput(),
         key: str | None = Header(None, alias="Idempotency-Key"),
         db=database_dependency,
     ):
-        row = domain.get(db, Program, ident)
+        row = domain.get(db, Application, ident)
         return accepted(
             domain.submit_agent(
                 db,
@@ -616,11 +737,11 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             )
         )
 
-    @router.post("/programs/{ident}/version-checks")
+    @router.post("/applications/{ident}/version-checks")
     def version_check(
         ident: str, key: str | None = Header(None, alias="Idempotency-Key"), db=database_dependency
     ):
-        row = domain.get(db, Program, ident)
+        row = domain.get(db, Application, ident)
         if not row.config.get("active_recipe_id"):
             raise DomainError(
                 "recipe_required", "Generate and validate a reusable recipe first", 422
@@ -630,32 +751,32 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 db,
                 "version_check",
                 row,
-                domain.job_input(row, recipe_id=row.config["active_recipe_id"]),
+                domain.job_input(db, row, recipe_id=row.config["active_recipe_id"]),
                 idempotency_key=key,
             )
         )
 
-    @router.get("/programs/{ident}/version-observations")
+    @router.get("/applications/{ident}/version-observations")
     def observations(
         ident: str, cursor: str | None = None, limit: int = 50, db=database_dependency
     ):
-        domain.get(db, Program, ident)
+        domain.get(db, Application, ident)
         return paginate(
             db,
             select(Observation)
-            .where(Observation.program_id == ident)
+            .where(Observation.application_id == ident)
             .order_by(Observation.checked_at.desc()),
             domain.observation_json,
             cursor,
             limit,
         )
 
-    @router.post("/programs/{ident}/version-observations", status_code=201)
+    @router.post("/applications/{ident}/version-observations", status_code=201)
     def observe(ident: str, body: ManualObservation, db=database_dependency):
-        program = domain.get(db, Program, ident)
+        application = domain.get(db, Application, ident)
         row = Observation(
-            program_id=program.id,
-            source_generation=program.source_generation,
+            application_id=application.id,
+            source_generation=application.source_generation,
             data={
                 "status": "detected",
                 "version": body.version,
@@ -671,13 +792,13 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         db.flush()
         return domain.observation_json(row)
 
-    @router.get("/programs/{ident}/audit-contexts")
+    @router.get("/applications/{ident}/audit-contexts")
     def contexts(ident: str, cursor: str | None = None, limit: int = 50, db=database_dependency):
-        domain.get(db, Program, ident)
+        domain.get(db, Application, ident)
         return paginate(
             db,
             select(AuditContext)
-            .where(AuditContext.program_id == ident)
+            .where(AuditContext.application_id == ident)
             .order_by(AuditContext.created_at.desc()),
             lambda r: {
                 "id": r.id,
@@ -696,14 +817,14 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             limit,
         )
 
-    @router.post("/programs/{ident}/audit-contexts")
+    @router.post("/applications/{ident}/audit-contexts")
     def generate_context(
         ident: str,
         body: OperationInput = OperationInput(),
         key: str | None = Header(None, alias="Idempotency-Key"),
         db=database_dependency,
     ):
-        row = domain.get(db, Program, ident)
+        row = domain.get(db, Application, ident)
         inputs = {
             "focus": body.focus,
             "max_functions": body.max_functions,
@@ -711,8 +832,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         }
         if body.refresh_from:
             base = db.get(AuditContext, body.refresh_from)
-            if base is None or base.program_id != row.id:
-                raise DomainError("not_found", "There is no such audit context for this program", 404)
+            if base is None or base.application_id != row.id:
+                raise DomainError("not_found", "There is no such audit context for this Application", 404)
             # A refresh keeps the scope the context was built with.
             inputs = domain.audit_refresh_input(db, row, base)
         return accepted(
@@ -728,15 +849,15 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
     @router.get("/cves")
     def cve_list(
-        program_id: str | None = None,
+        application_id: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
         db=database_dependency,
     ):
-        stmt = select(ProgramCVE).order_by(ProgramCVE.cve_id, ProgramCVE.program_id)
-        if program_id:
-            domain.get(db, Program, program_id)
-            stmt = stmt.where(ProgramCVE.program_id == program_id)
+        stmt = select(ApplicationCVE).order_by(ApplicationCVE.cve_id, ApplicationCVE.application_id)
+        if application_id:
+            domain.get(db, Application, application_id)
+            stmt = stmt.where(ApplicationCVE.application_id == application_id)
         return paginate(
             db,
             stmt,
@@ -745,16 +866,16 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             limit,
         )
 
-    def program_cve(db, ident, cve_id):
-        program, cve = domain.get(db, Program, ident), domain.get(db, CVE, cve_id)
+    def application_cve(db, ident, cve_id):
+        application, cve = domain.get(db, Application, ident), domain.get(db, CVE, cve_id)
         link = db.scalar(
-            select(ProgramCVE).where(ProgramCVE.program_id == ident, ProgramCVE.cve_id == cve_id)
+            select(ApplicationCVE).where(ApplicationCVE.application_id == ident, ApplicationCVE.cve_id == cve_id)
         )
         if not link:
-            raise DomainError("not_found", "CVE is not associated with this program", 404)
-        return program, cve, link
+            raise DomainError("not_found", "CVE is not associated with this Application", 404)
+        return application, cve, link
 
-    @router.post("/programs/{ident}/cves/{cve_id}/analyses")
+    @router.post("/applications/{ident}/cves/{cve_id}/analyses")
     def analyze_cve(
         ident: str,
         cve_id: str,
@@ -762,11 +883,11 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         key: str | None = Header(None, alias="Idempotency-Key"),
         db=database_dependency,
     ):
-        program, cve, link = program_cve(db, ident, cve_id)
+        application, cve, link = application_cve(db, ident, cve_id)
         return accepted(
             domain.queue_cve(
                 db,
-                program,
+                application,
                 cve,
                 link,
                 body.profile.model_dump() if body.profile else None,
@@ -775,34 +896,34 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             )
         )
 
-    @router.post("/programs/{ident}/cves/{cve_id}/match")
+    @router.post("/applications/{ident}/cves/{cve_id}/match")
     def confirm_cve(ident: str, cve_id: str, body: MatchInput, db=database_dependency):
-        program, cve, link = program_cve(db, ident, cve_id)
+        application, cve, link = application_cve(db, ident, cve_id)
         link.confirmed = body.confirmed
         action(db, "cve", link.id, {"action": "match_confirmed", "confirmed": body.confirmed})
-        domain.refresh_cve_policy(db, program, cve, link)
+        domain.refresh_cve_policy(db, application, cve, link)
         return domain.cve_json(db, cve, link)
 
-    @router.post("/programs/{ident}/cve-sync")
+    @router.post("/applications/{ident}/cve-sync")
     def cve_sync(
         ident: str, key: str | None = Header(None, alias="Idempotency-Key"), db=database_dependency
     ):
-        program = domain.get(db, Program, ident)
+        application = domain.get(db, Application, ident)
         return accepted(
-            domain.enqueue(db, "cve_sync", program, domain.job_input(program), idempotency_key=key)
+            domain.enqueue(db, "cve_sync", application, domain.job_input(db, application), idempotency_key=key)
         )
 
     @router.get("/findings")
     def findings(
-        program_id: str | None = None,
+        application_id: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
         view: Literal["full", "summary"] = "full",
         db=database_dependency,
     ):
         stmt = select(Finding).order_by(Finding.created_at.desc())
-        if program_id:
-            stmt = stmt.where(Finding.program_id == program_id)
+        if application_id:
+            stmt = stmt.where(Finding.application_id == application_id)
         if view == "summary":
             page = paginate(db, stmt, lambda row: row, cursor, limit)
             page["items"] = domain.finding_summaries(db, page["items"], config.artifact_root)
@@ -812,21 +933,26 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         )
 
     def validate_finding_refs(db, body):
-        domain.get(db, Program, body.program_id)
+        domain.get(db, Application, body.application_id)
         if body.cve_id:
-            program_cve(db, body.program_id, body.cve_id)
-        for cls, value in ((Commit, body.source_commit_id), (Analysis, body.source_analysis_id)):
-            if value and domain.get(db, cls, value).program_id != body.program_id:
-                raise DomainError(
-                    "invalid_reference", "Finding evidence must belong to the same program", 422
-                )
+            application_cve(db, body.application_id, body.cve_id)
+        commit = domain.get(db, Commit, body.source_commit_id) if body.source_commit_id else None
+        analysis = domain.get(db, Analysis, body.source_analysis_id) if body.source_analysis_id else None
+        if (
+            commit
+            and commit.repository_id
+            not in set(db.scalars(domain.linked_repository_ids(body.application_id)))
+        ) or (analysis and analysis.application_id != body.application_id):
+            raise DomainError(
+                "invalid_reference", "Finding evidence must belong to the same Application", 422
+            )
 
     @router.post("/findings", status_code=201)
     def create_finding(body: FindingInput, db=database_dependency):
         validate_finding_refs(db, body)
         data = body.model_dump()
         row = Finding(
-            **{k: data.pop(k) for k in ("program_id", "kind", "cve_id", "title", "status")},
+            **{k: data.pop(k) for k in ("application_id", "kind", "cve_id", "title", "status")},
             data=data,
         )
         db.add(row)
@@ -848,7 +974,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         row = domain.get(db, Finding, ident)
         db.refresh(row, with_for_update=True)
         old = {
-            "program_id": row.program_id,
+            "application_id": row.application_id,
             "kind": row.kind,
             "cve_id": row.cve_id,
             "title": row.title,
@@ -857,12 +983,12 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         }
         data = FindingInput.model_validate({**old, **body})
         validate_finding_refs(db, data)
-        if data.program_id != row.program_id:
-            raise DomainError("immutable_program", "A finding cannot move to another program", 422)
+        if data.application_id != row.application_id:
+            raise DomainError("immutable_application", "A finding cannot move to another Application", 422)
         values = data.model_dump()
         for field in ("kind", "cve_id", "title", "status"):
             setattr(row, field, values.pop(field))
-        values.pop("program_id")
+        values.pop("application_id")
         row.data, row.updated_at = {**row.data, **values}, now()
         action(
             db,
@@ -901,7 +1027,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             "kind": row.kind,
             "cve_id": row.cve_id,
             "status": row.status,
-            "program_id": row.program_id,
+            "application_id": row.application_id,
             "source_commit_id": row.data.get("source_commit_id"),
             "source_analysis_id": row.data.get("source_analysis_id"),
         })
@@ -1002,7 +1128,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             row.id,
             values,
             {
-                "program_id": row.program_id,
+                "application_id": row.application_id,
                 "source_analysis_id": row.data.get("source_analysis_id"),
                 "origin": "upload",
             },
@@ -1025,7 +1151,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             domain.submit_agent(
                 db,
                 "finding_artifacts",
-                domain.get(db, Program, row.program_id),
+                domain.get(db, Application, row.application_id),
                 # None resolves the newest still-affected release when the job runs.
                 {"finding_id": row.id, "source_ref": body.source_ref},
                 body.profile.model_dump() if body.profile else None,
@@ -1051,13 +1177,13 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 "Complete and pin all required artifacts before verification",
                 422,
             )
-        program = domain.get(db, Program, finding.program_id)
+        application = domain.get(db, Application, finding.application_id)
         job = domain.enqueue(
             db,
             "lab_run",
-            program,
+            application,
             domain.job_input(
-                program, finding_id=finding.id, artifact_revision=finding.artifact_revision
+                db, application, finding_id=finding.id, artifact_revision=finding.artifact_revision
             ),
             idempotency_key=key,
         )
@@ -1122,15 +1248,15 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
     @router.get("/jobs")
     def jobs(
-        program_id: str | None = None,
+        application_id: str | None = None,
         status: str | None = None,
         cursor: str | None = None,
         limit: int = 50,
         db=database_dependency,
     ):
         stmt = select(Job).order_by(Job.created_at.desc())
-        if program_id:
-            stmt = stmt.where(Job.program_id == program_id)
+        if application_id:
+            stmt = stmt.where(Job.application_id == application_id)
         if status:
             stmt = stmt.where(Job.status == status)
         return paginate(db, stmt, lambda j: domain.job_json(db, j, False), cursor, limit)
@@ -1245,8 +1371,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             raise DomainError(
                 "finding_removed", "The finding this job worked on has been deleted", 409
             )
-        program = domain.get(db, Program, row.program_id) if row.program_id else None
-        job = domain.enqueue(db, row.kind, program, row.input, row.profile, key)
+        application = domain.get(db, Application, row.application_id) if row.application_id else None
+        job = domain.enqueue(db, row.kind, application, row.input, row.profile, key)
         if row.kind == "lab_run" and not db.scalar(select(LabRun).where(LabRun.job_id == job.id)):
             original = db.scalar(select(LabRun).where(LabRun.job_id == row.id))
             db.add(
@@ -1279,7 +1405,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     @router.patch("/settings")
     def patch_settings(body: dict, db=database_dependency):
         allowed = {
-            "monitor_interval_days",
+            "monitor_interval_seconds",
             "default_profiles",
             "webhook_enabled",
             "dashboard_url",
@@ -1293,15 +1419,19 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             **row.data,
             **{k: v for k, v in body.items() if k not in ("webhook_url", "webhook_key")},
         }
-        days = values.get("monitor_interval_days")
+        seconds = values.get("monitor_interval_seconds")
         if type(values.get("webhook_enabled")) is not bool:
             raise DomainError("validation_error", "Webhook enabled must be true or false", 422)
-        if days is not None and (type(days) is not int or not 1 <= days <= 3650):
+        if seconds is not None and (
+            type(seconds) is not int or not MIN_INTERVAL <= seconds <= MAX_INTERVAL
+        ):
+            too_long = type(seconds) is int and seconds > MAX_INTERVAL
+            message = "At most 10 years" if too_long else "At least 5 minutes"
             raise DomainError(
                 "validation_error",
-                "Monitoring interval must be positive whole days",
+                "The monitoring interval must be between 5 minutes and 10 years",
                 422,
-                {"monitor_interval_days": "Positive whole days required"},
+                {"monitor_interval_seconds": message},
             )
         if values.get("dashboard_url"):
             try:
@@ -1339,18 +1469,18 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 row.webhook_secret = vault.encrypt({"url": url, "key": body.get("webhook_key")})
             else:
                 row.webhook_secret = None
-        if days is None and any(
-            p.config.get("monitor_interval_inherited") for p in db.scalars(select(Program))
+        if seconds is None and any(
+            p.config.get("monitor_interval_inherited") for p in db.scalars(select(Application))
         ):
             raise DomainError(
-                "monitor_interval_required", "Existing programs inherit the global interval", 422
+                "monitor_interval_required", "Existing Applications inherit the global interval", 422
             )
-        if days is not None and days != row.data.get("monitor_interval_days"):
-            for monitored in db.scalars(select(Program)):
+        if seconds is not None and seconds != row.data.get("monitor_interval_seconds"):
+            for monitored in db.scalars(select(Application)):
                 if monitored.config.get("monitor_interval_inherited"):
-                    monitored.monitor_interval_days = days
+                    monitored.monitor_interval_seconds = seconds
                     monitored.next_check_at = (
-                        (utc(monitored.last_check_at) or now()) + timedelta(days=days)
+                        (utc(monitored.last_check_at) or now()) + timedelta(seconds=seconds)
                         if monitored.monitor_enabled and not monitored.archived
                         else None
                     )

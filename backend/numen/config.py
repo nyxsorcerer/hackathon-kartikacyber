@@ -17,7 +17,7 @@ class Config:
     broker_token: str = ""
     cookie_secure: bool = False
     frontend_root: Path = Path("../frontend/dist")
-    monitor_interval_days: int | None = None
+    monitor_interval_seconds: int | None = None
     test_mode: bool = False
     worker_concurrency: int = 3
     audit_concurrency: int = 3
@@ -33,7 +33,7 @@ class Config:
             broker_token=secret_env("NUMEN_BROKER_TOKEN"),
             cookie_secure=os.getenv("NUMEN_COOKIE_SECURE", "false").lower() == "true",
             frontend_root=Path(os.getenv("NUMEN_FRONTEND_ROOT", "../frontend/dist")),
-            monitor_interval_days=int(days) if days else None,
+            monitor_interval_seconds=int(days) * 86400 if days else None,
             test_mode=os.getenv("NUMEN_TEST_MODE") == "1",
             worker_concurrency=int(os.getenv("NUMEN_WORKER_CONCURRENCY", "3")),
             audit_concurrency=int(os.getenv("NUMEN_AUDIT_CONCURRENCY", "3")),

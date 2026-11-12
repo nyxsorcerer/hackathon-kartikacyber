@@ -24,11 +24,12 @@ import {
   analysisBatchSchema,
   commitSchema,
   commitsSchema,
-  programSchema,
-  programsSchema,
+  applicationSchema,
+  applicationsSchema,
+  repositoryLabel,
   reviewBatchSchema,
 } from "../types";
-import type { Analysis, Commit, CommitFile, Program } from "../types";
+import type { Analysis, Commit, CommitFile, Application } from "../types";
 import { AnalysisResult } from "../components/AnalysisResult";
 import { JobLaunch } from "../components/JobLaunch";
 import {
@@ -135,12 +136,12 @@ function triageConfidence(commit: Commit) {
 }
 export function AnalysisHistory({
   analyses,
-  programId,
+  applicationId,
   commitId,
   onRerun,
 }: {
   analyses: Analysis[];
-  programId: string;
+  applicationId: string;
   commitId?: string;
   onRerun?: () => void;
 }) {
@@ -211,7 +212,7 @@ export function AnalysisHistory({
         findingCategories.includes(category || "") && (
           <Link
             className="secondary button"
-            to={`/findings/new?program_id=${encodeURIComponent(programId)}${commitId ? `&source_commit_id=${encodeURIComponent(commitId)}` : ""}${analysis.id ? `&source_analysis_id=${encodeURIComponent(analysis.id)}` : ""}`}
+            to={`/findings/new?application_id=${encodeURIComponent(applicationId)}${commitId ? `&source_commit_id=${encodeURIComponent(commitId)}` : ""}${analysis.id ? `&source_analysis_id=${encodeURIComponent(analysis.id)}` : ""}`}
           >
             Create finding
           </Link>
@@ -250,7 +251,7 @@ function DecisionBadge({ decision }: { decision: string }) {
 /** A prefilled Create finding form for this revision and its latest analysis. */
 function createFindingHref(commit: Commit) {
   const query = new URLSearchParams({
-    program_id: commit.program_id,
+    application_id: commit.application_id ?? "",
     source_commit_id: commit.id,
     title: commitTitle(commit),
   });
@@ -531,31 +532,31 @@ function QueueBar({
 }
 const noSelection = new Set<string>();
 export function CommitList({
-  program,
+  application,
   collection,
   scopeId,
-  scopeProgram,
+  scopeApplication,
 }: {
-  program?: Program;
+  application?: Application;
   collection?: Collection<Commit>;
   scopeId?: string;
-  /** The program a scoped queue belongs to, for its execution profile. */
-  scopeProgram?: Program;
+  /** The application a scoped queue belongs to, for its execution profile. */
+  scopeApplication?: Application;
 }) {
   const own = useCollection(
     collection
       ? null
-      : program
-        ? `/programs/${program.id}/commits`
+      : application
+        ? `/applications/${application.id}/commits`
         : scopeId
-          ? `/commits?program_id=${encodeURIComponent(scopeId)}`
+          ? `/commits?application_id=${encodeURIComponent(scopeId)}`
           : "/commits",
     commitsSchema,
   );
   const commits = collection || own;
   const [filters, update] = useQueryState({
     q: "",
-    decision: program ? "all" : "candidate",
+    decision: application ? "all" : "candidate",
     triage: "all",
     show: "all",
     sort: "newest",
@@ -593,7 +594,7 @@ export function CommitList({
   const [receipt, setReceipt] = useState<Receipt>();
   // The revisions a batch analysis was opened for, fixed while its dialog is open.
   const [analyzing, setAnalyzing] = useState<Commit[]>();
-  const owner = program || scopeProgram;
+  const owner = application || scopeApplication;
   const select = (ids: Set<string>) => {
     setSelection({ key: filterKey, ids });
     setReceipt(undefined);
@@ -666,7 +667,7 @@ export function CommitList({
   let lastDay = "";
   return (
     <Panel
-      title={program ? "Source history" : "Review queue"}
+      title={application ? "Source history" : "Review queue"}
       description="Triage classification and detailed analysis are separate judgments."
       className="commit-queue-panel"
     >
@@ -952,7 +953,7 @@ export function CommitList({
             icon={GitCommitHorizontal}
             title="No revisions yet"
             description={
-              program
+              application
                 ? "Run a source check to import the available history."
                 : "Revisions appear here after source checks import them."
             }
@@ -964,7 +965,9 @@ export function CommitList({
           path="/commits/analyses"
           operation="commit_analysis"
           initialProfile={owner?.config.profiles.commit_analysis}
-          context={<BatchAnalysisContext commits={analyzing} program={owner} />}
+          context={
+            <BatchAnalysisContext commits={analyzing} application={owner} />
+          }
           submit={analyze}
           submitLabel={`Start ${analyzing.length} ${analyzing.length === 1 ? "analysis" : "analyses"}`}
           onClose={() => setAnalyzing(undefined)}
@@ -976,17 +979,17 @@ export function CommitList({
 /** What a batch analysis covers: the first few revisions and how the batch runs. */
 function BatchAnalysisContext({
   commits,
-  program,
+  application,
 }: {
   commits: Commit[];
-  program?: Program;
+  application?: Application;
 }) {
   const listed = commits.slice(0, 5);
   return (
     <div className="commit-launch-context">
       <p>
         <strong>{revisionCount(commits.length)}</strong>
-        {program && ` · ${program.product_name}`}
+        {application && ` · ${application.product_name}`}
       </p>
       <ul className="batch-launch-list">
         {listed.map((c) => (
@@ -1008,10 +1011,10 @@ function BatchAnalysisContext({
   );
 }
 export function Reviews() {
-  const programs = useCollection("/programs", programsSchema);
-  const [scope, update] = useQueryState({ prog: "", q: "" });
-  const list = programs.data?.items || [];
-  const selected = list.find((p) => p.id === scope.prog);
+  const applications = useCollection("/applications", applicationsSchema);
+  const [scope, update] = useQueryState({ application: "", q: "" });
+  const list = applications.data?.items || [];
+  const selected = list.find((p) => p.id === scope.application);
   return (
     <>
       <PageHeading
@@ -1019,58 +1022,63 @@ export function Reviews() {
         title="Commit review"
         description={
           selected ? (
-            <Link to={`/programs/${selected.id}?tab=commits`}>
+            <Link to={`/applications/${selected.id}?tab=commits`}>
               {selected.asset_name} · {selected.product_name}
             </Link>
           ) : (
-            "Review one program at a time, distinguish security changes, and investigate supported findings."
+            "Review one application at a time, distinguish security changes, and investigate supported findings."
           )
         }
         actions={
-          scope.prog &&
-          programs.data && (
+          scope.application &&
+          applications.data && (
             <FilterSelect
-              label="Program"
-              value={scope.prog}
-              onChange={(prog) => update({ prog, q: null })}
+              label="Application"
+              value={scope.application}
+              onChange={(application) => update({ application, q: null })}
               options={[
                 ...(selected
                   ? []
-                  : [{ value: scope.prog, label: "Unavailable program" }]),
+                  : [
+                      {
+                        value: scope.application,
+                        label: "Unavailable application",
+                      },
+                    ]),
                 ...list.map((p) => ({ value: p.id, label: p.asset_name })),
               ]}
             />
           )
         }
       />
-      {!scope.prog ? (
+      {!scope.application ? (
         <Panel
-          title="Choose a program"
-          description="Each program has its own review queue, so different sources never mix."
+          title="Choose an application"
+          description="Each application has its own review queue, so different sources never mix."
         >
           <div className="explorer-toolbar">
             <SearchField
-              label="Search review programs"
+              label="Search review applications"
               placeholder="Search asset or product…"
               value={scope.q}
               onChange={(q) => update({ q })}
             />
           </div>
           <DataState
-            loading={programs.loading}
-            error={programs.error}
-            retry={programs.refresh}
-            hasData={!!programs.data}
+            loading={applications.loading}
+            error={applications.error}
+            retry={applications.refresh}
+            hasData={!!applications.data}
           >
-            <div className="review-program-grid">
+            <div className="review-application-grid">
               {list
                 .filter((p) => matches(scope.q, p.asset_name, p.product_name))
                 .map((p) => (
                   <Link
                     key={p.id}
-                    className="review-program-card"
+                    className="review-application-card"
                     aria-label={`Review commits for ${p.asset_name}`}
-                    to={`/reviews?prog=${encodeURIComponent(p.id)}`}
+                    to={`/reviews?application=${encodeURIComponent(p.id)}`}
                   >
                     <GitCommitHorizontal size={20} aria-hidden="true" />
                     <div>
@@ -1083,8 +1091,8 @@ export function Reviews() {
                 ))}
               {!list.length && (
                 <Empty
-                  title="No programs yet"
-                  description="Register a program to monitor and review its source revisions."
+                  title="No applications yet"
+                  description="Register an application to monitor and review its source revisions."
                 />
               )}
             </div>
@@ -1092,24 +1100,24 @@ export function Reviews() {
         </Panel>
       ) : (
         <>
-          {programs.data && !selected && (
+          {applications.data && !selected && (
             <Callout
               tone="warm"
-              title="This program is unavailable"
+              title="This application is unavailable"
               action={
                 <Link className="secondary button" to="/reviews">
-                  Choose a program
+                  Choose an application
                 </Link>
               }
             >
               It may have been removed. Revisions below are limited to this
-              program identifier.
+              application identifier.
             </Callout>
           )}
           <CommitList
-            key={scope.prog}
-            scopeId={scope.prog}
-            scopeProgram={selected}
+            key={scope.application}
+            scopeId={scope.application}
+            scopeApplication={selected}
           />
         </>
       )}
@@ -1354,11 +1362,11 @@ function DiffFiles({
   );
 }
 const historyKeys = ["j", "k"];
-/** Newer/older navigation through a program's revisions. */
+/** Newer/older navigation through an application's revisions. */
 function HistoryPager({ commit }: { commit: Commit }) {
   const navigate = useNavigate();
   const history = useCollection(
-    `/programs/${commit.program_id}/commits`,
+    `/applications/${commit.application_id}/commits`,
     commitsSchema,
   );
   const list = useMemo(
@@ -1419,8 +1427,14 @@ function CommitDetailBody({
     : commit.analyses.length
       ? "analysis"
       : "source";
-  const program = useResource(`/programs/${commit.program_id}`, programSchema);
-  const source = program.data;
+  const application = useResource(
+    `/applications/${commit.application_id}`,
+    applicationSchema,
+  );
+  const source = application.data;
+  const repository = source?.repositories.find(
+    (r) => r.repository_id === commit.repository_id,
+  );
   const reason = triageField(commit, "reason");
   const confidence = triageConfidence(commit);
   return (
@@ -1428,14 +1442,14 @@ function CommitDetailBody({
       <HistoryPager commit={commit} />
       <PageHeading
         back={{
-          to: `/reviews?prog=${encodeURIComponent(commit.program_id)}`,
+          to: `/reviews?application=${encodeURIComponent(commit.application_id ?? "")}`,
           label: "Commit review",
         }}
         eyebrow={`Revision ${commit.revision.slice(0, 12)}`}
         title={commitTitle(commit)}
         description={
           source && (
-            <Link to={`/programs/${source.id}?tab=commits`}>
+            <Link to={`/applications/${source.id}?tab=commits`}>
               {source.asset_name} · {source.product_name}
             </Link>
           )
@@ -1463,12 +1477,10 @@ function CommitDetailBody({
         <DetailGrid
           items={[
             [
-              "Upstream source",
-              source ? (
-                <ExternalLink href={source.source_url}>
-                  {source.source_kind === "wordpress"
-                    ? `WordPress · ${source.plugin_slug}`
-                    : source.source_url?.replace("https://github.com/", "")}
+              "Repository",
+              repository ? (
+                <ExternalLink href={repository.source_url}>
+                  {repositoryLabel(repository)}
                 </ExternalLink>
               ) : (
                 "Loading…"
@@ -1646,7 +1658,7 @@ function CommitDetailBody({
           ) : (
             <p className="muted">
               {commit.triage_status === "disabled"
-                ? "Triage is disabled for this program. Review the change manually."
+                ? "Triage is disabled for this application. Review the change manually."
                 : "No classification reason recorded."}
             </p>
           )}
@@ -1664,7 +1676,7 @@ function CommitDetailBody({
             {source && (
               <Link
                 className="secondary button"
-                to={`/programs/${source.id}?tab=audit`}
+                to={`/applications/${source.id}?tab=audit`}
               >
                 Inspect audit context
               </Link>
@@ -1689,7 +1701,7 @@ function CommitDetailBody({
         >
           <AnalysisHistory
             analyses={commit.analyses}
-            programId={commit.program_id}
+            applicationId={commit.application_id ?? ""}
             commitId={commit.id}
             onRerun={() => setAnalyze(true)}
           />
@@ -1699,7 +1711,7 @@ function CommitDetailBody({
         <JobLaunch
           path={`/commits/${commit.id}/analyses`}
           operation="commit_analysis"
-          initialProfile={program.data?.config.profiles.commit_analysis}
+          initialProfile={application.data?.config.profiles.commit_analysis}
           context={
             <div className="commit-launch-context">
               <p>
@@ -1707,7 +1719,7 @@ function CommitDetailBody({
               </p>
               <p className="mono">{commit.revision}</p>
               <p>
-                {program.data?.product_name || "Source context"} ·{" "}
+                {application.data?.product_name || "Source context"} ·{" "}
                 {commit.diff_complete ? "Complete diff" : "Incomplete diff"}
               </p>
               <p className="hint">

@@ -105,7 +105,7 @@ export function markdownLines(text: string, base?: CSSProperties): Span[][] {
   return lines;
 }
 
-/** Tool output: the program's own colors when present, diffs and exit codes otherwise. */
+/** Tool output: the tool's own colors when present, diffs and exit codes otherwise. */
 export function outputLines(text: string): Span[][] {
   if (hasEscapes(text)) return ansiLines(text);
   const diff = looksLikeDiff(text);

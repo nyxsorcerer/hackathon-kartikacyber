@@ -9,26 +9,25 @@ afterEach(() => {
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
 });
-const program = {
-  id: "program",
+const application = {
+  id: "application",
   asset_name: "Customer portal",
   asset_url: "https://example.test",
   product_kind: "cms",
   product_name: "Example CMS",
-  source_kind: "github",
-  monitor_interval_days: 7,
+  monitor_interval_seconds: 604800,
   monitor_enabled: true,
   archived: false,
   source_generation: 1,
   last_check_at: null,
   next_check_at: null,
-  last_error: null,
+  repositories: [],
   version: null,
   config: {},
 };
 const summary = {
   id: "finding",
-  program_id: "program",
+  application_id: "application",
   kind: "0day",
   cve_id: null,
   title: "Stored XSS in timezone settings",
@@ -111,7 +110,9 @@ it("renders structured ranges in the finding detail", async () => {
     vi.fn(
       async (url: string) =>
         new Response(
-          JSON.stringify(url.startsWith("/api/programs/") ? program : detail),
+          JSON.stringify(
+            url.startsWith("/api/applications/") ? application : detail,
+          ),
         ),
     ),
   );
@@ -140,8 +141,8 @@ it("preserves structured version evidence when editing the operator status", asy
       }
       return new Response(
         JSON.stringify(
-          url === "/api/programs"
-            ? { items: [program], next_cursor: null }
+          url === "/api/applications"
+            ? { items: [application], next_cursor: null }
             : detail,
         ),
       );
@@ -182,8 +183,8 @@ it("deletes a false-positive finding after confirmation and returns to its commi
       if (init?.method === "DELETE") return new Response(null, { status: 204 });
       return new Response(
         JSON.stringify(
-          url.startsWith("/api/programs/")
-            ? program
+          url.startsWith("/api/applications/")
+            ? application
             : { ...detail, source_commit_id: "commit-1" },
         ),
       );
@@ -221,7 +222,9 @@ it("opens a finding recorded before version ranges were stored for commit findin
     vi.fn(
       async (url: string) =>
         new Response(
-          JSON.stringify(url.startsWith("/api/programs/") ? program : legacy),
+          JSON.stringify(
+            url.startsWith("/api/applications/") ? application : legacy,
+          ),
         ),
     ),
   );

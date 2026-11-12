@@ -1040,6 +1040,9 @@ tbody tr:last-child td {
 tbody tr:hover {
   background: var(--surface-2);
 }
+tr.dimmed {
+  opacity: 0.6;
+}
 .table-title {
   display: inline-block;
   max-width: 360px;
@@ -1412,7 +1415,7 @@ td:first-child {
   font-size: 12.5px;
 }
 
-/* Programs and versions */
+/* Applications and versions */
 .version-hero {
   display: flex;
   flex-wrap: wrap;
@@ -1923,7 +1926,7 @@ td:first-child {
 /* ---------------------------------------------------------------------------
    Forms
    ------------------------------------------------------------------------ */
-.program-form {
+.application-form {
   max-width: 1040px;
 }
 .narrow-form {
@@ -2273,6 +2276,13 @@ form > .hint,
   width: 280px;
   max-width: 100%;
   margin: 0;
+}
+.interval-input {
+  display: flex;
+  gap: 8px;
+}
+.interval-input select {
+  width: auto;
 }
 .default-operation {
   padding: 18px 20px;
@@ -4413,14 +4423,14 @@ tbody tr.group-row:hover {
   }
 }
 
-/* Program-scoped commit review */
-.review-program-grid {
+/* Application-scoped commit review */
+.review-application-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   gap: 12px;
   padding: 20px;
 }
-.review-program-card {
+.review-application-card {
   display: flex;
   align-items: center;
   gap: 14px;
@@ -4429,15 +4439,15 @@ tbody tr.group-row:hover {
   border-radius: var(--radius);
   background: var(--surface-2);
 }
-.review-program-card:hover {
+.review-application-card:hover {
   border-color: var(--border-strong);
   background: var(--surface-3);
   text-decoration: none;
 }
-.review-program-card > svg {
+.review-application-card > svg {
   flex-shrink: 0;
 }
-.review-program-card > div {
+.review-application-card > div {
   display: flex;
   flex: 1;
   flex-direction: column;
@@ -4445,12 +4455,12 @@ tbody tr.group-row:hover {
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.review-program-card strong {
+.review-application-card strong {
   font-size: 15px;
   color: var(--text);
 }
-.review-program-card span,
-.review-program-card small {
+.review-application-card span,
+.review-application-card small {
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -4497,11 +4507,11 @@ tbody tr.group-row:hover {
   color: var(--text-muted);
 }
 @media (max-width: 600px) {
-  .review-program-grid,
+  .review-application-grid,
   .commit-analysis-history {
     padding: 16px;
   }
-  .review-program-card {
+  .review-application-card {
     padding: 16px;
   }
 }

@@ -2,8 +2,13 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { LoaderCircle, Plus, Radar, Search, X } from "lucide-react";
 import { useDebounced, useResource } from "../hooks";
-import { programState, programsSchema } from "../types";
-import type { Program } from "../types";
+import {
+  applicationState,
+  applicationsSchema,
+  failingRepositories,
+  repositoryLabel,
+} from "../types";
+import type { Application } from "../types";
 import {
   Badge,
   DataState,
@@ -14,8 +19,8 @@ import {
   Pagination,
   Time,
 } from "../components/ui";
-export function VersionCell({ program }: { program: Program }) {
-  const version = program.version;
+export function VersionCell({ application }: { application: Application }) {
+  const version = application.version;
   if (!version) return <span className="muted">Not observed</span>;
   return (
     <>
@@ -33,7 +38,7 @@ export function VersionCell({ program }: { program: Program }) {
     </>
   );
 }
-export function Programs() {
+export function Applications() {
   const [cursor, setCursor] = useState("");
   const [search, setSearch] = useState("");
   const query = useDebounced(search.trim());
@@ -41,8 +46,8 @@ export function Programs() {
   if (query) params.set("q", query);
   if (cursor) params.set("cursor", cursor);
   const resource = useResource(
-    `/programs${params.size ? `?${params}` : ""}`,
-    programsSchema,
+    `/applications${params.size ? `?${params}` : ""}`,
+    applicationsSchema,
     0,
     true,
   );
@@ -51,12 +56,12 @@ export function Programs() {
     <>
       <PageHeading
         eyebrow="Asset inventory"
-        title="Programs"
-        description="Each program pairs a deployed asset with the software and upstream source it runs."
+        title="Applications"
+        description="Each application pairs a deployed asset with the software and upstream source it runs."
         actions={
-          <Link className="primary button" to="/programs/new">
+          <Link className="primary button" to="/applications/new">
             <Plus size={16} aria-hidden="true" />
-            Insert program
+            Insert application
           </Link>
         }
       />
@@ -66,7 +71,7 @@ export function Programs() {
             <Search size={16} aria-hidden="true" />
             <input
               type="search"
-              aria-label="Search programs"
+              aria-label="Search applications"
               placeholder="Search assets, software, or URL"
               value={search}
               onChange={(e) => {
@@ -91,7 +96,7 @@ export function Programs() {
           </div>
           <span className="muted" role="status">
             {items
-              ? `${items.length} ${items.length === 1 ? "program" : "programs"}${resource.data?.next_cursor ? " on this page" : ""}`
+              ? `${items.length} ${items.length === 1 ? "application" : "applications"}${resource.data?.next_cursor ? " on this page" : ""}`
               : ""}
           </span>
         </div>
@@ -107,7 +112,7 @@ export function Programs() {
                 <thead>
                   <tr>
                     <th scope="col">Asset / software</th>
-                    <th scope="col">Upstream source</th>
+                    <th scope="col">Repositories</th>
                     <th scope="col">Observed version</th>
                     <th scope="col">Last check</th>
                     <th scope="col">Next check</th>
@@ -118,7 +123,10 @@ export function Programs() {
                   {items.map((p) => (
                     <tr key={p.id}>
                       <td>
-                        <Link className="table-title" to={`/programs/${p.id}`}>
+                        <Link
+                          className="table-title"
+                          to={`/applications/${p.id}`}
+                        >
                           {p.asset_name}
                         </Link>
                         <div className="table-subtitle">
@@ -126,19 +134,14 @@ export function Programs() {
                         </div>
                         <div className="table-url">{p.asset_url}</div>
                       </td>
-                      <td>
-                        {p.source_kind === "wordpress"
-                          ? "WordPress plugin"
-                          : "GitHub"}
-                        <div className="table-subtitle mono">
-                          {p.plugin_slug ||
-                            p.source_url?.replace("https://github.com/", "")}
-                          {" · "}
-                          {p.source_ref || "default branch"}
-                        </div>
+                      <td className="mono">
+                        {p.repositories
+                          .filter((r) => !r.removed_at)
+                          .map(repositoryLabel)
+                          .join(", ") || <span className="muted">None</span>}
                       </td>
                       <td>
-                        <VersionCell program={p} />
+                        <VersionCell application={p} />
                       </td>
                       <td>
                         <Time value={p.last_check_at} />
@@ -151,10 +154,12 @@ export function Programs() {
                         )}
                       </td>
                       <td>
-                        <Badge>{programState(p)}</Badge>
-                        {!!p.last_error && (
+                        <Badge>{applicationState(p)}</Badge>
+                        {failingRepositories(p).length > 0 && (
                           <div className="table-subtitle danger-text clamp">
-                            {describeError(p.last_error) || "Last check failed"}
+                            {describeError(
+                              failingRepositories(p)[0].last_error,
+                            ) || "Last check failed"}
                           </div>
                         )}
                       </td>
@@ -166,17 +171,17 @@ export function Programs() {
           ) : (
             <Empty
               icon={query ? Search : Radar}
-              title={query ? "No matching programs" : "No programs yet"}
+              title={query ? "No matching applications" : "No applications yet"}
               description={
                 query
-                  ? `Nothing matches “${query}”. Try an asset name, software name, or URL.`
+                  ? `Nothing matches “${query}”. Try a name, software name, or URL.`
                   : "Register your first asset to start collecting source and version evidence."
               }
               action={
                 !query && (
-                  <Link className="primary button" to="/programs/new">
+                  <Link className="primary button" to="/applications/new">
                     <Plus size={16} aria-hidden="true" />
-                    Insert program
+                    Insert application
                   </Link>
                 )
               }

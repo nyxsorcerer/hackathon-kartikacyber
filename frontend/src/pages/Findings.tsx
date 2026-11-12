@@ -23,10 +23,10 @@ import {
   findingDeletionSchema,
   findingSchema,
   findingSummariesSchema,
-  programSchema,
-  programsSchema,
+  applicationSchema,
+  applicationsSchema,
 } from "../types";
-import type { Finding, Program } from "../types";
+import type { Finding, Application } from "../types";
 import { versionLabels } from "../versions";
 import { JobLaunch, queueJob } from "../components/JobLaunch";
 import { ArtifactBrowser } from "../components/ArtifactPreview";
@@ -89,10 +89,10 @@ function findingCount(n: number) {
   return `${n} ${n === 1 ? "finding" : "findings"}`;
 }
 const noSelection = new Set<string>();
-export function FindingsList({ program }: { program?: Program }) {
+export function FindingsList({ application }: { application?: Application }) {
   const [cursor, setCursor] = useState("");
   const params = new URLSearchParams({ view: "summary" });
-  if (program) params.set("program_id", program.id);
+  if (application) params.set("application_id", application.id);
   if (cursor) params.set("cursor", cursor);
   const resource = useResource(
     `/findings${params.size ? `?${params}` : ""}`,
@@ -126,10 +126,10 @@ export function FindingsList({ program }: { program?: Program }) {
       title="Finding register"
       description="Upstream remediation and target exposure are tracked independently."
       actions={
-        program && (
+        application && (
           <Link
             className="secondary button"
-            to={`/findings/new?program_id=${program.id}`}
+            to={`/findings/new?application_id=${application.id}`}
           >
             <Plus size={14} aria-hidden="true" />
             Create finding
@@ -282,7 +282,7 @@ export function FindingsList({ program }: { program?: Program }) {
             action={
               <Link
                 className="secondary button"
-                to={`/findings/new${program ? `?program_id=${program.id}` : ""}`}
+                to={`/findings/new${application ? `?application_id=${application.id}` : ""}`}
               >
                 <Plus size={15} aria-hidden="true" />
                 Create finding
@@ -322,9 +322,9 @@ function EditFinding({ id }: { id: string }) {
 function FindingEditor({ finding }: { finding?: Finding }) {
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const programs = useResource("/programs", programsSchema);
-  const [programId, setProgramId] = useState(
-    finding?.program_id || params.get("program_id") || "",
+  const applications = useResource("/applications", applicationsSchema);
+  const [applicationId, setApplicationId] = useState(
+    finding?.application_id || params.get("application_id") || "",
   );
   const [kind, setKind] = useState(
     finding?.kind || (params.has("cve_id") ? "cve" : "0day"),
@@ -368,7 +368,7 @@ function FindingEditor({ finding }: { finding?: Finding }) {
               finding ? `/findings/${finding.id}` : "/findings",
               findingSchema,
               {
-                program_id: programId,
+                application_id: applicationId,
                 kind,
                 cve_id: cveId || null,
                 title,
@@ -407,21 +407,21 @@ function FindingEditor({ finding }: { finding?: Finding }) {
         <Panel title="Finding identity">
           <div className="form-grid">
             <label className="full">
-              Program
+              Application
               <select
                 required
-                value={programId}
-                onChange={(e) => setProgramId(e.target.value)}
+                value={applicationId}
+                onChange={(e) => setApplicationId(e.target.value)}
               >
-                <option value="">Select a program</option>
-                {programs.data?.items.map((p) => (
+                <option value="">Select an application</option>
+                {applications.data?.items.map((p) => (
                   <option value={p.id} key={p.id}>
                     {p.asset_name} · {p.product_name}
                   </option>
                 ))}
               </select>
-              {programs.error && (
-                <span className="field-error">{programs.error}</span>
+              {applications.error && (
+                <span className="field-error">{applications.error}</span>
               )}
             </label>
             <label>
@@ -516,7 +516,7 @@ function FindingEditor({ finding }: { finding?: Finding }) {
           >
             Cancel
           </Link>
-          <button className="primary" disabled={busy || programs.loading}>
+          <button className="primary" disabled={busy || applications.loading}>
             <Save size={15} />
             {busy ? "Saving…" : "Save finding"}
           </button>
@@ -555,9 +555,12 @@ function FindingBody({
   const [generate, setGenerate] = useState(false);
   const [upload, setUpload] = useState(false);
   const navigate = useNavigate();
-  const program = useResource(`/programs/${finding.program_id}`, programSchema);
+  const application = useResource(
+    `/applications/${finding.application_id}`,
+    applicationSchema,
+  );
   const complete = finding.artifact_state.status === "complete";
-  const observed = program.data?.version;
+  const observed = application.data?.version;
   const lab = labState(finding.lab_runs[0]?.status);
   return (
     <>
@@ -566,9 +569,9 @@ function FindingBody({
         eyebrow={findingIdentifier(finding)}
         title={finding.title}
         description={
-          program.data && (
-            <Link to={`/programs/${finding.program_id}?tab=findings`}>
-              {program.data.asset_name} · {program.data.product_name}
+          application.data && (
+            <Link to={`/applications/${finding.application_id}?tab=findings`}>
+              {application.data.asset_name} · {application.data.product_name}
             </Link>
           )
         }
@@ -873,7 +876,7 @@ function FindingBody({
         <JobLaunch
           operation="finding_artifacts"
           path={`/findings/${finding.id}/artifact-generations`}
-          initialProfile={program.data?.config.profiles.finding_artifacts}
+          initialProfile={application.data?.config.profiles.finding_artifacts}
           context={`${finding.title} · ${finding.cve_id || "0day"} · affected versions ${finding.affected_versions.join(", ") || "unknown"}`}
           onClose={() => setGenerate(false)}
           onSubmitted={refresh}

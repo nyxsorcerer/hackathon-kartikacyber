@@ -21,6 +21,8 @@ CATEGORIES = (
     "Insufficient context",
 )
 CHANGE_KINDS = ("vulnerability_fix", "security_hardening", "vulnerability_introduction", "unrelated", "insufficient_context")
+# Monitoring intervals in seconds: at least 5 minutes, at most 10 years.
+MIN_INTERVAL, MAX_INTERVAL = 300, 3650 * 86400
 
 
 def http_url(value):
@@ -80,7 +82,7 @@ class ModelCapability(BaseModel):
         return self
 
 
-class ProgramConfig(Strict):
+class ApplicationConfig(Strict):
     monitor_interval_inherited: bool = False
     triage_mode: Literal["disabled", "jev", "pi", "claude", "codex"] = "disabled"
     profiles: dict[str, Profile] = Field(default_factory=dict)
@@ -124,25 +126,30 @@ class ProgramConfig(Strict):
         return value
 
 
-class ProgramInput(Strict):
+class ApplicationInput(Strict):
     asset_name: str = Field(min_length=1, max_length=200)
     asset_url: str
     product_kind: str = Field(min_length=1, max_length=100)
     product_name: str = Field(min_length=1, max_length=200)
-    source_kind: Literal["github", "wordpress"]
-    source_url: str | None = None
-    source_ref: str | None = None
-    source_path: str | None = None
-    plugin_slug: str | None = None
-    monitor_interval_days: int | None = Field(default=None, gt=0, le=3650)
+    monitor_interval_seconds: int | None = Field(default=None, ge=MIN_INTERVAL, le=MAX_INTERVAL)
     monitor_enabled: bool = True
     archived: bool = False
-    config: ProgramConfig = Field(default_factory=ProgramConfig)
+    config: ApplicationConfig = Field(default_factory=ApplicationConfig)
 
     @field_validator("asset_url")
     @classmethod
     def url(cls, value):
         return http_url(value)
+
+
+class RepositoryInput(Strict):
+    role: Literal["own", "upstream"] = "upstream"
+    source_kind: Literal["github", "wordpress"]
+    source_url: str | None = None
+    plugin_slug: str | None = None
+    source_ref: str | None = None
+    source_path: str | None = None
+    locked_version: str | None = Field(default=None, max_length=100)
 
     @field_validator("source_path")
     @classmethod
@@ -156,7 +163,10 @@ class ProgramInput(Strict):
                 r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?", self.source_url
             ):
                 raise ValueError("GitHub source requires https://github.com/owner/repository")
-            self.source_url = self.source_url.rstrip("/").removesuffix(".git")
+            # One row per repository: GitHub names are case-insensitive.
+            self.source_url = self.source_url.rstrip("/").removesuffix(".git").lower()
+        elif self.role == "own":
+            raise ValueError("An Own repository must be a GitHub repository")
         else:
             if not self.plugin_slug or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", self.plugin_slug):
                 raise ValueError("WordPress source requires a valid plugin slug")
@@ -166,8 +176,18 @@ class ProgramInput(Strict):
         return self
 
 
+class RepositoryPatch(Strict):
+    # An explicit null clears the Locked version; an omitted field keeps it.
+    enabled: bool | None = None
+    locked_version: str | None = Field(default=None, max_length=100)
+
+
+class BackfillInput(Strict):
+    count: int = Field(ge=1, le=100)
+
+
 class FindingInput(Strict):
-    program_id: str
+    application_id: str
     kind: Literal["cve", "0day"]
     cve_id: str | None = None
     title: str = Field(min_length=1, max_length=300)

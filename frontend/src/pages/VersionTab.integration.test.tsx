@@ -1,12 +1,12 @@
 import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
-import { VersionTab } from "./ProgramDetail";
-import type { Program } from "../types";
+import { VersionTab } from "./ApplicationDetail";
+import type { Application } from "../types";
 
 afterEach(() => vi.unstubAllGlobals());
-const program = {
-  id: "program-1",
+const application = {
+  id: "application-1",
   asset_name: "Customer portal",
   asset_url: "https://portal.example.test",
   product_kind: "cms",
@@ -14,7 +14,7 @@ const program = {
   source_kind: "github",
   source_url: "https://github.com/example/cms",
   source_ref: "main",
-  monitor_interval_days: 7,
+  monitor_interval_seconds: 604800,
   monitor_enabled: true,
   archived: false,
   source_generation: 1,
@@ -30,7 +30,7 @@ const program = {
     cve_auto_analyze: false,
     active_recipe_id: "recipe-old",
   },
-} as unknown as Program;
+} as unknown as Application;
 const coverage = (versions: string[], resolution: string[][]) => ({
   corpus_coverage: {
     releases: versions.map((version) => ({ version })),
@@ -100,9 +100,9 @@ function renderTab(activeRecipe: string) {
   render(
     <MemoryRouter>
       <VersionTab
-        program={{
-          ...program,
-          config: { ...program.config, active_recipe_id: activeRecipe },
+        application={{
+          ...application,
+          config: { ...application.config, active_recipe_id: activeRecipe },
         }}
         onGenerate={() => {}}
         onManual={() => {}}

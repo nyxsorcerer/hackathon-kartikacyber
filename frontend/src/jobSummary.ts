@@ -19,7 +19,7 @@ const subjectLinks: Record<string, string> = {
   finding: "Open finding",
   account: "Open connections",
   notification: "Open notified item",
-  source: "Open source history",
+  source: "Open repositories",
   version: "Open version evidence",
   audit: "Open audit context",
   cves: "Open CVE records",
@@ -110,10 +110,29 @@ function successSummary(job: Job): {
       return {
         summary:
           field(r, "baseline") === true
-            ? `Recorded a baseline of ${plural(imported, "revision")}`
+            ? "Set the Baseline at the head; earlier commits are not imported"
             : imported
               ? `Imported ${plural(imported, "new revision")}`
               : "No new upstream revisions",
+        facts,
+      };
+    }
+    case "backfill": {
+      const imported = count(r, "imported") || 0;
+      return {
+        summary: `Backfill imported ${plural(imported, "earlier revision")}`,
+        facts,
+      };
+    }
+    case "derive_upstreams": {
+      const added = list(r, "added").length;
+      const removed = list(r, "removed").length;
+      const unresolved = count(r, "unresolved") || 0;
+      if (added) facts.push(`${added} added`);
+      if (removed) facts.push(`${removed} removed`);
+      if (unresolved) facts.push(plural(unresolved, "unresolved package"));
+      return {
+        summary: `Found ${plural(count(r, "repositories") || 0, "Upstream repository", "Upstream repositories")}`,
         facts,
       };
     }
@@ -296,9 +315,9 @@ function successSummary(job: Job): {
 /** What to do about a failure, keyed by the API's error code. */
 const failureHints: Record<string, string> = {
   source_not_checked:
-    "Run a source check for this program first, then retry this job.",
+    "Run a source check for this application first, then retry this job.",
   source_snapshot_limit:
-    "The program source is larger than the bounded snapshot. Narrow the source path or focus, then retry.",
+    "The application source is larger than the bounded snapshot. Narrow the source path or focus, then retry.",
   audit_scope_limit:
     "Orientation selected too many functions. Narrow the audit focus, then retry.",
   broker_unavailable:
@@ -324,7 +343,7 @@ const failureHints: Record<string, string> = {
   input_changed:
     "The connection's credentials changed after this job was queued. Run the check again.",
   cve_selectors_required:
-    "Add product or CPE selectors to the program, then retry.",
+    "Add product or CPE selectors to the application, then retry.",
   upstream_error:
     "The upstream source refused the request. Check the source URL and access, then retry.",
   source_unavailable:
@@ -340,12 +359,15 @@ const failureActions: Record<
   (job: Job) => { label: string; to: string } | undefined
 > = {
   source_not_checked: (job) =>
-    job.program_id
-      ? { label: "Open program", to: `/programs/${job.program_id}` }
+    job.application_id
+      ? { label: "Open application", to: `/applications/${job.application_id}` }
       : undefined,
   cve_selectors_required: (job) =>
-    job.program_id
-      ? { label: "Edit program", to: `/programs/${job.program_id}/edit` }
+    job.application_id
+      ? {
+          label: "Edit application",
+          to: `/applications/${job.application_id}/edit`,
+        }
       : undefined,
   credential_required: () => ({
     label: "Open connections",

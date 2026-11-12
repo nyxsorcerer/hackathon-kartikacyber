@@ -21,7 +21,7 @@ it.each(["succeeded", "failed"])(
           : {
               id: "job-1",
               kind: "cve_analysis",
-              program_id: "program-1",
+              application_id: "application-1",
               status,
               progress: {},
               created_at: "2026-10-04T00:00:00Z",
@@ -48,7 +48,7 @@ it.each(["succeeded", "failed"])(
       await screen.findByRole("link", { name: "View CVE analysis and report" }),
     ).toHaveAttribute(
       "href",
-      "/cves?cve=CVE-2026-12345&cvep=program-1&view=analysis&run=analysis-1",
+      "/cves?cve=CVE-2026-12345&cve_application=application-1&view=analysis&run=analysis-1",
     );
     expect(
       screen.getByRole("link", { name: "View finding artifacts" }),
@@ -60,7 +60,7 @@ it("links the CVE analysis history to its generated finding", () => {
   render(
     <MemoryRouter>
       <AnalysisHistory
-        programId="program-1"
+        applicationId="application-1"
         analyses={[
           {
             id: "analysis-1",
@@ -274,8 +274,8 @@ it("loads the final transcript after a running job passes through read-only canc
 const triage = {
   id: "job-triage",
   kind: "commit_triage",
-  program_id: "program-1",
-  program_name: "Customer portal",
+  application_id: "application-1",
+  application_name: "Customer portal",
   subject: {
     type: "commit",
     label: "Potential path traversal in template selection",
@@ -301,7 +301,7 @@ function serveJobs(jobs: Record<string, unknown>[]) {
       const job = jobs.find((j) => url === `/api/jobs/${String(j.id)}`);
       const body = job
         ? job
-        : url.startsWith("/api/programs")
+        : url.startsWith("/api/applications")
           ? { items: [], next_cursor: null }
           : url.startsWith("/api/jobs?") || url.endsWith("/events")
             ? { items: url.endsWith("/events") ? [] : jobs, next_cursor: null }
@@ -320,7 +320,7 @@ function renderJob(id: string) {
   );
 }
 
-it("names each job's subject, links to it and its program, and states the outcome", async () => {
+it("names each job's subject, links to it and its application, and states the outcome", async () => {
   serveJobs([triage]);
   render(
     <MemoryRouter initialEntries={["/jobs"]}>
@@ -339,7 +339,7 @@ it("names each job's subject, links to it and its program, and states the outcom
   ).toHaveAttribute("href", "/commits/commit-1");
   expect(
     within(row).getByRole("link", { name: "Customer portal" }),
-  ).toHaveAttribute("href", "/programs/program-1");
+  ).toHaveAttribute("href", "/applications/application-1");
   expect(
     within(row).getByText("Flagged as a security candidate"),
   ).toBeInTheDocument();
@@ -356,7 +356,7 @@ it("explains a failure with its code, remedy, and where to fix it", async () => 
         type: "version",
         label: "example/portal",
         ref: null,
-        link: "/programs/program-1?tab=version",
+        link: "/applications/application-1?tab=version",
       },
       status: "failed",
       result: null,
@@ -379,18 +379,18 @@ it("explains a failure with its code, remedy, and where to fix it", async () => 
     "Version recipe failed: Complete a source check before generating grounded evidence.",
   );
   expect(outcome).toHaveTextContent(
-    "Run a source check for this program first, then retry this job.",
+    "Run a source check for this application first, then retry this job.",
   );
   expect(
     within(outcome).getByText("Error code source_not_checked"),
   ).toBeInTheDocument();
   expect(
-    within(outcome).getByRole("link", { name: "Open program" }),
-  ).toHaveAttribute("href", "/programs/program-1");
-  expect(screen.queryByText("Program details")).not.toBeInTheDocument();
+    within(outcome).getByRole("link", { name: "Open application" }),
+  ).toHaveAttribute("href", "/applications/application-1");
+  expect(screen.queryByText("Application details")).not.toBeInTheDocument();
   expect(
     screen.getAllByRole("link", { name: "Customer portal" })[0],
-  ).toHaveAttribute("href", "/programs/program-1");
+  ).toHaveAttribute("href", "/applications/application-1");
 });
 
 it("summarizes what a successful job produced", async () => {
@@ -403,7 +403,7 @@ it("summarizes what a successful job produced", async () => {
         type: "source",
         label: "example/portal",
         ref: null,
-        link: "/programs/program-1?tab=commits",
+        link: "/applications/application-1?tab=repositories",
       },
       result: { imported: 87, baseline: false, source_ref: "f".repeat(40) },
     },
@@ -418,6 +418,38 @@ it("summarizes what a successful job produced", async () => {
   ).toBeInTheDocument();
   expect(within(outcome).getByText("Took 3 min")).toBeInTheDocument();
   expect(
-    screen.getAllByRole("link", { name: /Open source history/ })[0],
-  ).toHaveAttribute("href", "/programs/program-1?tab=commits");
+    screen.getAllByRole("link", { name: /Open repositories/ })[0],
+  ).toHaveAttribute("href", "/applications/application-1?tab=repositories");
+});
+
+it("summarizes an Upstream derivation", async () => {
+  serveJobs([
+    {
+      ...triage,
+      id: "job-derive",
+      kind: "derive_upstreams",
+      subject: {
+        type: "source",
+        label: "example/portal",
+        ref: null,
+        link: "/applications/application-1?tab=repositories",
+      },
+      result: {
+        source_ref: "f".repeat(40),
+        repositories: 3,
+        added: ["https://github.com/facebook/react"],
+        removed: [],
+        unresolved: 2,
+      },
+    },
+  ]);
+  renderJob("job-derive");
+  const outcome = await screen.findByRole("region", { name: "Job outcome" });
+  expect(outcome).toHaveTextContent(
+    "Derive upstreams succeeded: Found 3 Upstream repositories",
+  );
+  expect(within(outcome).getByText("1 added")).toBeInTheDocument();
+  expect(
+    within(outcome).getByText("2 unresolved packages"),
+  ).toBeInTheDocument();
 });

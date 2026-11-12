@@ -7,10 +7,10 @@ import {
   accountsSchema,
   operationNames,
   operations,
-  programSchema,
+  applicationSchema,
   settingsSchema,
 } from "../types";
-import type { Profile, Program } from "../types";
+import type { Profile, Application } from "../types";
 import {
   ProfileSelect,
   emptyProfile,
@@ -19,15 +19,17 @@ import {
 import {
   DataState,
   ErrorNote,
+  IntervalInput,
   PageHeading,
   Panel,
+  formatInterval,
   notify,
 } from "../components/ui";
-export function ProgramForm() {
+export function ApplicationForm() {
   const { id } = useParams();
   const settings = useResource("/settings", settingsSchema);
   return id ? (
-    <EditProgram id={id} />
+    <EditApplication id={id} />
   ) : (
     <DataState
       loading={settings.loading}
@@ -35,15 +37,17 @@ export function ProgramForm() {
       retry={settings.refresh}
     >
       {settings.data && (
-        <ProgramEditor defaultDays={settings.data.monitor_interval_days} />
+        <ApplicationEditor
+          defaultSeconds={settings.data.monitor_interval_seconds}
+        />
       )}
     </DataState>
   );
 }
-function EditProgram({ id }: { id: string }) {
+function EditApplication({ id }: { id: string }) {
   const resource = useResource(
-    `/programs/${encodeURIComponent(id)}`,
-    programSchema,
+    `/applications/${encodeURIComponent(id)}`,
+    applicationSchema,
   );
   return (
     <DataState
@@ -52,61 +56,61 @@ function EditProgram({ id }: { id: string }) {
       retry={resource.refresh}
     >
       {resource.data && (
-        <ProgramEditor
+        <ApplicationEditor
           key={resource.data.id}
-          program={resource.data}
-          defaultDays={null}
+          application={resource.data}
+          defaultSeconds={null}
         />
       )}
     </DataState>
   );
 }
-function ProgramEditor({
-  program,
-  defaultDays,
+function ApplicationEditor({
+  application,
+  defaultSeconds,
 }: {
-  program?: Program;
-  defaultDays: number | null;
+  application?: Application;
+  defaultSeconds: number | null;
 }) {
   const navigate = useNavigate();
   const accounts = useResource("/accounts", accountsSchema);
   const settings = useResource("/settings", settingsSchema);
-  const [name, setName] = useState(program?.asset_name || "");
-  const [url, setUrl] = useState(program?.asset_url || "");
-  const [kind, setKind] = useState(program?.product_kind || "CMS");
-  const [product, setProduct] = useState(program?.product_name || "");
-  const [source, setSource] = useState(program?.source_kind || "github");
-  const [repo, setRepo] = useState(program?.source_url || "");
-  const [ref, setRef] = useState(program?.source_ref || "");
-  const [path, setPath] = useState(program?.source_path || "");
-  const [slug, setSlug] = useState(program?.plugin_slug || "");
+  const [name, setName] = useState(application?.asset_name || "");
+  const [url, setUrl] = useState(application?.asset_url || "");
+  const [kind, setKind] = useState(application?.product_kind || "CMS");
+  const [product, setProduct] = useState(application?.product_name || "");
   const [inherit, setInherit] = useState(
-    program
-      ? program.config.monitor_interval_inherited === true ||
-          program.monitor_interval_days === null
+    application
+      ? application.config.monitor_interval_inherited === true ||
+          application.monitor_interval_seconds === null
       : true,
   );
-  const [days, setDays] = useState(
-    String(program?.monitor_interval_days || defaultDays || ""),
+  const [seconds, setSeconds] = useState(
+    application?.monitor_interval_seconds || defaultSeconds || null,
   );
-  const [enabled, setEnabled] = useState(program?.monitor_enabled ?? true);
+  const globalSeconds = settings.data?.monitor_interval_seconds ?? null;
+  const [enabled, setEnabled] = useState(application?.monitor_enabled ?? true);
   const [triage, setTriage] = useState(
-    program?.config.triage_mode || "disabled",
+    application?.config.triage_mode || "disabled",
   );
   const [profiles, setProfiles] = useState<Record<string, Profile>>(
-    program?.config.profiles || {},
+    application?.config.profiles || {},
   );
   const [minScore, setMinScore] = useState(
-    String(program?.config.cve_min_score ?? ""),
+    String(application?.config.cve_min_score ?? ""),
   );
-  const [versions, setVersions] = useState(program?.config.cve_versions || []);
-  const [auto, setAuto] = useState(program?.config.cve_auto_analyze || false);
+  const [versions, setVersions] = useState(
+    application?.config.cve_versions || [],
+  );
+  const [auto, setAuto] = useState(
+    application?.config.cve_auto_analyze || false,
+  );
   const [auditRefresh, setAuditRefresh] = useState(
-    program?.config.audit_auto_refresh || false,
+    application?.config.audit_auto_refresh || false,
   );
   const [selectors, setSelectors] = useState(() =>
-    Array.isArray(program?.config.cve_selectors)
-      ? program.config.cve_selectors
+    Array.isArray(application?.config.cve_selectors)
+      ? application.config.cve_selectors
           .map((s) =>
             typeof s === "object" && s && "value" in s ? String(s.value) : "",
           )
@@ -117,24 +121,26 @@ function ProgramEditor({
   const [error, setError] = useState<string>();
   const [fields, setFields] = useState<Record<string, unknown>>({});
   const [scheme, setScheme] = useState<string>(
-    typeof program?.config.version_scheme === "string"
-      ? program.config.version_scheme
+    typeof application?.config.version_scheme === "string"
+      ? application.config.version_scheme
       : "unknown",
   );
   const [versionEnabled, setVersionEnabled] = useState(
-    program?.config.version_monitor_enabled !== false,
+    application?.config.version_monitor_enabled !== false,
   );
   const [origins, setOrigins] = useState(
-    Array.isArray(program?.config.asset_origins)
-      ? program.config.asset_origins.join("\n")
+    Array.isArray(application?.config.asset_origins)
+      ? application.config.asset_origins.join("\n")
       : "",
   );
   const [jev, setJev] = useState(
-    typeof program?.config.jev_connection_id === "string"
-      ? program.config.jev_connection_id
+    typeof application?.config.jev_connection_id === "string"
+      ? application.config.jev_connection_id
       : "",
   );
-  const [jevModel, setJevModel] = useState(program?.config.jev_model_id || "");
+  const [jevModel, setJevModel] = useState(
+    application?.config.jev_model_id || "",
+  );
   const jevModels =
     accounts.data?.items.find((a) => a.id === jev)?.models || [];
   const cveProfile =
@@ -165,22 +171,22 @@ function ProgramEditor({
     <>
       <PageHeading
         back={{
-          to: program ? `/programs/${program.id}` : "/programs",
-          label: program ? "Back to program" : "All programs",
+          to: application ? `/applications/${application.id}` : "/applications",
+          label: application ? "Back to application" : "All applications",
         }}
-        eyebrow={program ? "Program configuration" : "Asset inventory"}
-        title={program ? "Edit program" : "Insert program"}
+        eyebrow={application ? "Application configuration" : "Asset inventory"}
+        title={application ? "Edit application" : "Insert application"}
         description="Define the deployed asset, its upstream software, and the evidence you want to collect."
       />
       <form
-        className="program-form"
+        className="application-form"
         onSubmit={async (e) => {
           e.preventDefault();
           setBusy(true);
           setError(undefined);
           setFields({});
           const config = {
-            ...program?.config,
+            ...application?.config,
             triage_mode: triage,
             profiles,
             cve_selectors: selectors
@@ -206,32 +212,29 @@ function ProgramEditor({
           };
           try {
             const saved = await mutate(
-              program ? `/programs/${program.id}` : "/programs",
-              programSchema,
+              application ? `/applications/${application.id}` : "/applications",
+              applicationSchema,
               {
                 asset_name: name,
                 asset_url: url,
                 product_kind: kind,
                 product_name: product,
-                source_kind: source,
-                source_url: source === "github" ? repo : null,
-                source_ref: ref || null,
-                source_path: path || null,
-                plugin_slug: source === "wordpress" ? slug : null,
-                monitor_interval_days: inherit ? null : Number(days),
+                monitor_interval_seconds: inherit ? null : seconds,
                 monitor_enabled: enabled,
-                archived: program?.archived || false,
+                archived: application?.archived || false,
                 config,
               },
-              program ? "PATCH" : "POST",
+              application ? "PATCH" : "POST",
             );
-            notify(program ? "Program updated." : "Program created.");
-            navigate(`/programs/${saved.id}`);
+            notify(
+              application ? "Application updated." : "Application created.",
+            );
+            navigate(`/applications/${saved.id}`);
           } catch (err) {
             setError(
               err instanceof Error
                 ? err.message
-                : "Unable to save the program.",
+                : "Unable to save the application.",
             );
             if (err instanceof ApiError) setFields(err.fields);
           } finally {
@@ -241,11 +244,11 @@ function ProgramEditor({
       >
         <Panel
           title="Asset & software"
-          description="One program represents one deployed asset / software pair."
+          description="One application represents one deployed asset / software pair."
         >
           <div className="form-grid">
             <label>
-              Asset name
+              Name
               <input
                 required
                 maxLength={200}
@@ -296,101 +299,22 @@ function ProgramEditor({
           </div>
         </Panel>
         <Panel
-          title="Upstream source"
-          description="Choose the source history to monitor. WordPress sources do not require a GitHub repository."
-        >
-          <div className="form-grid">
-            <label>
-              Source type
-              <select
-                value={source}
-                onChange={(e) => {
-                  if (
-                    e.target.value === "github" ||
-                    e.target.value === "wordpress"
-                  )
-                    setSource(e.target.value);
-                }}
-              >
-                <option value="github">GitHub repository</option>
-                <option value="wordpress">
-                  WordPress plugin release history
-                </option>
-              </select>
-            </label>
-            {source === "github" ? (
-              <label>
-                GitHub repository
-                <input
-                  required
-                  type="url"
-                  value={repo}
-                  onChange={(e) => setRepo(e.target.value)}
-                  placeholder="https://github.com/owner/repository"
-                />
-                {fieldError("source_url")}
-              </label>
-            ) : (
-              <label>
-                WordPress plugin slug
-                <input
-                  required
-                  pattern="[a-z0-9][a-z0-9-]*"
-                  value={slug}
-                  onChange={(e) => setSlug(e.target.value)}
-                  placeholder="plugin-slug"
-                />
-                {fieldError("plugin_slug")}
-              </label>
-            )}
-            <label>
-              {source === "github" ? "Branch / ref" : "SVN subtree"}
-              <input
-                value={ref}
-                onChange={(e) => setRef(e.target.value)}
-                placeholder={source === "github" ? "Default branch" : "trunk"}
-              />
-            </label>
-            <label>
-              Source path (optional)
-              <input
-                value={path}
-                onChange={(e) => setPath(e.target.value)}
-                placeholder="src/"
-              />
-              {fieldError("source_path")}
-            </label>
-            {source === "wordpress" && (
-              <p className="hint full">
-                Release source: https://plugins.svn.wordpress.org/
-                {slug || "{plugin-slug}"}/{ref || "trunk"}
-              </p>
-            )}
-          </div>
-        </Panel>
-        <Panel
           title="Monitoring"
-          description="The interval is elapsed whole days. Manual checks remain available when paused."
+          description="Check every 5 minutes or longer, in minutes, hours or days. Manual checks remain available when paused."
         >
           <div className="form-grid">
             <div className="field-stack">
               <label>
-                Check interval in days
-                <input
-                  type="number"
-                  required={!inherit}
+                Check interval
+                <IntervalInput
+                  key={inherit ? `global-${globalSeconds}` : "own"}
+                  label="Check interval"
+                  value={inherit ? globalSeconds : seconds}
+                  onChange={setSeconds}
                   disabled={inherit}
-                  min={1}
-                  max={3650}
-                  step={1}
-                  value={
-                    inherit
-                      ? String(settings.data?.monitor_interval_days ?? "")
-                      : days
-                  }
-                  onChange={(e) => setDays(e.target.value)}
+                  invalid={!!fields.monitor_interval_seconds}
                 />
-                {fieldError("monitor_interval_days")}
+                {fieldError("monitor_interval_seconds")}
               </label>
               <label className="check-label">
                 <input
@@ -399,7 +323,7 @@ function ProgramEditor({
                   onChange={(e) => setInherit(e.target.checked)}
                 />
                 Use the global default (
-                {settings.data?.monitor_interval_days ?? "not configured"} days)
+                {globalSeconds ? formatInterval(globalSeconds) : "not configured"})
               </label>
             </div>
             <div className="field-stack">
@@ -410,7 +334,7 @@ function ProgramEditor({
                   checked={enabled}
                   onChange={(e) => setEnabled(e.target.checked)}
                 />
-                Check this program on its interval
+                Check this application on its interval
               </label>
               <span className="hint">
                 When paused, manual checks remain available.
@@ -448,7 +372,7 @@ function ProgramEditor({
               !triageConfigured && (
                 <p className="hint warning full">
                   The selected triage runtime needs a matching ready Commit
-                  triage profile. Configure a program override below or the
+                  triage profile. Configure an application override below or the
                   global default.
                 </p>
               )}
@@ -501,7 +425,7 @@ function ProgramEditor({
         </Panel>
         <Panel
           title="Version determination"
-          description="Generate and inspect reusable recipes from the program’s Version tab after saving."
+          description="Generate and inspect reusable recipes from the application’s Version tab after saving."
         >
           <div className="form-grid">
             <label>
@@ -639,7 +563,7 @@ function ProgramEditor({
                     })
                   }
                 />
-                Override this operation for this program
+                Override this operation for this application
               </label>
               {profiles[operation] && (
                 <ProfileSelect
@@ -677,13 +601,15 @@ function ProgramEditor({
           </span>
           <Link
             className="secondary button"
-            to={program ? `/programs/${program.id}` : "/programs"}
+            to={
+              application ? `/applications/${application.id}` : "/applications"
+            }
           >
             Cancel
           </Link>
           <button className="primary" disabled={busy}>
             <Save size={16} />
-            {busy ? "Saving…" : "Save program"}
+            {busy ? "Saving…" : "Save application"}
           </button>
         </div>
       </form>

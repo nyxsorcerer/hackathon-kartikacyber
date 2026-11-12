@@ -31,9 +31,9 @@ import type { Session } from "./types";
 import { useResource, useShortcut } from "./hooks";
 import { isMac, QuickJump } from "./components/QuickJump";
 import { Dashboard } from "./pages/Dashboard";
-import { Programs } from "./pages/Programs";
-import { ProgramForm } from "./pages/ProgramForm";
-import { ProgramDetail } from "./pages/ProgramDetail";
+import { Applications } from "./pages/Applications";
+import { ApplicationForm } from "./pages/ApplicationForm";
+import { ApplicationDetail } from "./pages/ApplicationDetail";
 import { CommitDetail, Reviews } from "./pages/Commits";
 import { CVEs } from "./pages/CVEs";
 import { FindingDetail, FindingForm, Findings } from "./pages/Findings";
@@ -42,7 +42,7 @@ import { Settings } from "./pages/Settings";
 import { ActionButton, Empty, ErrorNote, Kbd } from "./components/ui";
 const navigation = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
-  { to: "/programs", label: "Programs", icon: Radar },
+  { to: "/applications", label: "Applications", icon: Radar },
   { to: "/reviews", label: "Commit review", icon: GitCommitHorizontal },
   { to: "/cves", label: "CVEs", icon: ShieldAlert },
   { to: "/findings", label: "Findings", icon: Target },
@@ -227,14 +227,14 @@ function SetupNotice() {
     window.addEventListener("numen:settings-updated", listener);
     return () => window.removeEventListener("numen:settings-updated", listener);
   }, [settings.refresh]);
-  if (!settings.data || settings.data.monitor_interval_days) return null;
+  if (!settings.data || settings.data.monitor_interval_seconds) return null;
   return (
     <div className="setup-notice">
       <KeyRound size={16} aria-hidden="true" />
       <span>
         <strong>Finish initial setup.</strong> Define a monitoring interval and
-        connect an agent account when you need one. Programs can be saved in the
-        meantime.
+        connect an agent account when you need one. Applications can be saved in
+        the meantime.
       </span>
       <Link className="secondary button" to="/settings?tab=defaults">
         Configure defaults
@@ -445,10 +445,13 @@ function Shell({
           <SetupNotice />
           <Routes>
             <Route path="/" element={<Dashboard />} />
-            <Route path="/programs" element={<Programs />} />
-            <Route path="/programs/new" element={<ProgramForm />} />
-            <Route path="/programs/:id/edit" element={<ProgramForm />} />
-            <Route path="/programs/:id" element={<ProgramDetail />} />
+            <Route path="/applications" element={<Applications />} />
+            <Route path="/applications/new" element={<ApplicationForm />} />
+            <Route
+              path="/applications/:id/edit"
+              element={<ApplicationForm />}
+            />
+            <Route path="/applications/:id" element={<ApplicationDetail />} />
             <Route path="/reviews" element={<Reviews />} />
             <Route path="/commits/:id" element={<CommitDetail />} />
             <Route path="/cves" element={<CVEs />} />

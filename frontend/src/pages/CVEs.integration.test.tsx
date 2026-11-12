@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { CVEList } from "./CVEs";
-import type { CVE, Program } from "../types";
+import type { CVE, Application } from "../types";
 
 const scrollTo = HTMLElement.prototype.scrollTo;
 beforeEach(() => {
@@ -19,22 +19,20 @@ const profile = {
   model_id: "fixture-model",
   reasoning_effort: "high",
 };
-const program: Program = {
-  id: "program",
+const application: Application = {
+  id: "application",
   asset_name: "Customer portal",
   asset_url: "https://example.test",
   product_kind: "cms",
   product_name: "Example CMS",
-  source_kind: "github",
-  source_url: "https://github.com/example/cms",
-  source_ref: "main",
-  monitor_interval_days: 7,
+  monitor_interval_seconds: 604800,
   monitor_enabled: true,
   archived: false,
   source_generation: 1,
   last_check_at: null,
   next_check_at: null,
-  last_error: null,
+  repositories: [],
+  unresolved_dependencies: [],
   version: null,
   config: {
     profiles: {},
@@ -48,7 +46,7 @@ const program: Program = {
 };
 const cve: CVE = {
   id: "CVE-2026-12345",
-  program_id: "program",
+  application_id: "application",
   title: "Stored XSS in account settings",
   description: "A stored value executes in the administrator's browser.",
   scores: [
@@ -149,8 +147,8 @@ function setup(url: string, record = cve) {
           }),
         );
       const body =
-        url === "/api/programs/program"
-          ? program
+        url === "/api/applications/application"
+          ? application
           : url === "/api/accounts"
             ? {
                 items: [
@@ -176,12 +174,12 @@ function setup(url: string, record = cve) {
               }
             : url === "/api/settings"
               ? {
-                  monitor_interval_days: 7,
+                  monitor_interval_seconds: 604800,
                   default_profiles: { cve_analysis: profile },
                   webhook_enabled: false,
                   webhook_configured: false,
                 }
-              : { items: [program], next_cursor: null };
+              : { items: [application], next_cursor: null };
       return new Response(JSON.stringify(body));
     }),
   );
@@ -201,7 +199,7 @@ function setup(url: string, record = cve) {
 }
 
 it("opens saved analysis links, switches runs, and downloads the selected run's immutable output", async () => {
-  setup("/cves?cve=CVE-2026-12345&cvep=program&view=analysis");
+  setup("/cves?cve=CVE-2026-12345&cve_application=application&view=analysis");
   expect(
     await screen.findByRole("heading", { name: "Latest report" }),
   ).toBeInTheDocument();
@@ -248,7 +246,9 @@ it("opens saved analysis links, switches runs, and downloads the selected run's 
 });
 
 it("returns to CVE details on cancel and submits the selected profile and vulnerable revision", async () => {
-  const submissions = setup("/cves?cve=CVE-2026-12345&cvep=program");
+  const submissions = setup(
+    "/cves?cve=CVE-2026-12345&cve_application=application",
+  );
   const user = userEvent.setup();
   await user.click(screen.getByRole("button", { name: "Analyze CVE" }));
   await user.click(await screen.findByRole("button", { name: "Cancel" }));
@@ -267,7 +267,7 @@ it("returns to CVE details on cancel and submits the selected profile and vulner
 });
 
 it("keeps ineligible records inspectable and explains their analysis gate", () => {
-  setup("/cves?cve=CVE-2026-12345&cvep=program&act=analyze", {
+  setup("/cves?cve=CVE-2026-12345&cve_application=application&act=analyze", {
     ...cve,
     eligible: false,
     qualifying_score: null,
@@ -283,7 +283,7 @@ it("keeps ineligible records inspectable and explains their analysis gate", () =
 });
 
 it("opens existing CVE notification links and clears their selection when closed", async () => {
-  setup("/cves?program_id=program&cve_id=CVE-2026-12345");
+  setup("/cves?application_id=application&cve_id=CVE-2026-12345");
   const dialog = screen.getByRole("dialog", { name: "CVE-2026-12345" });
   await userEvent
     .setup()

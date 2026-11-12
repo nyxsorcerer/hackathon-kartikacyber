@@ -2,6 +2,7 @@ import json
 from urllib.parse import quote
 from datetime import timedelta
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from . import artifacts, cves
 from .models import (
@@ -9,6 +10,7 @@ from .models import (
     Action,
     Analysis,
     Artifact,
+    AuditContext,
     CVE,
     Commit,
     Finding,
@@ -18,14 +20,17 @@ from .models import (
     Notification,
     Observation,
     Plugin,
-    Program,
-    ProgramCVE,
+    Application,
+    ApplicationCVE,
+    ApplicationRepository,
+    Repository,
     Setting,
     now,
     utc,
 )
 from .schemas import AUDIT_MAX_FUNCTIONS, OPERATIONS, Profile
 from .security import DomainError, fingerprint
+from .sources import github_token_required
 
 
 # Native subscription logins run in exactly one runtime per provider.
@@ -56,7 +61,7 @@ def settings(db, config=None):
         row = Setting(
             id="global",
             data={
-                "monitor_interval_days": config.monitor_interval_days if config else None,
+                "monitor_interval_seconds": config.monitor_interval_seconds if config else None,
                 "default_profiles": {},
                 "webhook_enabled": False,
                 "dashboard_url": "",
@@ -152,10 +157,10 @@ def require_provider_plugin(db, provider):
         )
 
 
-def resolve_profile(db, program, operation, submitted=None):
+def resolve_profile(db, application, operation, submitted=None):
     if operation not in OPERATIONS:
         raise DomainError("unknown_operation", "Unknown agent operation", 422)
-    saved = program.config.get("profiles", {}).get(operation) if program else None
+    saved = application.config.get("profiles", {}).get(operation) if application else None
     value = submitted or saved or settings(db).data.get("default_profiles", {}).get(operation)
     if not value:
         raise DomainError(
@@ -218,12 +223,12 @@ def event(db, job, kind, message, **data):
     db.add(JobEvent(job_id=job.id, data={"kind": kind, "message": message, **data}))
 
 
-def enqueue(db, kind, program=None, inputs=None, profile=None, idempotency_key=None):
+def enqueue(db, kind, application=None, inputs=None, profile=None, idempotency_key=None):
     inputs = inputs or {}
     digest = fingerprint(
         {
             "kind": kind,
-            "program_id": program.id if program else None,
+            "application_id": application.id if application else None,
             "input": inputs,
             "profile": profile,
         }
@@ -240,7 +245,7 @@ def enqueue(db, kind, program=None, inputs=None, profile=None, idempotency_key=N
             return existing
     job = Job(
         kind=kind,
-        program_id=program.id if program else None,
+        application_id=application.id if application else None,
         input=inputs,
         input_hash=digest,
         profile=profile,
@@ -253,18 +258,153 @@ def enqueue(db, kind, program=None, inputs=None, profile=None, idempotency_key=N
     return job
 
 
-def job_input(program, **data):
-    return {"source_generation": program.source_generation, "source_ref": program.cursor, **data}
+def links(db, application):
+    """The Application's repository links with their repositories: the Own one first, then
+    in the order they were added. Removed links are included."""
+    return db.execute(
+        select(ApplicationRepository, Repository)
+        .join(Repository, Repository.id == ApplicationRepository.repository_id)
+        .where(ApplicationRepository.application_id == application.id)
+        .order_by(ApplicationRepository.role != "own", ApplicationRepository.created_at)
+    ).all()
 
 
-def submit_agent(db, operation, program, inputs=None, submitted=None, key=None):
-    profile = resolve_profile(db, program, operation, submitted)
-    return enqueue(db, operation, program, job_input(program, **(inputs or {})), profile, key)
+def active_repositories(db, application):
+    """The repositories the Application polls: every enabled link that is not removed."""
+    return [r for link, r in links(db, application) if link.enabled and link.removed_at is None]
 
 
-def audit_refresh_input(db, program, base):
+def source_repository(db, application):
+    """The repository Numen's per-Application operations read (version recipe, version check,
+    audit context, CVE analysis, finding artifacts): the earliest linked one that is not removed,
+    whatever its role or on/off state. Adding a repository or turning a link on or off keeps it,
+    so a migrated Application keeps its recipe and CVE cursor when it gets an Own repository."""
+    return db.scalar(
+        select(Repository)
+        .join(ApplicationRepository, ApplicationRepository.repository_id == Repository.id)
+        .where(
+            ApplicationRepository.application_id == application.id,
+            ApplicationRepository.removed_at.is_(None),
+        )
+        .order_by(ApplicationRepository.created_at, ApplicationRepository.id)
+        .limit(1)
+    )
+
+
+def required_repository(db, application):
+    repository = source_repository(db, application)
+    if repository is None:
+        raise DomainError("repository_required", "Link a repository to this Application first", 422)
+    return repository
+
+
+def linked_repository_ids(application_id):
+    """Every repository the Application links or once linked, whose commits it lists."""
+    return select(ApplicationRepository.repository_id).where(
+        ApplicationRepository.application_id == application_id
+    )
+
+
+def linked_applications(db, repository):
+    """The Applications linking `repository`, oldest link first, with their links."""
+    return db.execute(
+        select(Application, ApplicationRepository)
+        .join(ApplicationRepository, ApplicationRepository.application_id == Application.id)
+        .where(ApplicationRepository.repository_id == repository.id)
+        .order_by(ApplicationRepository.created_at)
+    ).all()
+
+
+def repository_for(db, source_url, **fields):
+    """The repository stored for `source_url`, created from `fields` when there is none. A
+    concurrent job or request that creates it first wins; this one then reads its row."""
+    query = select(Repository).where(Repository.source_url == source_url)
+    repository = db.scalar(query)
+    if repository is None:
+        try:
+            with db.begin_nested():
+                repository = Repository(source_url=source_url, **fields)
+                db.add(repository)
+        except IntegrityError:
+            repository = db.scalar(query)
+    return repository
+
+
+def in_use(application, link):
+    return not application.archived and link.enabled and link.removed_at is None
+
+
+def commit_application(db, commit):
+    """The first Application that uses the commit's repository (not archived, link on and not
+    removed), else the first that ever linked it. Until Findings are per Application, it is the
+    context for commit pages and commit analysis."""
+    rows = linked_applications(db, db.get(Repository, commit.repository_id))
+    return next((a for a, link in rows if in_use(a, link)), rows[0][0] if rows else None)
+
+
+def triage_application(db, repository):
+    """The Application whose Triage settings judge the repository's new commits: the first
+    one that uses it and has Triage on. A shared repository is triaged once."""
+    for application, link in linked_applications(db, repository):
+        if in_use(application, link) and application.config.get("triage_mode", "disabled") != "disabled":
+            return application
+    return None
+
+
+def job_input(db, application, **data):
+    repository = source_repository(db, application)
+    return {
+        "source_generation": application.source_generation,
+        "source_ref": repository.cursor if repository else None,
+        **data,
+    }
+
+
+def repository_input(repository, **data):
+    return {
+        "repository_id": repository.id,
+        "source_generation": repository.source_generation,
+        "source_ref": repository.cursor,
+        **data,
+    }
+
+
+def active_source_check(db, repository):
+    return db.scalar(
+        select(Job)
+        .where(
+            Job.kind == "source_check",
+            Job.status.in_(["queued", "running", "cancelling"]),
+            Job.input["repository_id"].as_string() == repository.id,
+        )
+        .limit(1)
+    )
+
+
+def source_changed(db, application, previous_repository_id):
+    """Starts a new source generation when the repository the Application's operations read
+    was replaced or went away: recipes, audit contexts and the CVE cursor belong to the old one."""
+    repository = source_repository(db, application)
+    if previous_repository_id is None or (repository and repository.id) == previous_repository_id:
+        return False
+    application.source_generation += 1
+    application.cve_cursor = {}
+    application.config = {**application.config, "active_recipe_id": None}
+    for context in db.scalars(select(AuditContext).where(AuditContext.application_id == application.id)):
+        context.status = "stale"
+    for link in db.scalars(select(ApplicationCVE).where(ApplicationCVE.application_id == application.id)):
+        refresh_cve_policy(db, application, db.get(CVE, link.cve_id), link)
+    return True
+
+
+def submit_agent(db, operation, application, inputs=None, submitted=None, key=None):
+    profile = resolve_profile(db, application, operation, submitted)
+    return enqueue(db, operation, application, job_input(db, application, **(inputs or {})), profile, key)
+
+
+def audit_refresh_input(db, application, base):
     """Job input that refreshes `base` for the current source revision, keeping its scope."""
-    if base.source_generation != program.source_generation:
+    if base.source_generation != application.source_generation:
         raise DomainError(
             "refresh_unavailable",
             "That audit context belongs to an earlier source generation; build a fresh context",
@@ -274,7 +414,8 @@ def audit_refresh_input(db, program, base):
         raise DomainError(
             "refresh_unavailable", "That audit context has no analysed functions to reuse", 409
         )
-    if base.source_ref == program.cursor:
+    repository = source_repository(db, application)
+    if base.source_ref == (repository.cursor if repository else None):
         raise DomainError(
             "context_current", "That audit context is already built at the current source revision", 409
         )
@@ -287,19 +428,19 @@ def audit_refresh_input(db, program, base):
     }
 
 
-def queue_cve(db, program, cve, link, submitted=None, key=None, source_ref=None):
-    decision = cves.gate(program, cve, link)
+def queue_cve(db, application, cve, link, submitted=None, key=None, source_ref=None):
+    decision = cves.gate(application, cve, link)
     if not decision["eligible"]:
         raise DomainError("criteria_not_met", decision["eligibility_reason"], 422)
     return submit_agent(
         db,
         "cve_analysis",
-        program,
+        application,
         {
             "cve_id": cve.id,
             # None resolves the newest still-affected release when the job runs.
             "source_ref": source_ref,
-            "gate_hash": cves.gate_hash(program, cve, link),
+            "gate_hash": cves.gate_hash(application, cve, link),
             "record_hash": cve.record_hash,
             "source_record": cve.raw,
             "eligibility": decision,
@@ -309,42 +450,43 @@ def queue_cve(db, program, cve, link, submitted=None, key=None, source_ref=None)
     )
 
 
-def refresh_cve_policy(db, program, cve, link):
-    decision = cves.gate(program, cve, link)
-    relevant_hash = cves.gate_hash(program, cve, link)
+def refresh_cve_policy(db, application, cve, link):
+    decision = cves.gate(application, cve, link)
+    relevant_hash = cves.gate_hash(application, cve, link)
     if decision["eligible"] and link.data.get("notified_hash") != relevant_hash:
         notify(
             db,
-            f"cve:{program.id}:{cve.id}:{relevant_hash}",
+            f"cve:{application.id}:{cve.id}:{relevant_hash}",
             cve.id + " — " + cve.data["title"],
-            f"/cves?program_id={program.id}&cve_id={cve.id}",
+            f"/cves?application_id={application.id}&cve_id={cve.id}",
             "Eligible Base score " + str(decision["qualifying_score"]["base_score"]),
         )
         link.data = {**link.data, "notified_hash": relevant_hash}
-    if decision["eligible"] and program.config.get("cve_auto_analyze") and not program.archived:
-        key = f"cve-analysis:{program.id}:{cve.id}:{relevant_hash}"
+    if decision["eligible"] and application.config.get("cve_auto_analyze") and not application.archived:
+        key = f"cve-analysis:{application.id}:{cve.id}:{relevant_hash}"
         if not db.scalar(select(Job).where(Job.idempotency_key == key)):
             try:
-                if not program.cursor:
+                repository = source_repository(db, application)
+                if not repository or not repository.cursor:
                     # Held until a baseline source check, which dispatches it.
                     raise DomainError(
                         "source_not_checked",
                         "Complete a source check before generating grounded evidence",
                         422,
                     )
-                queue_cve(db, program, cve, link, key=key)
+                queue_cve(db, application, cve, link, key=key)
                 link.data = {**link.data, "analysis_blocked": None}
             except DomainError as exc:
                 link.data = {**link.data, "analysis_blocked": exc.as_dict()}
 
 
-def last_observation(db, program, success_only=False):
+def last_observation(db, application, success_only=False):
     rows = list(
         db.scalars(
             select(Observation)
             .where(
-                Observation.program_id == program.id,
-                Observation.source_generation == program.source_generation,
+                Observation.application_id == application.id,
+                Observation.source_generation == application.source_generation,
             )
             .order_by(Observation.checked_at.desc())
         )
@@ -360,37 +502,69 @@ def observation_json(row):
     return {
         **row.data,
         "id": row.id,
-        "program_id": row.program_id,
+        "application_id": row.application_id,
         "recipe_id": row.recipe_id,
         "source_generation": row.source_generation,
         "checked_at": utc(row.checked_at),
     }
 
 
-def program_json(db, row):
+def release_branch_status(link, repository):
+    """None where no Release branch applies; pending until the next check resolves the Locked
+    version; unknown ('release branch unknown') when no candidate branch exists."""
+    if link.role == "own" or repository.source_kind != "github" or not link.locked_version:
+        return None
+    if link.release_branch_version != link.locked_version:
+        return "pending"
+    return "matched" if link.release_branch else "unknown"
+
+
+def link_json(link, repository):
+    return {
+        "repository_id": repository.id,
+        "role": link.role,
+        "enabled": link.enabled,
+        "removed_at": utc(link.removed_at),
+        "locked_version": link.locked_version,
+        "locked_version_source": link.locked_version_source,
+        "release_branch": link.release_branch,
+        "release_branch_status": release_branch_status(link, repository),
+        "packages": link.packages,
+        "source_kind": repository.source_kind,
+        "source_url": repository.source_url,
+        "plugin_slug": repository.plugin_slug,
+        "source_ref": repository.source_ref,
+        "source_path": repository.source_path,
+        "cursor": repository.cursor,
+        "baseline_revision": repository.baseline_revision,
+        "last_check_at": utc(repository.last_check_at),
+        "last_error": repository.last_error,
+    }
+
+
+def application_json(db, row):
     columns = (
         "id",
         "asset_name",
         "asset_url",
         "product_kind",
         "product_name",
-        "source_kind",
-        "source_url",
-        "source_ref",
-        "source_path",
-        "plugin_slug",
-        "monitor_interval_days",
+        "monitor_interval_seconds",
         "monitor_enabled",
         "archived",
         "source_generation",
         "last_check_at",
         "next_check_at",
-        "last_error",
         "config",
     )
     result = {name: getattr(row, name) for name in columns}
     for name in ("last_check_at", "next_check_at"):
         result[name] = utc(result[name])
+    rows = links(db, row)
+    result["repositories"] = [link_json(link, repository) for link, repository in rows]
+    result["unresolved_dependencies"] = next(
+        (link.unresolved for link, _ in rows if link.role == "own" and link.removed_at is None), []
+    )
     result["version"] = (
         observation_json(last_observation(db, row, True))
         if last_observation(db, row, True)
@@ -425,18 +599,18 @@ def analysis_json(db, row, with_artifacts=True):
     superseded = False
     if row.kind == "cve_analysis":
         cve = db.get(CVE, row.subject_id)
-        program = db.get(Program, row.program_id)
+        application = db.get(Application, row.application_id)
         link = db.scalar(
-            select(ProgramCVE).where(
-                ProgramCVE.program_id == row.program_id, ProgramCVE.cve_id == row.subject_id
+            select(ApplicationCVE).where(
+                ApplicationCVE.application_id == row.application_id, ApplicationCVE.cve_id == row.subject_id
             )
         )
-        if cve and program and link:
-            superseded = cves.analysis_superseded(program, cve, link, row.result.get("gate_hash"))
+        if cve and application and link:
+            superseded = cves.analysis_superseded(application, cve, link, row.result.get("gate_hash"))
     result = {
         "superseded": superseded,
         "id": row.id,
-        "program_id": row.program_id,
+        "application_id": row.application_id,
         "kind": row.kind,
         "subject_id": row.subject_id,
         "job_id": row.job_id,
@@ -477,9 +651,11 @@ def commit_json(db, row, findings=None):
             .order_by(Analysis.created_at.desc())
         )
     )
+    application = commit_application(db, row)
     return {
         "id": row.id,
-        "program_id": row.program_id,
+        "repository_id": row.repository_id,
+        "application_id": application.id if application else None,
         "revision": row.revision,
         "source_generation": row.source_generation,
         **row.data,
@@ -492,27 +668,29 @@ def commit_json(db, row, findings=None):
 
 
 def cve_json(db, cve, link):
-    program = get(db, Program, link.program_id)
+    application = get(db, Application, link.application_id)
     analyses = list(
         db.scalars(
             select(Analysis)
             .where(
                 Analysis.kind == "cve_analysis",
                 Analysis.subject_id == cve.id,
-                Analysis.program_id == program.id,
+                Analysis.application_id == application.id,
             )
             .order_by(Analysis.created_at.desc())
         )
     )
     return {
         "id": cve.id,
-        "program_id": program.id,
+        "application_id": application.id,
         **cve.data,
-        **cves.gate(program, cve, link),
-        "applicability": cves.applicability(program, cve, last_observation(db, program)),
+        **cves.gate(application, cve, link),
+        "applicability": cves.applicability(
+            application, source_repository(db, application), cve, last_observation(db, application)
+        ),
         "analyses": [analysis_json(db, a) for a in analyses],
         "analysis_blocked": link.data.get("analysis_blocked")
-        if program.config.get("cve_auto_analyze")
+        if application.config.get("cve_auto_analyze")
         else None,
     }
 
@@ -569,7 +747,7 @@ def finding_summaries(db, rows, root):
     return [
         {
             "id": row.id,
-            "program_id": row.program_id,
+            "application_id": row.application_id,
             "kind": row.kind,
             "cve_id": row.cve_id,
             "title": row.title,
@@ -606,7 +784,7 @@ def finding_json(db, row, root):
     )
     return {
         "id": row.id,
-        "program_id": row.program_id,
+        "application_id": row.application_id,
         "kind": row.kind,
         "cve_id": row.cve_id,
         "title": row.title,
@@ -632,22 +810,24 @@ def finding_json(db, row, root):
     }
 
 
-def source_label(program):
-    if program.source_kind == "wordpress":
-        return f"WordPress · {program.plugin_slug}"
-    return (program.source_url or program.asset_name).removeprefix("https://github.com/")
+def repository_label(repository):
+    if repository.source_kind == "wordpress":
+        return f"WordPress · {repository.plugin_slug}"
+    return repository.source_url.removeprefix("https://github.com/")
 
 
-# Program-level operations act on one part of the program; link to its tab.
-PROGRAM_SUBJECTS = {
-    "source_check": ("source", "commits"),
+# Application-level operations act on one part of the Application; link to its tab.
+APPLICATION_SUBJECTS = {
+    "source_check": ("source", "repositories"),
+    "backfill": ("source", "repositories"),
+    "derive_upstreams": ("source", "repositories"),
     "version_recipe": ("version", "version"),
     "version_check": ("version", "version"),
     "audit_context": ("audit", "audit"),
 }
 
 
-def job_subject(db, row, program):
+def job_subject(db, row, application):
     """What a job acts on, as a readable label, short reference, and dashboard link."""
     data = row.input if isinstance(row.input, dict) else {}
     ref = data.get("source_ref")
@@ -666,8 +846,8 @@ def job_subject(db, row, program):
     if data.get("cve_id"):
         cve = db.get(CVE, data["cve_id"])
         query = f"cve={quote(data['cve_id'])}"
-        if row.program_id:
-            query += f"&cvep={quote(row.program_id)}"
+        if row.application_id:
+            query += f"&cve_application={quote(row.application_id)}"
         if row.kind == "cve_analysis":
             query += "&view=analysis"
         return {
@@ -703,34 +883,39 @@ def job_subject(db, row, program):
             "ref": None,
             "link": link if isinstance(link, str) and link.startswith("/") else None,
         }
-    if program and row.kind in PROGRAM_SUBJECTS:
-        kind, tab = PROGRAM_SUBJECTS[row.kind]
-        # A source check's input ref is where it started, not what it found.
-        pinned = isinstance(ref, str) and row.kind != "source_check"
+    if application and row.kind in APPLICATION_SUBJECTS:
+        kind, tab = APPLICATION_SUBJECTS[row.kind]
+        # A source check's or Backfill's input ref is where it started, not what it found.
+        pinned = isinstance(ref, str) and row.kind not in ("source_check", "backfill")
+        repository = (
+            db.get(Repository, data["repository_id"])
+            if data.get("repository_id")
+            else source_repository(db, application)
+        )
         return {
             "type": kind,
-            "label": source_label(program),
+            "label": repository_label(repository) if repository else application.asset_name,
             "ref": ref[:10] if pinned else None,
-            "link": f"/programs/{program.id}?tab={tab}",
+            "link": f"/applications/{application.id}?tab={tab}",
         }
-    if program and row.kind == "cve_sync":
+    if application and row.kind == "cve_sync":
         return {
             "type": "cves",
-            "label": program.product_name,
+            "label": application.product_name,
             "ref": None,
-            "link": f"/cves?prog={quote(program.id)}",
+            "link": f"/cves?application={quote(application.id)}",
         }
     return None
 
 
 def job_json(db, row, with_events=True):
-    program = db.get(Program, row.program_id) if row.program_id else None
+    application = db.get(Application, row.application_id) if row.application_id else None
     result = {
         name: getattr(row, name)
         for name in (
             "id",
             "kind",
-            "program_id",
+            "application_id",
             "status",
             "progress",
             "profile",
@@ -743,8 +928,8 @@ def job_json(db, row, with_events=True):
     }
     for name in ("created_at", "started_at", "finished_at"):
         result[name] = utc(result[name])
-    result["program_name"] = program.asset_name if program else None
-    result["subject"] = job_subject(db, row, program)
+    result["application_name"] = application.asset_name if application else None
+    result["subject"] = job_subject(db, row, application)
     result["events"] = (
         [
             {"id": e.id, "created_at": utc(e.created_at), **e.data}
@@ -780,41 +965,43 @@ def schedule(db):
     current = now()
     due = list(
         db.scalars(
-            select(Program)
+            select(Application)
             .where(
-                Program.monitor_enabled.is_(True),
-                Program.archived.is_(False),
-                (Program.next_check_at.is_(None)) | (Program.next_check_at <= current),
+                Application.monitor_enabled.is_(True),
+                Application.archived.is_(False),
+                (Application.next_check_at.is_(None)) | (Application.next_check_at <= current),
             )
             .with_for_update(skip_locked=True)
         )
     )
-    for program in due:
-        if not db.scalar(
-            select(Job).where(
-                Job.program_id == program.id,
-                Job.kind == "source_check",
-                Job.status.in_(["queued", "running", "cancelling"]),
-            )
-        ):
-            enqueue(db, "source_check", program, job_input(program))
-        program.next_check_at = current + timedelta(days=program.monitor_interval_days)
-        if program.config.get("cve_selectors"):
+    github_token = db.scalar(
+        select(Account.id).where(Account.provider == "github", Account.credential.is_not(None)).limit(1)
+    )
+    for application in due:
+        # A repository shared by several due Applications is polled once.
+        for repository in active_repositories(db, application):
+            if repository.source_kind == "github" and not github_token:
+                repository.last_error = github_token_required().as_dict()
+            elif not active_source_check(db, repository):
+                enqueue(db, "source_check", application, repository_input(repository))
+        application.last_check_at = current
+        application.next_check_at = current + timedelta(seconds=application.monitor_interval_seconds)
+        if application.config.get("cve_selectors"):
             if not db.scalar(
                 select(Job).where(
-                    Job.program_id == program.id,
+                    Job.application_id == application.id,
                     Job.kind == "cve_sync",
                     Job.status.in_(["queued", "running", "cancelling"]),
                 )
             ):
-                enqueue(db, "cve_sync", program, job_input(program))
-        if program.config.get("active_recipe_id") and program.config.get(
+                enqueue(db, "cve_sync", application, job_input(db, application))
+        if application.config.get("active_recipe_id") and application.config.get(
             "version_monitor_enabled", True
         ):
             enqueue(
                 db,
                 "version_check",
-                program,
-                job_input(program, recipe_id=program.config["active_recipe_id"]),
+                application,
+                job_input(db, application, recipe_id=application.config["active_recipe_id"]),
             )
     return len(due)

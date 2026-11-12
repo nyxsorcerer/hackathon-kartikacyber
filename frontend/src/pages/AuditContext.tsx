@@ -21,7 +21,7 @@ import type {
   Artifact,
   AuditContextRecord as Context,
   AuditCoverage,
-  Program,
+  Application,
 } from "../types";
 import { ArtifactPreview } from "../components/ArtifactPreview";
 import {
@@ -176,17 +176,17 @@ export function organizeDocs(
   return { overview, functions, supporting };
 }
 export function AuditTab({
-  program,
+  application,
   onGenerate,
   onRefresh,
 }: {
-  program: Program;
+  application: Application;
   onGenerate: () => void;
   onRefresh: (context: Context) => void;
 }) {
   const [poll, setPoll] = useState(0);
   const resource = useResource(
-    `/programs/${program.id}/audit-contexts`,
+    `/applications/${application.id}/audit-contexts`,
     auditsSchema,
     poll,
   );
@@ -246,7 +246,7 @@ export function AuditTab({
             <ContextView
               key={selected.id}
               context={selected}
-              program={program}
+              application={application}
               latest={selected === contexts[0]}
               doc={query.doc}
               onDoc={(doc) => update({ doc })}
@@ -287,7 +287,7 @@ function humanStatus(status: string) {
 }
 function ContextView({
   context,
-  program,
+  application,
   latest,
   doc,
   onDoc,
@@ -295,7 +295,7 @@ function ContextView({
   onRefresh,
 }: {
   context: Context;
-  program: Program;
+  application: Application;
   latest: boolean;
   doc: string;
   onDoc: (doc: string | null) => void;
@@ -335,7 +335,7 @@ function ContextView({
       <ContextSummary
         context={context}
         coverage={coverage}
-        program={program}
+        application={application}
         latest={latest}
         onGenerate={onGenerate}
         onRefresh={onRefresh}
@@ -406,14 +406,14 @@ function ContextView({
 function ContextSummary({
   context,
   coverage,
-  program,
+  application,
   latest,
   onGenerate,
   onRefresh,
 }: {
   context: Context;
   coverage: AuditCoverage;
-  program: Program;
+  application: Application;
   latest: boolean;
   onGenerate: () => void;
   onRefresh: () => void;
@@ -435,7 +435,7 @@ function ContextSummary({
   const stopped = context.status === "partial" && coverage.interrupted;
   const generationGap =
     context.source_generation !== undefined &&
-    context.source_generation !== program.source_generation;
+    context.source_generation !== application.source_generation;
   const current = context.status === "complete" && latest && !generationGap;
   const pct = (n: number) => `${selected ? (n / selected) * 100 : 0}%`;
   return (
@@ -574,7 +574,7 @@ function ContextSummary({
       <GapCallout
         context={context}
         coverage={coverage}
-        program={program}
+        application={application}
         generationGap={generationGap}
         onGenerate={onGenerate}
         onRefresh={onRefresh}
@@ -585,14 +585,14 @@ function ContextSummary({
 function GapCallout({
   context,
   coverage,
-  program,
+  application,
   generationGap,
   onGenerate,
   onRefresh,
 }: {
   context: Context;
   coverage: AuditCoverage;
-  program: Program;
+  application: Application;
   generationGap: boolean;
   onGenerate: () => void;
   onRefresh: () => void;
@@ -621,9 +621,9 @@ function GapCallout({
         title="Stale for the current source"
         action={regenerate("Generate current context")}
       >
-        Generated for source generation {context.source_generation}; the program
-        is now at generation {program.source_generation}, so analyses no longer
-        use it.
+        Generated for source generation {context.source_generation}; the
+        application is now at generation {application.source_generation}, so
+        analyses no longer use it.
       </Callout>
     );
   if (context.status === "stale")

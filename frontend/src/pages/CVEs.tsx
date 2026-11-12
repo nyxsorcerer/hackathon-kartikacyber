@@ -20,11 +20,11 @@ import {
 import {
   cveSchema,
   cvesSchema,
-  programSchema,
-  programsSchema,
+  applicationSchema,
+  applicationsSchema,
   safeHref,
 } from "../types";
-import type { CVE, Program } from "../types";
+import type { CVE, Application } from "../types";
 import { JobLaunch, queueJob } from "../components/JobLaunch";
 import {
   ActionButton,
@@ -114,16 +114,16 @@ const defaults = {
   elig: "all",
   sev: "all",
   app: "all",
-  prog: "all",
+  application: "all",
   sort: "score",
   cve: "",
-  cvep: "",
+  cve_application: "",
   act: "",
   view: "overview",
   run: "",
   // Accept links already emitted by job details and CVE notifications.
   cve_id: "",
-  program_id: "",
+  application_id: "",
 };
 type Filters = typeof defaults;
 const pagerKeys = ["j", "k"];
@@ -142,7 +142,9 @@ function applyFilters(rows: Row[], f: Filters, skip?: keyof Filters) {
         (f.elig === "eligible") === cve.eligible) &&
       (skip === "sev" || f.sev === "all" || cve.severity === f.sev) &&
       (skip === "app" || f.app === "all" || cve.applicability === f.app) &&
-      (skip === "prog" || f.prog === "all" || cve.program_id === f.prog),
+      (skip === "application" ||
+        f.application === "all" ||
+        cve.application_id === f.application),
   );
 }
 export function CVEs() {
@@ -158,21 +160,28 @@ export function CVEs() {
   );
 }
 export function CVEList({
-  program,
+  application,
   collection,
 }: {
-  program?: Program;
+  application?: Application;
   collection?: Collection<CVE>;
 }) {
   const own = useCollection(
-    collection ? null : program ? `/cves?program_id=${program.id}` : "/cves",
+    collection
+      ? null
+      : application
+        ? `/cves?application_id=${application.id}`
+        : "/cves",
     cvesSchema,
   );
   const cves = collection || own;
-  const programs = useResource(program ? null : "/programs", programsSchema);
+  const applications = useResource(
+    application ? null : "/applications",
+    applicationsSchema,
+  );
   const [filters, update] = useQueryState(defaults);
-  const programName = (id: string) =>
-    programs.data?.items.find((p) => p.id === id)?.asset_name;
+  const applicationName = (id: string) =>
+    applications.data?.items.find((p) => p.id === id)?.asset_name;
   const rows = useMemo(() => cveRows(cves.data?.items || []), [cves.data]);
   const visible = useMemo(
     () =>
@@ -186,7 +195,7 @@ export function CVEList({
       filters.elig,
       filters.sev,
       filters.app,
-      filters.prog,
+      filters.application,
       filters.sort,
     ].join("|"),
   );
@@ -195,40 +204,43 @@ export function CVEList({
   const eligibility = facet("elig", (r) => (r.eligible ? "eligible" : "not"));
   const severity = facet("sev", (r) => r.severity);
   const applicability = facet("app", (r) => r.applicability);
-  const byProgram = facet("prog", (r) => r.program_id);
+  const byApplication = facet("application", (r) => r.application_id);
   const selectedId = filters.cve || filters.cve_id;
-  const selectedProgram = filters.cvep || filters.program_id;
+  const selectedApplication = filters.cve_application || filters.application_id;
   const selected = selectedId
     ? rows.find(
         (row) =>
           row.id === selectedId &&
-          (program || !selectedProgram || row.program_id === selectedProgram),
+          (application ||
+            !selectedApplication ||
+            row.application_id === selectedApplication),
       )
     : undefined;
   const open = (cve?: CVE, act?: "analyze", view = filters.view) =>
     update({
       cve: cve?.id || null,
-      cvep: program ? null : cve?.program_id,
+      cve_application: application ? null : cve?.application_id,
       act: act || null,
       view: cve ? view : null,
       run:
-        cve?.id === selected?.id && cve?.program_id === selected?.program_id
+        cve?.id === selected?.id &&
+        cve?.application_id === selected?.application_id
           ? filters.run
           : null,
       cve_id: null,
-      program_id: null,
+      application_id: null,
     });
   const analyze =
     filters.act === "analyze" && selected?.eligible ? selected : undefined;
   const clear = () =>
-    update({ q: "", elig: "all", sev: "all", app: "all", prog: "all" });
+    update({ q: "", elig: "all", sev: "all", app: "all", application: "all" });
   return (
     <>
       <Panel
         title="CVE records"
         description={
-          program
-            ? `Minimum Base score ${program.config.cve_min_score ?? "not configured"} · CVSS ${program.config.cve_versions.join(", ") || "not configured"}`
+          application
+            ? `Minimum Base score ${application.config.cve_min_score ?? "not configured"} · CVSS ${application.config.cve_versions.join(", ") || "not configured"}`
             : "A qualifying score alone does not confirm the deployed asset is affected."
         }
         actions={
@@ -246,12 +258,12 @@ export function CVEList({
               />
               Refresh records
             </button>
-            {program && (
+            {application && (
               <ActionButton
                 className="secondary"
                 onAction={() =>
                   queueJob(
-                    `/programs/${program.id}/cve-sync`,
+                    `/applications/${application.id}/cve-sync`,
                     {},
                     undefined,
                     "CVE sync queued.",
@@ -322,17 +334,17 @@ export function CVEList({
               })),
             ]}
           />
-          {!program && (programs.data?.items.length || 0) > 1 && (
+          {!application && (applications.data?.items.length || 0) > 1 && (
             <FilterSelect
-              label="Program"
-              value={filters.prog}
-              onChange={(prog) => update({ prog })}
+              label="Application"
+              value={filters.application}
+              onChange={(application) => update({ application })}
               options={[
-                { value: "all", label: "All programs" },
-                ...(programs.data?.items || []).map((p) => ({
+                { value: "all", label: "All applications" },
+                ...(applications.data?.items || []).map((p) => ({
                   value: p.id,
                   label: p.asset_name,
-                  count: byProgram[p.id] || 0,
+                  count: byApplication[p.id] || 0,
                 })),
               ]}
             />
@@ -384,7 +396,7 @@ export function CVEList({
                 <tbody>
                   {shown.map((cve) => (
                     <tr
-                      key={`${cve.program_id}-${cve.id}`}
+                      key={`${cve.application_id}-${cve.id}`}
                       className="clickable-row"
                       aria-selected={selected === cve || undefined}
                       onClick={(e) => {
@@ -410,11 +422,14 @@ export function CVEList({
                               Published <Time value={cve.published_at} />
                             </>
                           )}
-                          {!program && (
+                          {!application && (
                             <>
                               {cve.published_at && " · "}
-                              <Link to={`/programs/${cve.program_id}?tab=cves`}>
-                                {programName(cve.program_id) || "Program"}
+                              <Link
+                                to={`/applications/${cve.application_id}?tab=cves`}
+                              >
+                                {applicationName(cve.application_id) ||
+                                  "Application"}
                               </Link>
                             </>
                           )}
@@ -493,9 +508,9 @@ export function CVEList({
               icon={ShieldAlert}
               title="No CVE records yet"
               description={
-                program
+                application
                   ? "Configure product selectors and score criteria, then sync CVEs."
-                  : "CVE records appear after a configured program synchronizes its product selectors."
+                  : "CVE records appear after a configured application synchronizes its product selectors."
               }
             />
           )}
@@ -503,10 +518,12 @@ export function CVEList({
       </Panel>
       {selected && !analyze && (
         <CVEDrawer
-          key={`${selected.program_id}-${selected.id}`}
+          key={`${selected.application_id}-${selected.id}`}
           cve={selected}
           list={visible.includes(selected) ? visible : rows}
-          programName={program?.asset_name || programName(selected.program_id)}
+          applicationName={
+            application?.asset_name || applicationName(selected.application_id)
+          }
           view={filters.view}
           run={filters.run}
           onViewChange={(view) => update({ view })}
@@ -564,7 +581,7 @@ function ScoreList({ cve }: { cve: CVE }) {
 function CVEDrawer({
   cve,
   list,
-  programName,
+  applicationName,
   view,
   run,
   onViewChange,
@@ -576,7 +593,7 @@ function CVEDrawer({
 }: {
   cve: Row;
   list: Row[];
-  programName?: string;
+  applicationName?: string;
   view: string;
   run: string;
   onViewChange: (view: string) => void;
@@ -614,7 +631,7 @@ function CVEDrawer({
   ];
   async function setMatch(confirmed: boolean) {
     await mutate(
-      `/programs/${cve.program_id}/cves/${cve.id}/match`,
+      `/applications/${cve.application_id}/cves/${cve.id}/match`,
       cveSchema,
       { confirmed },
     );
@@ -623,7 +640,7 @@ function CVEDrawer({
   return (
     <Modal
       title={cve.id}
-      description={programName || "CVE details and saved analysis"}
+      description={applicationName || "CVE details and saved analysis"}
       onClose={onClose}
       size="drawer"
       headerActions={
@@ -687,7 +704,7 @@ function CVEDrawer({
             </button>
             <Link
               className="secondary button"
-              to={`/findings/new?program_id=${cve.program_id}&cve_id=${cve.id}`}
+              to={`/findings/new?application_id=${cve.application_id}&cve_id=${cve.id}`}
             >
               Create CVE finding
             </Link>
@@ -739,9 +756,9 @@ function CVEDrawer({
                   ],
                   ["Target applicability", <Badge>{cve.applicability}</Badge>],
                   [
-                    "Program",
-                    <Link to={`/programs/${cve.program_id}`}>
-                      {programName || "Program details"}
+                    "Application",
+                    <Link to={`/applications/${cve.application_id}`}>
+                      {applicationName || "Application details"}
                     </Link>,
                   ],
                   [
@@ -766,10 +783,10 @@ function CVEDrawer({
                 <p className="hint">
                   Applicability stays unknown until the deployed version is
                   observed.
-                  <Link to={`/programs/${cve.program_id}?tab=version`}>
+                  <Link to={`/applications/${cve.application_id}?tab=version`}>
                     Check the target version
                   </Link>{" "}
-                  or record a manual observation in the program.
+                  or record a manual observation in the application.
                 </p>
               )}
               <div className="inline-actions">
@@ -870,12 +887,15 @@ function CVEAnalysisLaunch({
   onClose: () => void;
   onSubmitted: () => void;
 }) {
-  const resource = useResource(`/programs/${cve.program_id}`, programSchema);
+  const resource = useResource(
+    `/applications/${cve.application_id}`,
+    applicationSchema,
+  );
   if (!resource.data)
     return (
       <Modal
         title="CVE analysis"
-        description="Resolving this program’s execution profile."
+        description="Resolving this application’s execution profile."
         onClose={onClose}
       >
         <DataState
@@ -883,7 +903,7 @@ function CVEAnalysisLaunch({
           error={resource.error}
           retry={resource.refresh}
         >
-          <p>Loading program configuration…</p>
+          <p>Loading application configuration…</p>
         </DataState>
         <div className="form-actions">
           <button className="secondary" onClick={onClose}>
@@ -895,7 +915,7 @@ function CVEAnalysisLaunch({
   return (
     <JobLaunch
       operation="cve_analysis"
-      path={`/programs/${cve.program_id}/cves/${cve.id}/analyses`}
+      path={`/applications/${cve.application_id}/cves/${cve.id}/analyses`}
       initialProfile={resource.data.config.profiles.cve_analysis}
       context={
         <div className="cve-launch-context">
@@ -906,7 +926,7 @@ function CVEAnalysisLaunch({
           <p>{cve.title}</p>
           <DetailGrid
             items={[
-              ["Program", resource.data.asset_name],
+              ["Application", resource.data.asset_name],
               ["Product match", <Badge>{cve.match_status}</Badge>],
               [
                 "Qualifying score",
@@ -920,7 +940,7 @@ function CVEAnalysisLaunch({
           {(!resource.data.config.version_scheme ||
             resource.data.config.version_scheme === "unknown") && (
             <Callout tone="warm" title="Choose a vulnerable revision">
-              This program has no version scheme for resolving an affected
+              This application has no version scheme for resolving an affected
               release. Enter a vulnerable tag or commit below to avoid analyzing
               the monitored checkout.
             </Callout>

@@ -18,9 +18,12 @@ import type { Collection } from "../hooks";
 import { useCollection, useResource } from "../hooks";
 import {
   auditsSchema,
-  programSchema,
-  programState,
+  applicationSchema,
+  applicationState,
+  checksAcceptedSchema,
+  failingRepositories,
   recipesSchema,
+  repositoryLabel,
   versionSchema,
   versionsSchema,
 } from "../types";
@@ -36,7 +39,7 @@ import type {
   FindingSummary,
   Job,
   Operation,
-  Program,
+  Application,
 } from "../types";
 import { JobLaunch, queueJob } from "../components/JobLaunch";
 import { ArtifactBrowser } from "../components/ArtifactPreview";
@@ -51,6 +54,7 @@ import {
   ErrorNote,
   Evidence,
   ExternalLink,
+  formatInterval,
   Modal,
   notify,
   PageHeading,
@@ -64,13 +68,14 @@ import { CommitList, sortCommits } from "./Commits";
 import { CVEList, cveRows } from "./CVEs";
 import { FindingsList } from "./Findings";
 import { failureGroups } from "./Jobs";
+import { ApplicationRepositories } from "./ApplicationRepositories";
 import { jobName, jobOutcome } from "../jobSummary";
-type VersionRecord = NonNullable<Program["version"]>;
-export function ProgramDetail() {
+type VersionRecord = NonNullable<Application["version"]>;
+export function ApplicationDetail() {
   const { id } = useParams();
   const resource = useResource(
-    `/programs/${encodeURIComponent(id || "")}`,
-    programSchema,
+    `/applications/${encodeURIComponent(id || "")}`,
+    applicationSchema,
     30000,
   );
   return (
@@ -81,32 +86,44 @@ export function ProgramDetail() {
       hasData={!!resource.data}
     >
       {resource.data && (
-        <ProgramBody program={resource.data} refresh={resource.refresh} />
+        <ApplicationBody
+          application={resource.data}
+          refresh={resource.refresh}
+        />
       )}
     </DataState>
   );
 }
-function runCheck(program: Program) {
-  return queueJob(
-    `/programs/${program.id}/checks`,
+async function runCheck(application: Application) {
+  const { items } = await mutate(
+    `/applications/${application.id}/checks`,
+    checksAcceptedSchema,
     {},
-    undefined,
-    "Source check queued.",
+    "POST",
+    crypto.randomUUID(),
+  );
+  notify(
+    items.length === 1
+      ? "Source check queued."
+      : `${items.length} source checks queued, one per repository.`,
+    items.length === 1
+      ? `/jobs/${encodeURIComponent(items[0].job_id)}`
+      : undefined,
   );
 }
-function runVersionCheck(program: Program) {
+function runVersionCheck(application: Application) {
   return queueJob(
-    `/programs/${program.id}/version-checks`,
+    `/applications/${application.id}/version-checks`,
     {},
     undefined,
     "Version check queued.",
   );
 }
-function ProgramBody({
-  program,
+function ApplicationBody({
+  application,
   refresh,
 }: {
-  program: Program;
+  application: Application;
   refresh: () => void;
 }) {
   const [params, setParams] = useSearchParams();
@@ -118,57 +135,57 @@ function ProgramBody({
     revision: string;
   }>();
   const [manual, setManual] = useState(false);
-  const failure = program.last_error;
-  const data = useProgramData(program);
+  const failing = failingRepositories(application);
+  const data = useApplicationData(application);
   const count = (c: { data?: { items: unknown[] } }) => c.data?.items.length;
   return (
     <>
       <PageHeading
-        back={{ to: "/programs", label: "All programs" }}
-        eyebrow={`${program.product_name} · ${program.product_kind}`}
-        title={program.asset_name}
+        back={{ to: "/applications", label: "All applications" }}
+        eyebrow={`${application.product_name} · ${application.product_kind}`}
+        title={application.asset_name}
         description={
-          <ExternalLink href={program.asset_url}>
-            {program.asset_url}
+          <ExternalLink href={application.asset_url}>
+            {application.asset_url}
           </ExternalLink>
         }
         actions={
           <>
             <Link
               className="secondary button"
-              to={`/programs/${program.id}/edit`}
+              to={`/applications/${application.id}/edit`}
             >
               <PencilLine size={15} aria-hidden="true" />
               Edit
             </Link>
             <ActionButton
               className="secondary"
-              disabled={program.archived}
+              disabled={application.archived}
               onAction={async () => {
                 await mutate(
-                  `/programs/${program.id}`,
-                  programSchema,
-                  { monitor_enabled: !program.monitor_enabled },
+                  `/applications/${application.id}`,
+                  applicationSchema,
+                  { monitor_enabled: !application.monitor_enabled },
                   "PATCH",
                 );
                 notify(
-                  program.monitor_enabled
+                  application.monitor_enabled
                     ? "Scheduled monitoring paused. Manual checks remain available."
                     : "Scheduled monitoring resumed.",
                 );
                 refresh();
               }}
             >
-              {program.monitor_enabled ? (
+              {application.monitor_enabled ? (
                 <Pause size={15} aria-hidden="true" />
               ) : (
                 <Play size={15} aria-hidden="true" />
               )}
-              {program.monitor_enabled ? "Pause" : "Resume"}
+              {application.monitor_enabled ? "Pause" : "Resume"}
             </ActionButton>
             <ActionButton
               className="primary"
-              onAction={() => runCheck(program)}
+              onAction={() => runCheck(application)}
             >
               <RefreshCw size={15} aria-hidden="true" />
               Check now
@@ -177,21 +194,24 @@ function ProgramBody({
         }
         meta={
           <>
-            <Badge>{programState(program)}</Badge>
+            <Badge>{applicationState(application)}</Badge>
             <span>
-              Every {program.monitor_interval_days ?? "default"} days
-              {program.config.monitor_interval_inherited
+              Every{" "}
+              {application.monitor_interval_seconds
+                ? formatInterval(application.monitor_interval_seconds)
+                : "default interval"}
+              {application.config.monitor_interval_inherited
                 ? " (global default)"
                 : ""}
             </span>
             <span>
-              Last check <Time value={program.last_check_at} />
+              Last check <Time value={application.last_check_at} />
             </span>
             <span>
-              {program.monitor_enabled && !program.archived ? (
+              {application.monitor_enabled && !application.archived ? (
                 <>
                   Next check{" "}
-                  <Time value={program.next_check_at} fallback="pending" />
+                  <Time value={application.next_check_at} fallback="pending" />
                 </>
               ) : (
                 "Scheduled checks paused"
@@ -200,34 +220,48 @@ function ProgramBody({
           </>
         }
       />
-      {!!failure && (
+      {failing.length > 0 && (
         <ErrorNote>
-          <strong>Last source check failed.</strong>{" "}
-          {sentence(
-            describeError(failure) || "The source could not be checked",
-          )}{" "}
-          {program.last_check_at && (
-            <>
-              Last attempt <Time value={program.last_check_at} />. Earlier
-              evidence is retained.
-            </>
-          )}
+          <strong>Last source check failed.</strong>
+          {failing.map((repository) => (
+            <p key={repository.repository_id}>
+              <span className="mono">{repositoryLabel(repository)}</span>:{" "}
+              {sentence(
+                describeError(repository.last_error) ||
+                  "The source could not be checked",
+              )}{" "}
+              {repository.last_check_at && (
+                <>
+                  Last success <Time value={repository.last_check_at} />.
+                </>
+              )}
+            </p>
+          ))}
+          Earlier evidence is retained.
           <div className="callout-actions">
             <ActionButton
               className="secondary"
-              onAction={() => runCheck(program)}
+              onAction={() => runCheck(application)}
             >
               <RefreshCw size={14} aria-hidden="true" />
               Retry check
             </ActionButton>
           </div>
-          <Evidence value={failure} label="Failure details" />
+          <Evidence
+            value={failing.map((r) => r.last_error)}
+            label="Failure details"
+          />
         </ErrorNote>
       )}
       <Tabs
-        label="Program sections"
+        label="Application sections"
         items={[
           { id: "overview", label: "Overview" },
+          {
+            id: "repositories",
+            label: "Repositories",
+            count: application.repositories.filter((r) => !r.removed_at).length,
+          },
           { id: "version", label: "Version" },
           { id: "commits", label: "Commits", count: count(data.commits) },
           { id: "audit", label: "Audit context", count: count(data.audits) },
@@ -239,8 +273,8 @@ function ProgramBody({
       />
       {tab === "overview" && (
         <>
-          <ProgramGlance program={program} data={data} />
-          {!program.version && (data.cves.data?.items.length || 0) > 0 && (
+          <ApplicationGlance application={application} data={data} />
+          {!application.version && (data.cves.data?.items.length || 0) > 0 && (
             <Callout
               tone="warm"
               title={`Target applicability is unknown for all ${data.cves.data?.items.length} CVEs`}
@@ -258,46 +292,52 @@ function ProgramBody({
                 </div>
               }
             >
-              The deployed version of {program.asset_url} has not been observed,
-              so Numen cannot tell which CVEs affect it.
+              The deployed version of {application.asset_url} has not been
+              observed, so Numen cannot tell which CVEs affect it.
             </Callout>
           )}
           <div className="detail-columns">
             <div className="column-stack">
               <SetupChecklist
-                program={program}
+                application={application}
                 data={data}
                 onGenerateRecipe={() => setLaunch("version_recipe")}
                 onManual={() => setManual(true)}
                 onGenerateContext={() => setLaunch("audit_context")}
               />
               <VersionSummary
-                program={program}
+                application={application}
                 onGenerate={() => setLaunch("version_recipe")}
                 onManual={() => setManual(true)}
                 onHistory={() => setParams({ tab: "version" })}
               />
             </div>
             <div className="column-stack">
-              <RecentJobs program={program} data={data} />
-              <ProgramConfiguration program={program} refresh={refresh} />
+              <RecentJobs application={application} data={data} />
+              <ApplicationConfiguration
+                application={application}
+                refresh={refresh}
+              />
             </div>
           </div>
         </>
       )}
+      {tab === "repositories" && (
+        <ApplicationRepositories application={application} refresh={refresh} />
+      )}
       {tab === "version" && (
         <VersionTab
-          program={program}
+          application={application}
           onGenerate={() => setLaunch("version_recipe")}
           onManual={() => setManual(true)}
         />
       )}
       {tab === "commits" && (
-        <CommitList program={program} collection={data.commits} />
+        <CommitList application={application} collection={data.commits} />
       )}
       {tab === "audit" && (
         <AuditTab
-          program={program}
+          application={application}
           onGenerate={() => setLaunch("audit_context")}
           onRefresh={(context) => {
             setRefreshContext({ id: context.id, revision: context.source_ref });
@@ -305,14 +345,16 @@ function ProgramBody({
           }}
         />
       )}
-      {tab === "cves" && <CVEList program={program} collection={data.cves} />}
-      {tab === "findings" && <FindingsList program={program} />}
+      {tab === "cves" && (
+        <CVEList application={application} collection={data.cves} />
+      )}
+      {tab === "findings" && <FindingsList application={application} />}
       {launch && (
         <JobLaunch
           operation={launch}
-          path={`/programs/${program.id}/${launch === "audit_context" ? "audit-contexts" : "version-recipes"}`}
-          initialProfile={program.config.profiles[launch]}
-          context={`${program.product_name} · ${program.source_ref || "default source ref"} · source generation ${program.source_generation}`}
+          path={`/applications/${application.id}/${launch === "audit_context" ? "audit-contexts" : "version-recipes"}`}
+          initialProfile={application.config.profiles[launch]}
+          context={`${application.product_name} · source generation ${application.source_generation}`}
           refresh={launch === "audit_context" ? refreshContext : undefined}
           onClose={() => {
             setLaunch(undefined);
@@ -323,7 +365,7 @@ function ProgramBody({
       )}
       {manual && (
         <ManualVersion
-          program={program}
+          application={application}
           onClose={() => setManual(false)}
           refresh={refresh}
         />
@@ -390,19 +432,19 @@ function VersionFacts({ version }: { version: VersionRecord }) {
   );
 }
 function VersionSummary({
-  program,
+  application,
   onGenerate,
   onManual,
   onHistory,
 }: {
-  program: Program;
+  application: Application;
   onGenerate: () => void;
   onManual: () => void;
   onHistory: () => void;
 }) {
-  const version = program.version;
-  const latest = program.latest_version_check;
-  const hasRecipe = !!program.config.active_recipe_id;
+  const version = application.version;
+  const latest = application.latest_version_check;
+  const hasRecipe = !!application.config.active_recipe_id;
   return (
     <Panel
       title="Deployed version"
@@ -422,7 +464,7 @@ function VersionSummary({
             hasRecipe && (
               <ActionButton
                 className="secondary"
-                onAction={() => runVersionCheck(program)}
+                onAction={() => runVersionCheck(application)}
               >
                 Retry
               </ActionButton>
@@ -483,7 +525,7 @@ function VersionSummary({
           action={
             <ActionButton
               className="primary"
-              onAction={() => runVersionCheck(program)}
+              onAction={() => runVersionCheck(application)}
             >
               <RefreshCw size={15} aria-hidden="true" />
               Run check
@@ -511,54 +553,39 @@ function VersionSummary({
     </Panel>
   );
 }
-function ProgramConfiguration({
-  program,
+function ApplicationConfiguration({
+  application,
   refresh,
 }: {
-  program: Program;
+  application: Application;
   refresh: () => void;
 }) {
-  const selectors = program.config.cve_selectors;
+  const selectors = application.config.cve_selectors;
   return (
     <Panel title="Configuration" padded>
       <DetailGrid
         items={[
-          [
-            "Upstream source",
-            program.source_kind === "wordpress" ? (
-              <ExternalLink href={program.source_url}>
-                WordPress · {program.plugin_slug}
-              </ExternalLink>
-            ) : (
-              <ExternalLink href={program.source_url}>
-                {program.source_url?.replace("https://github.com/", "") ||
-                  "Not configured"}
-              </ExternalLink>
-            ),
-          ],
-          ["Source ref", program.source_ref || "Default branch"],
-          ["Source path", program.source_path || "Entire source"],
-          ["Source generation", program.source_generation],
-          ["Triage", humanTriage(program.config.triage_mode)],
+          ["Source generation", application.source_generation],
+          ["Triage", humanTriage(application.config.triage_mode)],
           [
             "CVE threshold",
-            program.config.cve_min_score ?? (
+            application.config.cve_min_score ?? (
               <span className="muted">Not configured</span>
             ),
           ],
           [
             "CVSS versions",
-            program.config.cve_versions.join(", ") || (
+            application.config.cve_versions.join(", ") || (
               <span className="muted">Not configured</span>
             ),
           ],
           [
             "Auto CVE analysis",
-            program.config.cve_auto_analyze ? "Enabled" : "Off",
+            application.config.cve_auto_analyze ? "Enabled" : "Off",
           ],
           [
             "Audit context refresh",
-            program.config.audit_auto_refresh
+            application.config.audit_auto_refresh
               ? "After each source change"
               : "Manual",
           ],
@@ -587,26 +614,28 @@ function ProgramConfiguration({
         </p>
         <ActionButton
           className="secondary"
-          confirm={program.archived ? undefined : "Confirm archive"}
+          confirm={application.archived ? undefined : "Confirm archive"}
           onAction={async () => {
             await mutate(
-              `/programs/${program.id}`,
-              programSchema,
-              { archived: !program.archived },
+              `/applications/${application.id}`,
+              applicationSchema,
+              { archived: !application.archived },
               "PATCH",
             );
             notify(
-              program.archived ? "Program restored." : "Program archived.",
+              application.archived
+                ? "Application restored."
+                : "Application archived.",
             );
             refresh();
           }}
         >
-          {program.archived ? (
+          {application.archived ? (
             <ArchiveRestore size={15} aria-hidden="true" />
           ) : (
             <Archive size={15} aria-hidden="true" />
           )}
-          {program.archived ? "Restore program" : "Archive program"}
+          {application.archived ? "Restore application" : "Archive application"}
         </ActionButton>
       </div>
     </Panel>
@@ -751,25 +780,25 @@ function FingerprintList({ evidence }: { evidence: unknown }) {
   );
 }
 export function VersionTab({
-  program,
+  application,
   onGenerate,
   onManual,
 }: {
-  program: Program;
+  application: Application;
   onGenerate: () => void;
   onManual: () => void;
 }) {
   const observations = useResource(
-    `/programs/${program.id}/version-observations`,
+    `/applications/${application.id}/version-observations`,
     versionsSchema,
   );
   const recipes = useResource(
-    `/programs/${program.id}/version-recipes`,
+    `/applications/${application.id}/version-recipes`,
     recipesSchema,
   );
-  const hasRecipe = !!program.config.active_recipe_id;
+  const hasRecipe = !!application.config.active_recipe_id;
   const active = recipes.data?.items.find(
-    (recipe) => recipe.id === program.config.active_recipe_id,
+    (recipe) => recipe.id === application.config.active_recipe_id,
   );
   const unfingerprinted =
     !!active && !fingerprintCoverage(active.metadata).releases.length;
@@ -808,7 +837,7 @@ export function VersionTab({
               className="primary"
               disabled={!hasRecipe}
               title={hasRecipe ? undefined : "Generate a recipe first"}
-              onAction={() => runVersionCheck(program)}
+              onAction={() => runVersionCheck(application)}
             >
               <RefreshCw size={15} aria-hidden="true" />
               Run check
@@ -898,7 +927,7 @@ export function VersionTab({
                 <summary>
                   <span className="mono">{recipe.id.slice(0, 16)}</span>
                   <Badge>{recipe.status}</Badge>
-                  {program.config.active_recipe_id === recipe.id && (
+                  {application.config.active_recipe_id === recipe.id && (
                     <Badge tone="accent">Active</Badge>
                   )}
                   <RecipeCoverage metadata={recipe.metadata} />
@@ -931,11 +960,11 @@ export function VersionTab({
   );
 }
 function ManualVersion({
-  program,
+  application,
   onClose,
   refresh,
 }: {
-  program: Program;
+  application: Application;
   onClose: () => void;
   refresh: () => void;
 }) {
@@ -956,7 +985,7 @@ function ManualVersion({
           setError(undefined);
           try {
             await mutate(
-              `/programs/${program.id}/version-observations`,
+              `/applications/${application.id}/version-observations`,
               versionSchema,
               { version, evidence },
             );
@@ -1006,24 +1035,24 @@ function ManualVersion({
     </Modal>
   );
 }
-type ProgramData = {
+type ApplicationData = {
   commits: Collection<Commit>;
   cves: Collection<CVE>;
   findings: Collection<FindingSummary>;
   jobs: Collection<Job>;
   audits: { data?: { items: unknown[] } };
 };
-function useProgramData(program: Program): ProgramData {
-  const id = program.id;
+function useApplicationData(application: Application): ApplicationData {
+  const id = application.id;
   return {
-    commits: useCollection(`/programs/${id}/commits`, commitsSchema),
-    cves: useCollection(`/cves?program_id=${id}`, cvesSchema),
+    commits: useCollection(`/applications/${id}/commits`, commitsSchema),
+    cves: useCollection(`/cves?application_id=${id}`, cvesSchema),
     findings: useCollection(
-      `/findings?program_id=${id}&view=summary`,
+      `/findings?application_id=${id}&view=summary`,
       findingSummariesSchema,
     ),
-    jobs: useCollection(`/jobs?program_id=${id}`, jobsSchema, 15000, 200),
-    audits: useResource(`/programs/${id}/audit-contexts`, auditsSchema),
+    jobs: useCollection(`/jobs?application_id=${id}`, jobsSchema, 15000, 200),
+    audits: useResource(`/applications/${id}/audit-contexts`, auditsSchema),
   };
 }
 function StatCard({
@@ -1047,12 +1076,12 @@ function StatCard({
     </Link>
   );
 }
-function ProgramGlance({
-  program,
+function ApplicationGlance({
+  application,
   data,
 }: {
-  program: Program;
-  data: ProgramData;
+  application: Application;
+  data: ApplicationData;
 }) {
   const cves = cveRows(data.cves.data?.items || []);
   const eligible = cves.filter((c) => c.eligible);
@@ -1063,29 +1092,29 @@ function ProgramGlance({
   const failed = (data.jobs.data?.items || []).filter(
     (j) => j.status === "failed",
   );
-  const base = `/programs/${program.id}`;
+  const base = `/applications/${application.id}`;
   const loading = (c: { data?: unknown }) => (c.data ? undefined : "…");
   return (
     <div className="stat-grid">
       <StatCard
         label="Deployed version"
         value={
-          program.version?.version ||
-          (program.version?.candidates?.length
-            ? `${program.version.candidates.length} candidates`
+          application.version?.version ||
+          (application.version?.candidates?.length
+            ? `${application.version.candidates.length} candidates`
             : "Unknown")
         }
         foot={
-          program.version ? (
+          application.version ? (
             <>
-              Observed <Time value={program.version.checked_at} />
+              Observed <Time value={application.version.checked_at} />
             </>
           ) : (
             "Not observed yet"
           )
         }
         to={`${base}?tab=version`}
-        tone={program.version ? undefined : "warm"}
+        tone={application.version ? undefined : "warm"}
       />
       <StatCard
         label="CVEs"
@@ -1125,37 +1154,42 @@ function ProgramGlance({
       <StatCard
         label="Failed jobs"
         value={loading(data.jobs) ?? failed.length}
-        foot={data.jobs.data && "For this program"}
-        to={`/jobs?program=${program.id}&status=failed`}
+        foot={data.jobs.data && "For this application"}
+        to={`/jobs?application=${application.id}&status=failed`}
         tone={failed.length ? "danger" : undefined}
       />
     </div>
   );
 }
 function SetupChecklist({
-  program,
+  application,
   data,
   onGenerateRecipe,
   onManual,
   onGenerateContext,
 }: {
-  program: Program;
-  data: ProgramData;
+  application: Application;
+  data: ApplicationData;
   onGenerateRecipe: () => void;
   onManual: () => void;
   onGenerateContext: () => void;
 }) {
-  const commits = data.commits.data?.items.length || 0;
+  const checked = application.repositories.filter(
+    (r) => !r.removed_at && r.baseline_revision,
+  ).length;
   const cves = data.cves.data?.items || [];
   const eligible = cves.filter((c) => c.eligible).length;
-  const config = program.config;
+  const config = application.config;
   const criteria =
     config.cve_selectors.length > 0 &&
     config.cve_min_score != null &&
     config.cve_versions.length > 0;
   const edit = (
-    <Link className="secondary button" to={`/programs/${program.id}/edit`}>
-      Edit program
+    <Link
+      className="secondary button"
+      to={`/applications/${application.id}/edit`}
+    >
+      Edit application
     </Link>
   );
   const steps: {
@@ -1165,23 +1199,33 @@ function SetupChecklist({
     action?: ReactNode;
   }[] = [
     {
-      title: "Import source history",
-      done: commits > 0,
+      title: "Link and check a repository",
+      done: checked > 0,
       detail:
-        commits > 0
-          ? `${commits} revisions imported`
-          : "Run a source check to import upstream revisions.",
-      action: (
-        <ActionButton className="secondary" onAction={() => runCheck(program)}>
+        checked > 0
+          ? `${checked} repositories past their Baseline`
+          : "Link an Own or Upstream repository; its first check sets the Baseline.",
+      action: application.repositories.some((r) => !r.removed_at) ? (
+        <ActionButton
+          className="secondary"
+          onAction={() => runCheck(application)}
+        >
           Check now
         </ActionButton>
+      ) : (
+        <Link
+          className="secondary button"
+          to={`/applications/${application.id}?tab=repositories`}
+        >
+          Add repository
+        </Link>
       ),
     },
     {
       title: "Observe the deployed version",
-      done: !!program.version,
-      detail: program.version
-        ? `Observed ${program.version.version || "candidate versions"}`
+      done: !!application.version,
+      detail: application.version
+        ? `Observed ${application.version.version || "candidate versions"}`
         : cves.length
           ? `Needed to decide whether the ${cves.length} CVEs apply to this asset.`
           : "Needed to decide whether CVEs apply to this asset.",
@@ -1262,20 +1306,23 @@ function SetupChecklist({
   );
 }
 function RecentJobs({
-  program,
+  application,
   data,
 }: {
-  program: Program;
-  data: ProgramData;
+  application: Application;
+  data: ApplicationData;
 }) {
   const items = data.jobs.data?.items || [];
   const failures = failureGroups(items);
   return (
     <Panel
       title="Recent jobs"
-      description="Background work for this program"
+      description="Background work for this application"
       actions={
-        <Link className="inline-link" to={`/jobs?program=${program.id}`}>
+        <Link
+          className="inline-link"
+          to={`/jobs?application=${application.id}`}
+        >
           All jobs
           <ArrowRight size={14} aria-hidden="true" />
         </Link>
@@ -1290,7 +1337,7 @@ function RecentJobs({
         {failures[0] && failures[0].count > 1 && (
           <Link
             className="failure-banner"
-            to={`/jobs?program=${program.id}&status=failed&q=${encodeURIComponent(failures[0].reason)}`}
+            to={`/jobs?application=${application.id}&status=failed&q=${encodeURIComponent(failures[0].reason)}`}
           >
             <strong>{failures[0].count}× failed</strong>
             <span className="clamp">{failures[0].reason}</span>
@@ -1321,7 +1368,7 @@ function RecentJobs({
         ) : (
           <Empty
             title="No jobs yet"
-            description="Checks and agent operations for this program appear here."
+            description="Checks and agent operations for this application appear here."
           />
         )}
       </DataState>

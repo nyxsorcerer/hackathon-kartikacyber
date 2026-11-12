@@ -4,9 +4,9 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from conftest import FixtureBroker, connection, program, source_snapshot
+from conftest import FixtureBroker, connection, application, source_snapshot
 from numen import domain
-from numen.models import Account, Commit, Job, JobAttempt, JobEvent, Program
+from numen.models import Account, Commit, Job, JobAttempt, JobEvent, Application
 from numen.queue import ExecutionContext, claim
 from numen.security import DomainError
 from numen.worker import run_once
@@ -43,7 +43,7 @@ def test_anthropic_account_routes_selected_runtime_catalog_and_publishes_report(
     assert {name: models[0]["id"] for name, models in public["agent_models"].items()} == {
         "pi": "pi-model", "claude": "claude-model"
     }
-    monitored = program(client)
+    monitored = application(client)
     commit_id = source_snapshot(app, monitored["id"])
     endpoint = f"/api/commits/{commit_id}/analyses"
     profile = {
@@ -138,7 +138,7 @@ def test_disabled_commandcode_plugin_never_runs_and_enabled_plugin_is_sent(syste
     ]
     assert client.get("/api/accounts").json()["items"][0]["supported_agents"] == ["pi"]
 
-    monitored = program(client)
+    monitored = application(client)
     commit_id = source_snapshot(app, monitored["id"])
     profile = {
         "agent": "pi",
@@ -636,7 +636,7 @@ def test_jev_official_model_discovery_and_typed_triage_keeps_uncertainty(system,
     run_once(config, app.state.factory, FixtureBroker())
     public = client.get("/api/accounts").json()["items"][0]
     assert public["status"] == "ready" and public["models"][0]["id"] == "jev-latest"
-    p = program(
+    p = application(
         client,
         config={
             "triage_mode": "jev",
@@ -648,13 +648,13 @@ def test_jev_official_model_discovery_and_typed_triage_keeps_uncertainty(system,
     with app.state.factory.begin() as db:
         commit = db.get(Commit, commit_id)
         commit.data = {**commit.data, "diff_complete": complete}
-        monitored = db.get(Program, p["id"])
+        monitored = db.get(Application, p["id"])
         job = domain.enqueue(
             db,
             "jev_triage",
             monitored,
             domain.job_input(
-                monitored, commit_id=commit.id, **domain.resolve_jev(db, monitored.config)
+                db, monitored, commit_id=commit.id, **domain.resolve_jev(db, monitored.config)
             ),
         )
         job_id = job.id
@@ -703,8 +703,8 @@ def test_jev_official_model_discovery_and_typed_triage_keeps_uncertainty(system,
 def test_runtime_events_reach_the_timeline_with_application_owned_messages(system):
     app, client, config = system
     connection(app)
-    p = program(client)
-    job_id = client.post(f"/api/programs/{p['id']}/audit-contexts", json={}).json()["job_id"]
+    p = application(client)
+    job_id = client.post(f"/api/applications/{p['id']}/audit-contexts", json={}).json()["job_id"]
     with app.state.factory.begin() as db:
         job = claim(db, "runtime-event-test")
         assert job.id == job_id
@@ -741,8 +741,8 @@ def test_runtime_events_reach_the_timeline_with_application_owned_messages(syste
 def test_a_refused_image_is_named_only_when_it_is_a_plain_image_reference(system):
     app, client, config = system
     connection(app)
-    p = program(client)
-    job_id = client.post(f"/api/programs/{p['id']}/audit-contexts", json={}).json()["job_id"]
+    p = application(client)
+    job_id = client.post(f"/api/applications/{p['id']}/audit-contexts", json={}).json()["job_id"]
     with app.state.factory.begin() as db:
         job = claim(db, "refused-image-test")
     context = ExecutionContext(app.state.factory, job, FixtureBroker())

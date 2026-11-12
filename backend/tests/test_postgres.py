@@ -1,5 +1,6 @@
 """Actual PostgreSQL lock/lease/migration/session proof in a disposable isolated schema."""
 
+import json
 import os
 import subprocess
 import sys
@@ -15,19 +16,35 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import load_only
 
 from numen.api import create_app
 from numen.config import Config
 from numen.db import make_database
 from numen.domain import enqueue, schedule
-from numen.models import Account, Job, Program, now
+from numen.models import Account, Job, Application, now
 from numen.queue import ExecutionContext, claim, recover
 from numen.security import DomainError
-from conftest import FixtureBroker
+from conftest import FixtureBroker, github_account
+
+
+def alembic(url, *args, check=True):
+    return subprocess.run(
+        [sys.executable, "-m", "alembic", *args],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "NUMEN_DATABASE_URL": url},
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def migrate(url, revision):
+    alembic(url, "upgrade", revision)
 
 
 @pytest.fixture
-def postgres(tmp_path):
+def schema_url():
     base = os.getenv("NUMEN_TEST_DATABASE_URL")
     if not base:
         pytest.skip("NUMEN_TEST_DATABASE_URL is required for the PostgreSQL boundary")
@@ -35,47 +52,352 @@ def postgres(tmp_path):
     control = create_engine(base)
     with control.begin() as db:
         db.execute(text(f'CREATE SCHEMA "{schema}"'))
-    url = (
-        make_url(base)
-        .update_query_dict({"options": f"-csearch_path={schema}"})
-        .render_as_string(hide_password=False)
-    )
-    config = Config(database_url=url, artifact_root=tmp_path / "artifacts", monitor_interval_days=2)
-    env = {**os.environ, "NUMEN_DATABASE_URL": url}
     try:
-        subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=Path(__file__).resolve().parents[1],
-            env=env,
-            check=True,
-            capture_output=True,
+        yield (
+            make_url(base)
+            .update_query_dict({"options": f"-csearch_path={schema}"})
+            .render_as_string(hide_password=False)
         )
-        engine, factory = make_database(config, initialize=True)
-        yield config, factory
-        engine.dispose()
     finally:
         with control.begin() as db:
             db.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         control.dispose()
 
 
-def create_program(db, name="Fixture"):
-    program = Program(
+@pytest.fixture
+def postgres(schema_url, tmp_path):
+    config = Config(database_url=schema_url, artifact_root=tmp_path / "artifacts", monitor_interval_seconds=172800)
+    migrate(schema_url, "head")
+    engine, factory = make_database(config, initialize=True)
+    yield config, factory
+    engine.dispose()
+
+
+def test_postgres_migration_renames_programs_to_applications(schema_url, tmp_path):
+    from numen.models import ApplicationCVE
+    from numen.security import fingerprint
+
+    migrate(schema_url, "fe74f85e4023")
+    engine = create_engine(schema_url)
+    inputs = {"source_generation": 1, "source_ref": None}
+    # Before the rename a job's input hash named its owner program_id.
+    old_hash = fingerprint({"kind": "source_check", "program_id": "p1", "input": inputs, "profile": None})
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO programs (id, asset_name, asset_url, product_kind, product_name, source_kind,"
+            " source_url, source_generation, monitor_interval_days, monitor_enabled, archived, config,"
+            " cve_cursor) VALUES ('p1', 'Site', 'https://example.com', 'plugin', 'Demo', 'github',"
+            " 'https://github.com/demo/plugin', 1, 2, true, false, '{\"triage_mode\": \"disabled\"}', '{}')"
+        ))
+        db.execute(text(
+            "INSERT INTO commits (id, program_id, source_generation, revision, data, triage_status,"
+            " review_decision) VALUES ('c1', 'p1', 1, 'abc', '{\"message\": \"Fix\"}', 'disabled', 'pending')"
+        ))
+        db.execute(text(
+            "INSERT INTO cves (id, raw, record_hash, data) VALUES ('CVE-2026-1', '{}', 'h', '{}')"
+        ))
+        db.execute(text(
+            "INSERT INTO program_cves (id, program_id, cve_id, confirmed, data)"
+            " VALUES ('pc1', 'p1', 'CVE-2026-1', true, '{\"eligible\": true}')"
+        ))
+        db.execute(text(
+            "INSERT INTO jobs (id, kind, program_id, status, input, input_hash, idempotency_key,"
+            " progress, created_at, attempts) VALUES ('j1', 'source_check', 'p1', 'succeeded',"
+            " CAST(:input AS json), :hash, 'check-1', '{}', now(), 0)"
+        ), {"input": json.dumps(inputs), "hash": old_hash})
+        db.execute(text(
+            "INSERT INTO actions (id, resource_type, resource_id, data, created_at)"
+            " VALUES ('a1', 'program', 'p1', '{\"action\": \"created\"}', now())"
+        ))
+    engine.dispose()
+
+    # The next revision moves sources onto repositories; this one only renames.
+    migrate(schema_url, "3f1a2b4c5d61")
+    config = Config(database_url=schema_url, artifact_root=tmp_path / "artifacts", monitor_interval_seconds=172800)
+    engine, factory = make_database(config)
+    try:
+        with factory.begin() as db:
+            # Later revisions add columns this one does not have yet.
+            application = db.get(Application, "p1", options=[load_only(Application.asset_name, Application.config)])
+            assert (application.asset_name, application.config) == ("Site", {"triage_mode": "disabled"})
+            assert db.execute(text("SELECT source_url FROM applications")).scalar() == "https://github.com/demo/plugin"
+            assert db.execute(text("SELECT application_id FROM commits WHERE id = 'c1'")).scalar() == "p1"
+            link = db.get(ApplicationCVE, "pc1")
+            assert (link.application_id, link.cve_id, link.confirmed, link.data) == (
+                "p1", "CVE-2026-1", True, {"eligible": True})
+            assert db.get(Job, "j1").application_id == "p1"
+            assert db.execute(text("SELECT resource_type FROM actions WHERE id = 'a1'")).scalar() == "application"
+            # The renamed job still answers its idempotency key instead of reporting a conflict.
+            assert enqueue(db, "source_check", application, inputs, idempotency_key="check-1").id == "j1"
+            assert not db.execute(text(
+                "SELECT conname FROM pg_constraint WHERE connamespace = to_regnamespace(current_schema())"
+                " AND conname LIKE '%program%'"
+            )).all()
+    finally:
+        engine.dispose()
+    alembic(schema_url, "downgrade", "fe74f85e4023")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        assert db.execute(text("SELECT program_id, input_hash FROM jobs")).one() == ("p1", old_hash)
+        assert db.execute(text("SELECT program_id FROM program_cves")).scalar() == "p1"
+        assert db.execute(text("SELECT resource_type FROM actions")).scalar() == "program"
+    engine.dispose()
+
+
+def create_application(db, name="Fixture"):
+    application = Application(
         asset_name=name,
         asset_url="https://example.com",
         product_kind="plugin",
         product_name="Fixture",
-        source_kind="wordpress",
-        source_url="https://plugins.svn.wordpress.org/fixture",
-        plugin_slug="fixture",
-        source_ref="trunk",
-        monitor_interval_days=2,
+        monitor_interval_seconds=172800,
         config={"triage_mode": "disabled"},
         monitor_enabled=True,
     )
-    db.add(program)
+    db.add(application)
     db.flush()
-    return program
+    return application
+
+
+def test_postgres_migration_moves_program_sources_to_upstream_repositories(schema_url, tmp_path):
+    from numen.models import ApplicationRepository, Commit, Repository, Snapshot, VersionRecipe
+
+    migrate(schema_url, "3f1a2b4c5d61")
+    engine = create_engine(schema_url)
+    selectors = [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}]
+
+    def program(db, ident, url, generation, checked, cursor, kind="github", slug=None):
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_kind, source_url, plugin_slug, source_ref, source_generation,"
+            " monitor_interval_days, monitor_enabled, archived, config, cve_cursor, cursor,"
+            " last_check_at, last_error) VALUES (:id, :id, :asset, 'plugin',"
+            " 'Demo', :kind, :url, :slug, 'main', :generation, 2, true, false, CAST(:config AS json),"
+            " '{}', :cursor, :checked, CAST(:error AS json))"
+        ), {"id": ident, "asset": f"https://{ident}.example", "url": url, "kind": kind, "slug": slug, "generation": generation,
+            "config": json.dumps({"cve_selectors": selectors}), "cursor": cursor, "checked": checked,
+            "error": json.dumps({"code": "source_unavailable"}) if ident == "newer" else None})
+
+    def commit(db, ident, application, generation, revision):
+        db.execute(text(
+            "INSERT INTO commits (id, application_id, source_generation, revision, data, triage_status,"
+            " review_decision) VALUES (:id, :application, :generation, :revision, '{}', 'disabled', 'pending')"
+        ), {"id": ident, "application": application, "generation": generation, "revision": revision})
+
+    def observation(db, ident, status, version, age, generation=1):
+        db.execute(text(
+            "INSERT INTO version_observations (id, application_id, source_generation, checked_at, data)"
+            " VALUES (:id, 'wp', :generation, now() - :age * interval '1 hour', CAST(:data AS json))"
+        ), {"id": ident, "generation": generation, "age": age,
+            "data": json.dumps({"status": status, "version": version})})
+
+    with engine.begin() as db:
+        # Two Programs share one GitHub repository (spelled differently); "newer" was checked last.
+        program(db, "older", "https://github.com/Demo/Plugin.git", 2, "2026-10-01T00:00:00Z", "b" * 40)
+        program(db, "newer", "https://github.com/demo/plugin/", 1, "2026-11-01T00:00:00Z", "c" * 40)
+        program(db, "wp", "https://plugins.svn.wordpress.org/fixture", 1, None, "7", "wordpress", "fixture")
+        commit(db, "older-1", "older", 1, "a" * 40)  # an earlier generation of "older"
+        commit(db, "older-2", "older", 2, "a" * 40)
+        commit(db, "newer-1", "newer", 1, "a" * 40)
+        commit(db, "wp-7", "wp", 1, "7")
+        db.execute(text(
+            "INSERT INTO source_snapshots (id, application_id, source_generation, source_ref, files,"
+            " created_at) VALUES ('s1', 'older', 2, :ref, '[]', now())"
+        ), {"ref": "b" * 40})
+        observation(db, "o1", "detected", "1.2.0", 3)
+        observation(db, "o2", "detected", "1.3.0", 2)
+        observation(db, "o3", "error", None, 1)
+        observation(db, "o4", "detected", "0.9.0", 0, generation=0)  # an earlier source
+        db.execute(text("INSERT INTO jobs (id, kind, status, input, input_hash, progress, created_at,"
+                        " attempts) VALUES ('j0', 'cve_sync', 'succeeded', '{}', 'h', '{}', now(), 0)"))
+        db.execute(text(
+            "INSERT INTO jobs (id, kind, application_id, status, input, input_hash, progress, created_at,"
+            " attempts) VALUES ('j1', 'version_recipe', 'wp', 'succeeded', '{}', 'h', '{}', now(), 0)"
+        ))
+        db.execute(text(
+            "INSERT INTO version_recipes (id, application_id, source_generation, source_ref, status, data,"
+            " created_at) VALUES ('r1', 'wp', 1, '7', 'active', '{}', now())"
+        ))
+        db.execute(text(
+            "INSERT INTO jobs (id, kind, application_id, status, input, input_hash, progress, created_at,"
+            " attempts) VALUES ('j2', 'source_check', 'older', 'queued',"
+            " '{\"source_generation\": 2, \"source_ref\": null}', 'h', '{}', now(), 0)"
+        ))
+    engine.dispose()
+
+    migrate(schema_url, "head")
+    config = Config(database_url=schema_url, artifact_root=tmp_path / "artifacts", monitor_interval_seconds=172800)
+    engine, factory = make_database(config)
+    try:
+        with factory.begin() as db:
+            repositories = {r.source_url: r for r in db.scalars(select(Repository))}
+            assert sorted(repositories) == ["https://github.com/demo/plugin", "https://plugins.svn.wordpress.org/fixture"]
+            shared = repositories["https://github.com/demo/plugin"]
+            wordpress = repositories["https://plugins.svn.wordpress.org/fixture"]
+            # The most recently checked Program is canonical; generations of both are kept apart.
+            assert (shared.cursor, shared.baseline_revision, shared.source_generation) == ("c" * 40, "c" * 40, 3)
+            assert shared.last_error == {"code": "source_unavailable"}
+            assert (wordpress.source_kind, wordpress.plugin_slug, wordpress.cursor) == ("wordpress", "fixture", "7")
+            links = {link.application_id: link for link in db.scalars(select(ApplicationRepository))}
+            assert {ident: (link.repository_id, link.role, link.enabled, link.removed_at)
+                    for ident, link in links.items()} == {
+                "older": (shared.id, "upstream", True, None),
+                "newer": (shared.id, "upstream", True, None),
+                "wp": (wordpress.id, "upstream", True, None),
+            }
+            assert links["older"].created_at < links["newer"].created_at  # in check order
+            assert (links["wp"].locked_version, links["wp"].locked_version_source) == ("1.3.0", "deployed")
+            assert links["older"].locked_version is links["older"].locked_version_source is None
+            commits = {c.id: (c.repository_id, c.source_generation) for c in db.scalars(select(Commit))}
+            assert commits == {
+                "older-1": (shared.id, 1), "older-2": (shared.id, 2),
+                "newer-1": (shared.id, 3), "wp-7": (wordpress.id, 1),
+            }
+            assert (db.get(Snapshot, "s1").repository_id, db.get(Snapshot, "s1").source_generation) == (shared.id, 2)
+            # Only the canonical Program's commits are current; the others' stay as history.
+            current = [i for i, (_, generation) in commits.items() if generation == shared.source_generation]
+            assert current == ["newer-1"]
+            wp = db.get(Application, "wp")
+            assert wp.asset_url == "https://wp.example" and wp.config["cve_selectors"] == selectors
+            assert db.get(VersionRecipe, "r1").application_id == "wp"
+            assert db.get(Job, "j2").input == {
+                "source_generation": 3, "source_ref": None, "repository_id": shared.id}
+            assert db.get(Job, "j1").input == {}
+    finally:
+        engine.dispose()
+    drift = alembic(schema_url, "check", check=False)
+    assert drift.returncode == 0, drift.stdout + drift.stderr
+    # Merged Programs cannot be split again.
+    refused = alembic(schema_url, "downgrade", "3f1a2b4c5d61", check=False)
+    assert refused.returncode != 0 and "cannot become Programs again" in refused.stderr
+
+
+def legacy_program(db, ident, source_path=None):
+    db.execute(text(
+        "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name, source_kind,"
+        " source_url, source_ref, source_path, source_generation, monitor_interval_days,"
+        " monitor_enabled, archived, config, cve_cursor, cursor) VALUES (:id, :id,"
+        " 'https://example.com', 'plugin', 'Demo', 'github', 'https://github.com/demo/mono', 'main',"
+        " :path, 1, 2, true, false, '{}', '{}', :cursor)"
+    ), {"id": ident, "path": source_path, "cursor": "a" * 40})
+
+
+def test_postgres_migration_refuses_to_merge_programs_with_different_subpaths(schema_url):
+    migrate(schema_url, "3f1a2b4c5d61")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        legacy_program(db, "plugin-a", "plugins/a")
+        legacy_program(db, "plugin-b", "plugins/b")
+    failed = alembic(schema_url, "upgrade", "head", check=False)
+    assert failed.returncode != 0
+    assert "plugin-a, plugin-b share https://github.com/demo/mono" in failed.stderr
+    with engine.begin() as db:
+        # Nothing moved: both Programs keep their own subpath.
+        assert dict(db.execute(text("SELECT id, source_path FROM applications")).all()) == {
+            "plugin-a": "plugins/a", "plugin-b": "plugins/b"}
+        assert db.execute(text("SELECT to_regclass('repositories')")).scalar() is None
+    engine.dispose()
+
+
+def test_postgres_migration_downgrades_unmerged_repositories_to_programs(schema_url):
+    migrate(schema_url, "fe74f85e4023")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO programs (id, asset_name, asset_url, product_kind, product_name, source_kind,"
+            " source_url, source_ref, source_path, source_generation, monitor_interval_days,"
+            " monitor_enabled, archived, config, cve_cursor, cursor, last_error) VALUES ('p1', 'Site',"
+            " 'https://example.com', 'plugin', 'Demo', 'github', 'https://github.com/demo/mono',"
+            " 'main', 'plugins/a', 1, 2, true, false, '{}', '{}', :cursor, '{\"code\": \"x\"}')"
+        ), {"cursor": "a" * 40})
+        db.execute(text(
+            "INSERT INTO commits (id, program_id, source_generation, revision, data, triage_status,"
+            " review_decision) VALUES ('c1', 'p1', 1, :rev, '{}', 'disabled', 'pending')"
+        ), {"rev": "a" * 40})
+        db.execute(text(
+            "INSERT INTO source_snapshots (id, program_id, source_generation, source_ref, files,"
+            " created_at) VALUES ('s1', 'p1', 1, :rev, '[]', now())"
+        ), {"rev": "a" * 40})
+    migrate(schema_url, "head")
+    alembic(schema_url, "downgrade", "fe74f85e4023")
+    with engine.begin() as db:
+        assert tuple(db.execute(text(
+            "SELECT source_kind, source_url, source_ref, source_path, cursor, last_error,"
+            " monitor_interval_days FROM programs"
+        )).one()) == ("github", "https://github.com/demo/mono", "main", "plugins/a", "a" * 40,
+                      {"code": "x"}, 2)
+        assert db.execute(text("SELECT program_id FROM commits")).scalar() == "p1"
+        assert db.execute(text("SELECT program_id FROM source_snapshots")).scalar() == "p1"
+        assert {name for (name,) in db.execute(text(
+            "SELECT conname FROM pg_constraint WHERE connamespace = to_regnamespace(current_schema())"
+            " AND conrelid IN ('commits'::regclass, 'source_snapshots'::regclass) AND contype IN ('f', 'u')"
+        ))} == {"commits_program_id_fkey", "commits_program_id_source_generation_revision_key",
+                "source_snapshots_program_id_fkey"}
+    engine.dispose()
+    # The downgraded schema upgrades again.
+    migrate(schema_url, "head")
+
+
+def test_postgres_migration_stores_intervals_in_seconds(schema_url):
+    migrate(schema_url, "5b3c4d6e7f83")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_generation, monitor_interval_days, monitor_enabled, archived, config, cve_cursor)"
+            " VALUES ('a1', 'Site', 'https://example.com', 'plugin', 'Demo', 1, 2, true, false, '{}', '{}')"
+        ))
+        db.execute(text(
+            "INSERT INTO settings (id, data, revision) VALUES ('global',"
+            " '{\"monitor_interval_days\": 7, \"webhook_enabled\": false}', 1)"
+        ))
+    migrate(schema_url, "6c4d5e7f8094")
+    with engine.begin() as db:
+        assert db.execute(text("SELECT monitor_interval_seconds FROM applications")).scalar() == 172800
+        assert db.execute(text("SELECT data FROM settings")).scalar() == {
+            "monitor_interval_seconds": 604800, "webhook_enabled": False}
+        # Intervals under a day, allowed since the upgrade, become one day on downgrade.
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_generation, monitor_interval_seconds, monitor_enabled, archived, config, cve_cursor)"
+            " VALUES ('a2', 'Shop', 'https://shop.example.com', 'app', 'Shop', 1, 300, true, false, '{}', '{}')"
+        ))
+        db.execute(text("UPDATE settings SET data = '{\"monitor_interval_seconds\": 300}'"))
+    alembic(schema_url, "downgrade", "5b3c4d6e7f83")
+    with engine.begin() as db:
+        assert dict(db.execute(text("SELECT id, monitor_interval_days FROM applications")).all()) == {
+            "a1": 2, "a2": 1}
+        assert db.execute(text("SELECT data FROM settings")).scalar() == {"monitor_interval_days": 1}
+    engine.dispose()
+
+
+def test_postgres_migration_keeps_links_and_adds_derivation_state(schema_url):
+    migrate(schema_url, "6c4d5e7f8094")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_generation, monitor_interval_seconds, monitor_enabled, archived, config, cve_cursor)"
+            " VALUES ('a1', 'Site', 'https://example.com', 'plugin', 'Demo', 1, 300, true, false, '{}', '{}')"
+        ))
+        db.execute(text(
+            "INSERT INTO repositories (id, source_kind, source_url, source_generation, watched_branches, created_at)"
+            " VALUES ('r1', 'github', 'https://github.com/demo/plugin', 1, '{}', now())"
+        ))
+        db.execute(text(
+            "INSERT INTO application_repositories (id, application_id, repository_id, role, enabled,"
+            " locked_version, locked_version_source, created_at)"
+            " VALUES ('l1', 'a1', 'r1', 'upstream', true, '1.2.0', 'deployed', now())"
+        ))
+    migrate(schema_url, "7d5e6f8091a5")
+    with engine.begin() as db:
+        assert tuple(db.execute(text(
+            "SELECT locked_version, packages, unresolved, derived_revision FROM application_repositories"
+        )).one()) == ("1.2.0", [], [], None)
+    alembic(schema_url, "downgrade", "6c4d5e7f8094")
+    with engine.begin() as db:
+        assert db.execute(text("SELECT locked_version FROM application_repositories")).scalar() == "1.2.0"
+    engine.dispose()
 
 
 def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(postgres, monkeypatch):
@@ -110,6 +432,7 @@ def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(p
             session = client.post("/api/auth/login", json={
                 "username": "admin", "password": "test-password-long"}).json()
             client.headers["X-CSRF-Token"] = session["csrf_token"]
+            github_account(app)
             _, ident, _ = prepared((app, client, config))
             with app.state.factory.begin() as db:
                 row = db.get(Commit, ident)
@@ -129,9 +452,9 @@ def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(p
 def test_postgres_skip_locked_claims_and_fenced_recovery(postgres):
     config, factory = postgres
     with factory.begin() as db:
-        program = create_program(db)
-        first = enqueue(db, "source_check", program, {"source_generation": 1})
-        second = enqueue(db, "source_check", program, {"source_generation": 1})
+        application = create_application(db)
+        first = enqueue(db, "source_check", application, {"source_generation": 1})
+        second = enqueue(db, "source_check", application, {"source_generation": 1})
         first_id, second_id = first.id, second.id
     with factory() as locked:
         locked.begin()
@@ -162,12 +485,12 @@ def test_postgres_worker_slots_run_jobs_concurrently(postgres, monkeypatch):
     config, factory = postgres
     config = replace(config, secret_key=Fernet.generate_key().decode())
     with factory.begin() as db:
-        program = create_program(db)
-        ids = [enqueue(db, "source_check", program, {"source_generation": 1}).id for _ in range(2)]
+        application = create_application(db)
+        ids = [enqueue(db, "source_check", application, {"source_generation": 1}).id for _ in range(2)]
     # Each job waits until the other is running too; a sequential worker would time out.
     barrier = threading.Barrier(2, timeout=20)
 
-    def source_check(self, db, job, program):
+    def source_check(self, db, job, application):
         barrier.wait()
         return {"concurrent": True}
 
@@ -181,6 +504,49 @@ def test_postgres_worker_slots_run_jobs_concurrently(postgres, monkeypatch):
         jobs = [db.get(Job, ident) for ident in ids]
         assert [job.status for job in jobs] == ["succeeded", "succeeded"]
         assert all(job.result["concurrent"] for job in jobs)
+
+
+def test_postgres_concurrent_derivations_create_one_shared_upstream_repository(postgres, monkeypatch):
+    from numen.models import ApplicationRepository, Repository
+    from numen.sources import Sources
+    from numen.worker import run_once
+
+    config, factory = postgres
+    config = replace(config, secret_key=Fernet.generate_key().decode())
+    react = "https://github.com/facebook/react"
+    with factory.begin() as db:
+        # Production and staging share their Own repository, which depends on react.
+        own = Repository(source_kind="github", source_url="https://github.com/acme/shop", cursor="a" * 40)
+        db.add(own)
+        db.flush()
+        ids = []
+        for name in ("Production", "Staging"):
+            application = create_application(db, name)
+            db.add(ApplicationRepository(application_id=application.id, repository_id=own.id, role="own"))
+            inputs = {"repository_id": own.id, "source_generation": 1, "source_ref": "a" * 40}
+            ids.append(enqueue(db, "derive_upstreams", application, inputs).id)
+    manifest = json.dumps({"dependencies": {"react": "^19.0.0"}})
+    monkeypatch.setattr(Sources, "github_file", lambda self, repository, path, ref: manifest if path == "package.json" else None)
+    monkeypatch.setattr(Sources, "npm_repository", lambda self, name, version: "facebook/react")
+    # Both jobs have found no react repository before either inserts one.
+    barrier = threading.Barrier(2, timeout=20)
+
+    def insert(*_):
+        barrier.wait()
+
+    event.listen(Repository, "before_insert", insert)
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            claimed = list(pool.map(lambda i: run_once(config, factory, FixtureBroker(), f"slot/{i}"), range(2)))
+    finally:
+        event.remove(Repository, "before_insert", insert)
+    assert claimed == [True, True]
+    with factory() as db:
+        jobs = [db.get(Job, ident) for ident in ids]
+        assert [(job.status, job.error) for job in jobs] == [("succeeded", None)] * 2
+        [shared] = db.scalars(select(Repository).where(Repository.source_url == react)).all()
+        links = db.scalars(select(ApplicationRepository).where(ApplicationRepository.repository_id == shared.id)).all()
+        assert sorted(link.application_id for link in links) == sorted(job.application_id for job in jobs)
 
 
 def test_postgres_command_code_runs_share_their_native_connection(postgres):
@@ -201,7 +567,7 @@ def test_postgres_command_code_runs_share_their_native_connection(postgres):
         db.add(account)
         db.flush()
         account_id = account.id
-        enqueue(db, "audit_context", create_program(db), {"source_generation": 1})
+        enqueue(db, "audit_context", create_application(db), {"source_generation": 1})
     with factory.begin() as db:
         job = claim(db, "worker")
     # Both runs must be in flight at once; a lock held on the account row would time this out.
@@ -351,19 +717,19 @@ def test_postgres_scheduler_deduplicates_and_api_survives_replacement(postgres):
             "/api/auth/login", json={"username": "admin", "password": "postgres-fixture-password"}
         ).json()
         client.headers["X-CSRF-Token"] = login["csrf_token"]
-        assert client.get("/api/programs").status_code == 200
+        assert client.get("/api/applications").status_code == 200
         created = client.post(
-            "/api/programs",
+            "/api/applications",
             json={
                 "asset_name": "Persistent",
                 "asset_url": "https://example.com",
                 "product_kind": "plugin",
                 "product_name": "Fixture",
-                "source_kind": "wordpress",
-                "plugin_slug": "fixture",
-                "monitor_interval_days": 2,
+                "monitor_interval_seconds": 172800,
             },
         ).json()
+        client.post(f"/api/applications/{created['id']}/repositories",
+                    json={"source_kind": "wordpress", "plugin_slug": "fixture"})
         cookie = client.cookies.get("numen_session")
     with factory.begin() as db:
         assert schedule(db) == 1
@@ -371,6 +737,6 @@ def test_postgres_scheduler_deduplicates_and_api_survives_replacement(postgres):
     replacement = create_app(config=config)
     with TestClient(replacement) as client:
         client.cookies.set("numen_session", cookie)
-        assert client.get(f"/api/programs/{created['id']}").json()["asset_name"] == "Persistent"
+        assert client.get(f"/api/applications/{created['id']}").json()["asset_name"] == "Persistent"
         assert len(client.get("/api/jobs").json()["items"]) == 1
-        assert client.post(f"/api/programs/{created['id']}/checks").status_code == 403
+        assert client.post(f"/api/applications/{created['id']}/checks").status_code == 403

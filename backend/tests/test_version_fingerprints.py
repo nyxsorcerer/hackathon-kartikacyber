@@ -4,10 +4,10 @@ import zipfile
 
 import httpx
 
-from conftest import FixtureBroker, program, source_snapshot
+from conftest import FixtureBroker, application, repository_of, source_snapshot
 from numen import fingerprint_probe, fingerprints
 from numen.artifacts import publish
-from numen.models import Program, VersionRecipe
+from numen.models import Application, VersionRecipe
 from numen.sources import Sources
 from numen.worker import run_once
 from numen.workflows import merge_fingerprints
@@ -35,7 +35,7 @@ def release_files(version):
 
 def test_release_corpus_fingerprints_served_files_of_one_installer_package(system, monkeypatch):
     app, client, config = system
-    p = program(client)
+    p = application(client)
     base = "https://api.github.com/repos/demo/plugin/releases/assets/"
     releases = [
         {
@@ -56,10 +56,10 @@ def test_release_corpus_fingerprints_served_files_of_one_installer_package(syste
         version = url.rsplit("/", 1)[1]
         return httpx.Response(200, content=package(f"app-{version}", release_files(version)))
 
-    source = Sources(config)
+    source = Sources(config, "fixture-github-token")
     monkeypatch.setattr(source, "get", get)
     with app.state.factory() as db:
-        corpus = source.release_corpus(db.get(Program, p["id"]))
+        corpus = source.release_corpus(repository_of(db, p["id"]))
     assert not any(url.endswith("-updater") for url in requested)
     # Paths drop the versioned package folder and keep only assets a site publishes;
     # manifests, dependency metadata and server config are never fingerprinted or requested.
@@ -137,11 +137,11 @@ def test_release_fingerprints_narrow_but_never_overrule_a_disclosure():
 
 def test_version_check_runs_numen_fingerprint_stage_after_the_recipe(system):
     app, client, config = system
-    p = program(client, source_kind="wordpress", source_url="https://plugins.svn.wordpress.org/demo", plugin_slug="demo", source_ref=None)
+    p = application(client, source_kind="wordpress", source_url="https://plugins.svn.wordpress.org/demo", plugin_slug="demo", source_ref=None)
     source_snapshot(app, p["id"])
     corpus = {**CORPUS, "fingerprints": {}, "limitations": []}
     with app.state.factory.begin() as db:
-        recipe = VersionRecipe(program_id=p["id"], source_generation=1, source_ref="a" * 40, status="active", data={})
+        recipe = VersionRecipe(application_id=p["id"], source_generation=1, source_ref="a" * 40, status="active", data={})
         db.add(recipe)
         db.flush()
         publish(db, config.artifact_root, "recipe", recipe.id, {
@@ -149,7 +149,7 @@ def test_version_check_runs_numen_fingerprint_stage_after_the_recipe(system):
             "recipe.json": b"{}",
             "release-corpus.json": json.dumps(corpus).encode(),
         })
-        row = db.get(Program, p["id"])
+        row = db.get(Application, p["id"])
         row.config = {**row.config, "active_recipe_id": recipe.id}
     stages = []
 
@@ -161,13 +161,13 @@ def test_version_check_runs_numen_fingerprint_stage_after_the_recipe(system):
         stages.append(("recipe", target["mode"], call["policy"]["request_budget"]))
         return observation(), {}
 
-    client.post(f"/api/programs/{p['id']}/version-checks")
+    client.post(f"/api/applications/{p['id']}/version-checks")
     run_once(config, app.state.factory, FixtureBroker(handler=handler))
     assert stages == [
         ("recipe", "observe", 25),
         ("fingerprints", {"base_url": "https://example.com/wp-content/plugins/demo/", "budget": 10}, 10),
     ]
-    version = client.get(f"/api/programs/{p['id']}").json()["version"]
+    version = client.get(f"/api/applications/{p['id']}").json()["version"]
     assert version["status"] == "detected" and version["version"] == "2.1"
     assert version["method"] == "html_markers+release_fingerprints"
 
@@ -177,11 +177,12 @@ def test_fingerprint_base_follows_the_recipe_only_onto_allowed_origins():
 
     from numen.workflows import fingerprint_base
 
-    site_program = SimpleNamespace(asset_url="https://site.test/cms", source_kind="github", plugin_slug=None)
+    site_application = SimpleNamespace(asset_url="https://site.test/cms")
+    github = SimpleNamespace(source_kind="github", plugin_slug=None)
     policy = {"origins": ["https://site.test", "https://cdn.site.test"]}
-    assert fingerprint_base(site_program, {}, policy) == "https://site.test/cms/"
-    assert fingerprint_base(site_program, {"asset_base": "static"}, policy) == "https://site.test/cms/static/"
-    assert fingerprint_base(site_program, {"asset_base": "https://cdn.site.test/v"}, policy) == "https://cdn.site.test/v/"
-    assert fingerprint_base(site_program, {"asset_base": "https://evil.test/"}, policy) == "https://site.test/cms/"
+    assert fingerprint_base(site_application, github, {}, policy) == "https://site.test/cms/"
+    assert fingerprint_base(site_application, github, {"asset_base": "static"}, policy) == "https://site.test/cms/static/"
+    assert fingerprint_base(site_application, github, {"asset_base": "https://cdn.site.test/v"}, policy) == "https://cdn.site.test/v/"
+    assert fingerprint_base(site_application, github, {"asset_base": "https://evil.test/"}, policy) == "https://site.test/cms/"
     assert fingerprints.strip_root({"a-1/x.js": b"", "a-1/y/z.css": b""}) == {"x.js": b"", "y/z.css": b""}
     assert fingerprints.strip_root({"x.js": b"", "y/z.css": b""}) == {"x.js": b"", "y/z.css": b""}

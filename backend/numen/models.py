@@ -1,7 +1,18 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -60,35 +71,90 @@ class Plugin(Base):
     data: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
-class Program(Base):
-    __tablename__ = "programs"
+class Application(Base):
+    __tablename__ = "applications"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     asset_name: Mapped[str] = mapped_column(String)
     asset_url: Mapped[str] = mapped_column(Text)
     product_kind: Mapped[str] = mapped_column(String)
     product_name: Mapped[str] = mapped_column(String)
-    source_kind: Mapped[str] = mapped_column(String)
-    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
-    source_path: Mapped[str | None] = mapped_column(String, nullable=True)
-    plugin_slug: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The generation of its source repository, which version recipes, observations and audit
+    # contexts belong to.
     source_generation: Mapped[int] = mapped_column(Integer, default=1)
-    monitor_interval_days: Mapped[int] = mapped_column(Integer)
+    monitor_interval_seconds: Mapped[int] = mapped_column(Integer)
     monitor_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     archived: Mapped[bool] = mapped_column(Boolean, default=False)
     config: Mapped[dict] = mapped_column(JSON, default=dict)
-    cursor: Mapped[str | None] = mapped_column(String, nullable=True)
     cve_cursor: Mapped[dict] = mapped_column(JSON, default=dict)
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Repository(Base):
+    """An Own or Upstream repository, stored once per source URL and polled once for every
+    Application that links it."""
+
+    __tablename__ = "repositories"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    source_kind: Mapped[str] = mapped_column(String)
+    source_url: Mapped[str] = mapped_column(Text, unique=True)
+    # ponytail: slug, ref and path are set when the row is created and never edited, so every
+    # Application linking this URL shares the first one's branch and subpath; key the row by
+    # (url, ref, path) if Applications need different ones.
+    plugin_slug: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_generation: Mapped[int] = mapped_column(Integer, default=1)
+    cursor: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The ETag of the last GitHub commit list, sent as If-None-Match on the next poll.
+    etag: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The Release branches polled besides the default branch: {branch: {cursor, etag}}.
+    watched_branches: Mapped[dict] = mapped_column(JSON, default=dict)
+    baseline_revision: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ApplicationRepository(Base):
+    __tablename__ = "application_repositories"
+    __table_args__ = (
+        UniqueConstraint("application_id", "repository_id"),
+        Index(
+            "uq_application_own_repository",
+            "application_id",
+            unique=True,
+            postgresql_where=text("role = 'own' AND removed_at IS NULL"),
+            sqlite_where=text("role = 'own' AND removed_at IS NULL"),
+        ),
+    )
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    repository_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"))
+    role: Mapped[str] = mapped_column(String)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    locked_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    # manifest, operator or deployed
+    locked_version_source: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The Release branch found for release_branch_version (None: none exists). A different
+    # Locked version is resolved again on the next check.
+    release_branch: Mapped[str | None] = mapped_column(String, nullable=True)
+    release_branch_version: Mapped[str | None] = mapped_column(String, nullable=True)
+    # A derived Upstream link: the packages it stands for, such as "npm:react". Hand-added: [].
+    packages: Mapped[list] = mapped_column(JSON, default=list)
+    # The Own link: the revision its Upstream repositories were last derived from, and the
+    # packages that could not be mapped to one: [{ecosystem, name, version, reason}].
+    derived_revision: Mapped[str | None] = mapped_column(String, nullable=True)
+    unresolved: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class Commit(Base):
     __tablename__ = "commits"
-    __table_args__ = (UniqueConstraint("program_id", "source_generation", "revision"),)
+    __table_args__ = (UniqueConstraint("repository_id", "source_generation", "revision"),)
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    repository_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"))
     source_generation: Mapped[int] = mapped_column(Integer)
     revision: Mapped[str] = mapped_column(String)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -100,7 +166,7 @@ class Commit(Base):
 class Snapshot(Base):
     __tablename__ = "source_snapshots"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    repository_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"))
     source_generation: Mapped[int] = mapped_column(Integer)
     source_ref: Mapped[str] = mapped_column(String)
     files: Mapped[list] = mapped_column(JSON, default=list)
@@ -110,7 +176,7 @@ class Snapshot(Base):
 class Analysis(Base):
     __tablename__ = "analyses"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
     kind: Mapped[str] = mapped_column(String)
     subject_id: Mapped[str] = mapped_column(String)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"))
@@ -123,7 +189,7 @@ class Analysis(Base):
 class VersionRecipe(Base):
     __tablename__ = "version_recipes"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
     source_generation: Mapped[int] = mapped_column(Integer)
     source_ref: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String)
@@ -134,7 +200,7 @@ class VersionRecipe(Base):
 class Observation(Base):
     __tablename__ = "version_observations"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
     recipe_id: Mapped[str | None] = mapped_column(ForeignKey("version_recipes.id"), nullable=True)
     source_generation: Mapped[int] = mapped_column(Integer)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
@@ -144,7 +210,7 @@ class Observation(Base):
 class AuditContext(Base):
     __tablename__ = "audit_contexts"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
     source_generation: Mapped[int] = mapped_column(Integer)
     source_ref: Mapped[str] = mapped_column(String)
     skill_revision: Mapped[str] = mapped_column(String)
@@ -162,11 +228,11 @@ class CVE(Base):
     data: Mapped[dict] = mapped_column(JSON)
 
 
-class ProgramCVE(Base):
-    __tablename__ = "program_cves"
-    __table_args__ = (UniqueConstraint("program_id", "cve_id"),)
+class ApplicationCVE(Base):
+    __tablename__ = "application_cves"
+    __table_args__ = (UniqueConstraint("application_id", "cve_id"),)
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
     cve_id: Mapped[str] = mapped_column(ForeignKey("cves.id"))
     confirmed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     data: Mapped[dict] = mapped_column(JSON, default=dict)
@@ -175,7 +241,7 @@ class ProgramCVE(Base):
 class Finding(Base):
     __tablename__ = "findings"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
-    program_id: Mapped[str] = mapped_column(ForeignKey("programs.id"))
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
     kind: Mapped[str] = mapped_column(String)
     cve_id: Mapped[str | None] = mapped_column(ForeignKey("cves.id"), nullable=True)
     title: Mapped[str] = mapped_column(String)
@@ -223,7 +289,7 @@ class Job(Base):
     __tablename__ = "jobs"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     kind: Mapped[str] = mapped_column(String, index=True)
-    program_id: Mapped[str | None] = mapped_column(ForeignKey("programs.id"), nullable=True)
+    application_id: Mapped[str | None] = mapped_column(ForeignKey("applications.id"), nullable=True)
     status: Mapped[str] = mapped_column(String, index=True, default="queued")
     input: Mapped[dict] = mapped_column(JSON, default=dict)
     input_hash: Mapped[str] = mapped_column(String)

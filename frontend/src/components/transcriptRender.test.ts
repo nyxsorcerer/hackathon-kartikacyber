@@ -54,7 +54,7 @@ it("styles markdown as a terminal does instead of rendering HTML", () => {
   expect(dunder[0].every((span) => !span.style)).toBe(true);
 });
 
-it("keeps a program's own colors and marks failed exits", () => {
+it("keeps a tool's own colors and marks failed exits", () => {
   expect(outputLines("\x1b[32mok\x1b[0m")[0]).toEqual([
     { text: "ok", style: { color: "var(--ansi-2)" } },
   ]);

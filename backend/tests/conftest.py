@@ -8,8 +8,11 @@ from fastapi.testclient import TestClient
 
 from numen.api import create_app
 from numen.config import Config
-from numen.models import Account, Commit, Program, Setting, Snapshot
+from numen.domain import source_repository
+from numen.models import Account, Commit, Application, Repository, Setting, Snapshot
 from numen.artifacts import publish
+
+REPOSITORY_FIELDS = ("role", "source_kind", "source_url", "source_ref", "source_path", "plugin_slug", "locked_version")
 
 
 @pytest.fixture
@@ -20,7 +23,7 @@ def system(tmp_path):
         secret_key=Fernet.generate_key().decode(),
         test_mode=True,
         frontend_root=Path("/missing-frontend"),
-        monitor_interval_days=2,
+        monitor_interval_seconds=172800,
     )
     app = create_app(config=config, admin_password="test-password-long")
     with TestClient(app) as client:
@@ -31,20 +34,49 @@ def system(tmp_path):
         yield app, client, config
 
 
-def program(client, **overrides):
+def application(client, **overrides):
+    """Creates an Application linked to one Upstream repository, built from the source_* overrides."""
+    source = {
+        "source_kind": "github",
+        "source_url": "https://github.com/demo/plugin",
+        "source_ref": "main",
+        **{key: overrides.pop(key) for key in REPOSITORY_FIELDS if key in overrides},
+    }
     body = {
         "asset_name": "Site",
         "asset_url": "https://example.com",
         "product_kind": "plugin",
         "product_name": "Demo",
-        "source_kind": "github",
-        "source_url": "https://github.com/demo/plugin",
-        "source_ref": "main",
-        "monitor_interval_days": 2,
+        "monitor_interval_seconds": 172800,
     }
-    result = client.post("/api/programs", json={**body, **overrides})
+    result = client.post("/api/applications", json={**body, **overrides})
     assert result.status_code == 201, result.text
-    return result.json()
+    ident = result.json()["id"]
+    linked = client.post(f"/api/applications/{ident}/repositories", json=source)
+    assert linked.status_code == 201, linked.text
+    return client.get(f"/api/applications/{ident}").json()
+
+
+def repository_of(db, ident):
+    """The repository the Application's operations read."""
+    return source_repository(db, db.get(Application, ident))
+
+
+def check_now(client, ident):
+    """Check now for an Application with one polled repository: that repository's job id."""
+    response = client.post(f"/api/applications/{ident}/checks")
+    assert response.status_code == 202, response.text
+    return response.json()["items"][0]["job_id"]
+
+
+def github_account(app):
+    """A GitHub read token; GitHub repositories are never polled without one."""
+    with app.state.factory.begin() as db:
+        db.add(Account(
+            label="GitHub", provider="github", auth_type="api_key",
+            credential=app.state.vault.encrypt({"api_key": "fixture-github-token"}),
+            data={"status": "unchecked", "models": [], "usage": None},
+        ))
 
 
 def connection(app, agents=None):
@@ -95,12 +127,14 @@ def connection(app, agents=None):
     return profile
 
 
-def source_snapshot(app, ident, revision="a" * 40):
+def source_snapshot(app, ident, revision="a" * 40, repository_id=None):
+    """A snapshot and a commit at `revision` of the Application's source repository, or of
+    `repository_id`."""
     with app.state.factory.begin() as db:
-        row = db.get(Program, ident)
+        row = db.get(Repository, repository_id) if repository_id else repository_of(db, ident)
         row.cursor = revision
         source = Snapshot(
-            program_id=ident,
+            repository_id=row.id,
             source_generation=row.source_generation,
             source_ref=revision,
             files=["main.py"],
@@ -115,7 +149,7 @@ def source_snapshot(app, ident, revision="a" * 40):
             {"main.py": b"def parse(value):\n    return str(value)\n"},
         )
         commit = Commit(
-            program_id=ident,
+            repository_id=row.id,
             source_generation=row.source_generation,
             revision=revision,
             data={

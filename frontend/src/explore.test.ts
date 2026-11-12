@@ -6,7 +6,7 @@ import { failureGroups } from "./pages/Jobs";
 import { matches, severityOf } from "./components/ui";
 const commit = {
   id: "c",
-  program_id: "p",
+  application_id: "p",
   revision: "abc",
   message: "m",
   diff_complete: true,
@@ -71,7 +71,7 @@ describe("diff navigation", () => {
 describe("CVE exploring", () => {
   it("rates severity from v3/v4 scores only, treating v2-only as unscored", () => {
     const base = {
-      program_id: "p",
+      application_id: "p",
       title: "t",
       description: "d",
       match_status: "confirmed",

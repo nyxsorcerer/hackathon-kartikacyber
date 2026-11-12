@@ -128,7 +128,7 @@ class SessionInput(BaseModel):
 class Repository(BaseModel):
     """A canonical source repository Numen mirrors for a build run, with full history.
 
-    The URL comes from the program's own source configuration, never from an agent.
+    The URL comes from the Application's own source configuration, never from an agent.
     """
     model_config = ConfigDict(extra="forbid")
     url: str = Field(max_length=200, pattern=r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")

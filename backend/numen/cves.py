@@ -67,12 +67,12 @@ def cpe_matches(record, selector):
     return bool(cpe_identity(record) and cpe_identity(record) == cpe_identity(selector))
 
 
-def product_match(program, cve, link):
+def product_match(application, cve, link):
     if link.confirmed is False:
         return "rejected"
     if link.confirmed is True:
         return "confirmed"
-    selectors = program.config.get("cve_selectors", [])
+    selectors = application.config.get("cve_selectors", [])
     for config in cve.raw.get("configurations", []):
         for node in config.get("nodes", []):
             for match in node.get("cpeMatch", []):
@@ -84,9 +84,9 @@ def product_match(program, cve, link):
     return "potential"
 
 
-def gate(program, cve, link):
-    config = program.config
-    matched = product_match(program, cve, link)
+def gate(application, cve, link):
+    config = application.config
+    matched = product_match(application, cve, link)
     reason, witness = None, None
     if matched != "confirmed":
         reason = "Product identity requires confirmation"
@@ -113,16 +113,16 @@ def gate(program, cve, link):
     }
 
 
-def gate_hash(program, cve, link):
+def gate_hash(application, cve, link):
     return fingerprint(
         {
             "record": {
                 k: v for k, v in cve.data.items() if k not in ("published_at", "modified_at")
             },
-            "match": product_match(program, cve, link),
-            "selectors": program.config.get("cve_selectors"),
-            "min": program.config.get("cve_min_score"),
-            "versions": program.config.get("cve_versions"),
+            "match": product_match(application, cve, link),
+            "selectors": application.config.get("cve_selectors"),
+            "min": application.config.get("cve_min_score"),
+            "versions": application.config.get("cve_versions"),
         }
     )
 
@@ -154,21 +154,24 @@ def compare_versions(a, b, scheme):
     return None
 
 
-def version_scheme(program):
+def version_scheme(application, repository):
+    """`repository` is the Application's source repository, or None."""
     return (
         "php"
-        if program.source_kind == "wordpress"
-        else program.config.get("version_scheme", "unknown")
+        if repository and repository.source_kind == "wordpress"
+        else application.config.get("version_scheme", "unknown")
     )
 
 
-def vulnerable_bound(program, cve):
+def vulnerable_bound(application, repository, cve):
     """Highest version a record still reports as affected, for pinning vulnerable source."""
-    scheme, candidates = version_scheme(program), []
+    scheme, candidates = version_scheme(application, repository), []
+    source = (repository.source_url if repository else "").rstrip("/").lower()
     for entry in cve.raw.get("affected", []):
         for data in entry.get("affectedData", []):
             collection = data.get("repo") or data.get("collectionURL")
-            if collection and collection.rstrip("/") != (program.source_url or "").rstrip("/"):
+            # Repository URLs are stored lower-cased; GitHub names are case-insensitive.
+            if collection and collection.rstrip("/").lower() != source:
                 continue
             for version in data.get("versions", []):
                 if version.get("status") != "affected":
@@ -179,7 +182,7 @@ def vulnerable_bound(program, cve):
                     candidates.append((version["lessThan"], False))
                 elif version.get("version") not in (None, "", "*", "-"):
                     candidates.append((version["version"], True))
-    selectors = program.config.get("cve_selectors", [])
+    selectors = application.config.get("cve_selectors", [])
     for config in cve.raw.get("configurations", []):
         if config.get("negate"):
             continue
@@ -235,16 +238,16 @@ def range_match(version, match, scheme):
     return True
 
 
-def applicability(program, cve, observation):
+def applicability(application, repository, cve, observation):
     if (
         not observation
         or observation.data.get("status") != "detected"
         or not observation.data.get("version")
     ):
         return "unknown"
-    scheme = version_scheme(program)
+    scheme = version_scheme(application, repository)
     values = []
-    selectors = program.config.get("cve_selectors", [])
+    selectors = application.config.get("cve_selectors", [])
     for config in cve.raw.get("configurations", []):
         # Environmental AND/negation requires evidence about other products.
         if config.get("operator", "OR") != "OR" or config.get("negate"):
@@ -270,5 +273,5 @@ def safe_reference(value):
     return parsed.scheme in ("http", "https") and bool(parsed.hostname)
 
 
-def analysis_superseded(program, cve, link, saved_hash):
-    return bool(saved_hash and gate_hash(program, cve, link) != saved_hash)
+def analysis_superseded(application, cve, link, saved_hash):
+    return bool(saved_hash and gate_hash(application, cve, link) != saved_hash)

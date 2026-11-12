@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import io
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import tarfile
@@ -180,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip('/') or '/'
+        # Repositories outlive a journey run, so each run links its own numen/fixture-<run>.
+        path = re.sub(r'^/repos/numen/fixture-[0-9a-f]+(?=/|$)', '/repos/numen/fixture', path)
         query = parse_qs(parsed.query)
         with STATE.lock:
             STATE.requests.append(path)
@@ -201,8 +204,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/repos/numen/fixture/commits':
             if int(query.get('page', ['1'])[0]) > 1:
                 return self.json([])
-            revisions = [BASE_SHA] if generation == 0 else [FIX_SHA, OLD_DATED_SHA, BASE_SHA]
-            return self.json([commit(sha) for sha in revisions])
+            if query.get('sha') == [BASE_SHA]:
+                revisions = [BASE_SHA]
+            else:
+                revisions = [BASE_SHA] if generation == 0 else [FIX_SHA, OLD_DATED_SHA, BASE_SHA]
+            body = json.dumps([commit(sha) for sha in revisions]).encode()
+            etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+            if self.headers.get('If-None-Match') == etag:
+                return self.send(304, b'', headers={'ETag': etag})
+            return self.send(200, body, headers={'ETag': etag})
         if path.startswith('/repos/numen/fixture/commits/'):
             sha = path.rsplit('/', 1)[1]
             if sha in (BASE_SHA, FIX_SHA, OLD_DATED_SHA):

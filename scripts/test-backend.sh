@@ -3,7 +3,7 @@ set -eu
 numen_case=${1:-all}
 case "$numen_case" in
     all) numen_selector='' ;;
-    auth-persistence|program-configuration) numen_selector='auth_program or inherited_interval or api_survives_replacement' ;;
+    auth-persistence|application-configuration) numen_selector='auth_application or inherited_interval or api_survives_replacement' ;;
     source-monitoring) numen_selector='github_old_dated or github_archive or wordpress or nvd' ;;
     job-recovery) numen_selector='lease_recovery or postgres' ;;
     review-notification) numen_selector='explicit_commit or webhook' ;;

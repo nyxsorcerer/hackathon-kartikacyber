@@ -15,7 +15,7 @@ from .models import (
     JobAttempt,
     LabRun,
     Observation,
-    Program,
+    Repository,
     VersionRecipe,
     now,
 )
@@ -123,12 +123,14 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                     and row.result
                     and row.result.get("artifact_revision")
                 )
-                if (
-                    row.program_id
-                    and row.kind == "source_check"
-                    and error["code"] not in ("input_changed", "source_check_superseded")
-                ):
-                    db.get(Program, row.program_id).last_error = error
+                repository = (
+                    db.get(Repository, row.input.get("repository_id"))
+                    if row.kind in ("source_check", "backfill", "derive_upstreams")
+                    and row.input.get("repository_id")
+                    else None
+                )
+                if repository and error["code"] not in ("input_changed", "source_check_superseded"):
+                    repository.last_error = error
                 if row.kind in ("commit_triage", "jev_triage"):
                     commit = db.get(Commit, row.input.get("commit_id"))
                     if commit:
@@ -145,10 +147,10 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                             "error": error,
                             "last_checked_at": now().isoformat(),
                         }
-                if row.kind == "version_check" and row.program_id:
+                if row.kind == "version_check" and row.application_id:
                     db.add(
                         Observation(
-                            program_id=row.program_id,
+                            application_id=row.application_id,
                             recipe_id=row.input.get("recipe_id"),
                             source_generation=row.input.get("source_generation", 1),
                             data={
@@ -167,7 +169,7 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                 if row.kind == "version_recipe":
                     for recipe in db.scalars(
                         select(VersionRecipe).where(
-                            VersionRecipe.program_id == row.program_id,
+                            VersionRecipe.application_id == row.application_id,
                             VersionRecipe.status.in_(["validating", "rejected"]),
                         )
                     ):

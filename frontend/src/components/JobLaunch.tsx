@@ -85,7 +85,7 @@ export function JobLaunch({
           {override
             ? "Using your selection for this job."
             : initialProfile
-              ? "Using the program’s execution profile. You can change it below."
+              ? "Using the application’s execution profile. You can change it below."
               : "Using the global execution profile. You can change it below."}
         </small>
       </div>

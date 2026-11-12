@@ -7,7 +7,7 @@ import {
   jobSchema,
   jobsSchema,
   operationNames,
-  programsSchema,
+  applicationsSchema,
   recordsSchema,
 } from "../types";
 import type { Job, JobSubject } from "../types";
@@ -52,7 +52,12 @@ const statuses = [
   "failed",
   "cancelled",
 ];
-type JobFilters = { status: string; kind: string; program: string; q: string };
+type JobFilters = {
+  status: string;
+  kind: string;
+  application: string;
+  q: string;
+};
 function resultId(result: unknown, key: string) {
   if (typeof result !== "object" || !result || !(key in result)) return;
   const value: unknown = Reflect.get(result, key);
@@ -67,16 +72,16 @@ function applyJobFilters(items: Job[], f: JobFilters, skip?: keyof JobFilters) {
         job.kind,
         jobName(job.kind),
         jobError(job),
-        job.program_name,
+        job.application_name,
         job.subject?.label,
         job.subject?.ref,
         job.subject?.detail,
       ) &&
       (skip === "status" || f.status === "all" || job.status === f.status) &&
       (skip === "kind" || f.kind === "all" || job.kind === f.kind) &&
-      (skip === "program" ||
-        f.program === "all" ||
-        (job.program_id || "none") === f.program),
+      (skip === "application" ||
+        f.application === "all" ||
+        (job.application_id || "none") === f.application),
   );
 }
 /** Group failed jobs by reason so repeated failures read as one problem. */
@@ -111,11 +116,11 @@ export function failureGroups(jobs: Job[]) {
 }
 export function Jobs() {
   const jobs = useCollection("/jobs", jobsSchema, 10000, 600);
-  const programs = useResource("/programs", programsSchema);
+  const applications = useResource("/applications", applicationsSchema);
   const [filters, update] = useQueryState({
     status: "all",
     kind: "all",
-    program: "all",
+    application: "all",
     q: "",
   });
   const items = useMemo(() => jobs.data?.items || [], [jobs.data]);
@@ -125,7 +130,7 @@ export function Jobs() {
   );
   const { shown, footer } = useShowMore(
     visible,
-    [filters.status, filters.kind, filters.program, filters.q].join("|"),
+    [filters.status, filters.kind, filters.application, filters.q].join("|"),
   );
   const statusCounts = countBy(
     applyJobFilters(items, filters, "status"),
@@ -135,13 +140,13 @@ export function Jobs() {
     applyJobFilters(items, filters, "kind"),
     (j) => j.kind,
   );
-  const programCounts = countBy(
-    applyJobFilters(items, filters, "program"),
-    (j) => j.program_id || "none",
+  const applicationCounts = countBy(
+    applyJobFilters(items, filters, "application"),
+    (j) => j.application_id || "none",
   );
   const failures = failureGroups(applyJobFilters(items, filters, "status"));
   const clear = () =>
-    update({ status: "all", kind: "all", program: "all", q: "" });
+    update({ status: "all", kind: "all", application: "all", q: "" });
   return (
     <>
       <PageHeading
@@ -222,22 +227,22 @@ export function Jobs() {
                 })),
             ]}
           />
-          {(programs.data?.items.length || 0) > 0 && (
+          {(applications.data?.items.length || 0) > 0 && (
             <FilterSelect
-              label="Program"
-              value={filters.program}
-              onChange={(program) => update({ program })}
+              label="Application"
+              value={filters.application}
+              onChange={(application) => update({ application })}
               options={[
                 { value: "all", label: "Any" },
-                ...(programs.data?.items || []).map((p) => ({
+                ...(applications.data?.items || []).map((p) => ({
                   value: p.id,
                   label: p.asset_name,
-                  count: programCounts[p.id] || 0,
+                  count: applicationCounts[p.id] || 0,
                 })),
                 {
                   value: "none",
                   label: "Installation",
-                  count: programCounts.none || 0,
+                  count: applicationCounts.none || 0,
                 },
               ]}
             />
@@ -287,11 +292,13 @@ export function Jobs() {
                         <td className="job-cell">
                           <div className="job-kicker">
                             {jobName(job.kind)}
-                            {job.program_id && (
+                            {job.application_id && (
                               <>
                                 {" · "}
-                                <Link to={`/programs/${job.program_id}`}>
-                                  {job.program_name || "Program"}
+                                <Link
+                                  to={`/applications/${job.application_id}`}
+                                >
+                                  {job.application_name || "Application"}
                                 </Link>
                               </>
                             )}
@@ -528,10 +535,10 @@ export function JobDetail() {
           View commit analysis and report
         </Link>
       )}
-      {job.kind === "cve_analysis" && cveId && job.program_id && (
+      {job.kind === "cve_analysis" && cveId && job.application_id && (
         <Link
           className="secondary button"
-          to={`/cves?cve=${encodeURIComponent(cveId)}&cvep=${encodeURIComponent(job.program_id)}&view=analysis${analysisId ? `&run=${encodeURIComponent(analysisId)}` : ""}`}
+          to={`/cves?cve=${encodeURIComponent(cveId)}&cve_application=${encodeURIComponent(job.application_id)}&view=analysis${analysisId ? `&run=${encodeURIComponent(analysisId)}` : ""}`}
         >
           View CVE analysis and report
         </Link>
@@ -549,7 +556,7 @@ export function JobDetail() {
   const hasResultLinks =
     !!job &&
     ((job.kind === "commit_analysis" && !!commitId) ||
-      (job.kind === "cve_analysis" && !!cveId && !!job.program_id) ||
+      (job.kind === "cve_analysis" && !!cveId && !!job.application_id) ||
       !!findingId);
   return (
     <DataState
@@ -571,9 +578,9 @@ export function JobDetail() {
                 )}
                 <p className="job-refs">
                   {job.subject && <SubjectLink subject={job.subject} />}
-                  {job.program_id && (
-                    <Link to={`/programs/${job.program_id}`}>
-                      {job.program_name || "Program"}
+                  {job.application_id && (
+                    <Link to={`/applications/${job.application_id}`}>
+                      {job.application_name || "Application"}
                     </Link>
                   )}
                 </p>
@@ -603,10 +610,10 @@ export function JobDetail() {
             <DetailGrid
               items={[
                 [
-                  "Program",
-                  job.program_id ? (
-                    <Link to={`/programs/${job.program_id}`}>
-                      {job.program_name || "Program"}
+                  "Application",
+                  job.application_id ? (
+                    <Link to={`/applications/${job.application_id}`}>
+                      {job.application_name || "Application"}
                     </Link>
                   ) : (
                     "Installation operation"

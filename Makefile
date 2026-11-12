@@ -34,7 +34,7 @@ check: init
 test: test-unit test-integration test-runtime test-ui
 
 test-unit: init
-	$(COMPOSE) --profile test run --build --no-deps --rm backend-tests pytest -q -p no:cacheprovider tests/test_api.py tests/test_workflows.py tests/test_artifacts.py tests/test_accounts.py
+	$(COMPOSE) --profile test run --build --no-deps --rm backend-tests pytest -q -p no:cacheprovider tests/test_api.py tests/test_workflows.py tests/test_artifacts.py tests/test_accounts.py tests/test_repositories.py tests/test_intake.py tests/test_dependencies.py
 	$(COMPOSE) --profile test run --build --no-deps --rm runner-tests
 
 test-integration: init

@@ -34,6 +34,24 @@ def media(path):
     return Path(path).suffix.lower() in MEDIA_SUFFIXES
 
 
+def github_token_required():
+    return DomainError(
+        "github_token_required",
+        "Add a GitHub read token (Contents and Metadata) under Settings, Accounts. "
+        "GitHub repositories are not polled without it.",
+        422,
+    )
+
+
+def release_branch_candidates(version):
+    """The branch names that may carry the release line of `version`, in matching order."""
+    match = re.match(r"v?(\d+)(?:\.(\d+))?", version)
+    if not match:
+        return []
+    major, minor = match.groups()
+    return [f"{major}.x", *([f"{major}.{minor}"] if minor else []), f"release-{major}", f"v{major}"]
+
+
 def github_parents(data):
     parents = data.get("parents") if isinstance(data, dict) else None
     if not isinstance(parents, list) or any(not isinstance(p, dict) or not isinstance(p.get("sha"), str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", p["sha"]) for p in parents):
@@ -55,6 +73,16 @@ class Sources:
             os.getenv("NUMEN_NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0")
             if config.test_mode
             else "https://services.nvd.nist.gov/rest/json/cves/2.0"
+        )
+        self.npm = (
+            os.getenv("NUMEN_NPM_REGISTRY_URL", "https://registry.npmjs.org")
+            if config.test_mode
+            else "https://registry.npmjs.org"
+        )
+        self.packagist = (
+            os.getenv("NUMEN_PACKAGIST_URL", "https://repo.packagist.org")
+            if config.test_mode
+            else "https://repo.packagist.org"
         )
 
     def close(self):
@@ -112,37 +140,115 @@ class Sources:
             retryable=True,
         )
 
-    def github_commits(self, program):
-        repo = program.source_url.removeprefix("https://github.com/")
-        headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-        if self.github_key:
-            headers["Authorization"] = f"Bearer {self.github_key}"
-        params = {"per_page": 100, "sha": program.source_ref or "HEAD"}
-        first = self.get(
-            f"{self.github}/repos/{repo}/commits", {**params, "page": 1}, headers
-        ).json()
+    def find(self, url, params=None, headers=None):
+        """get(), or None when the source answers 404."""
+        try:
+            return self.get(url, params, headers)
+        except DomainError as exc:
+            if exc.code == "upstream_error" and "404" in exc.message:
+                return None
+            raise
+
+    def github_file(self, repository, path, ref):
+        """The text of `path` under the repository's source_path at `ref`, or None without it."""
+        repo = repository.source_url.removeprefix("https://github.com/")
+        if repository.source_path:
+            path = repository.source_path.rstrip("/") + "/" + path
+        response = self.find(
+            f"{self.github}/repos/{repo}/contents/{quote(path)}",
+            {"ref": ref},
+            {**self.github_headers(), "Accept": "application/vnd.github.raw+json"},
+        )
+        return None if response is None else response.text
+
+    def npm_repository(self, name, version):
+        """The repository field of the npm metadata of `version` (the latest without one), ""
+        when it has none, or None when the registry does not have it."""
+        response = self.find(f"{self.npm}/{quote(name, safe='@')}/{quote(version or 'latest', safe='')}")
+        return None if response is None else response.json().get("repository") or ""
+
+    def packagist_repository(self, name, version):
+        """source.url of the Packagist entry for `version` (else the newest), "" when it has none,
+        or None when Packagist does not have the package."""
+        response = self.find(f"{self.packagist}/p2/{quote(name)}.json")
+        if response is None:
+            return None
+        entries, entry = [], {}
+        for item in (response.json().get("packages") or {}).get(name) or []:
+            entry = {**entry, **item}  # p2 metadata is minified: each entry lists what changed
+            entries.append(entry)
+        match = next(
+            (e for e in entries if str(e.get("version", "")).lstrip("v") == (version or "").lstrip("v")),
+            entries[0] if entries else {},
+        )
+        source = match.get("source")
+        return (source.get("url") or "") if isinstance(source, dict) else ""
+
+    def github_headers(self):
+        """Headers for every GitHub request. A GitHub repository is never read without a token."""
+        if not self.github_key:
+            raise github_token_required()
+        return {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": f"Bearer {self.github_key}",
+        }
+
+    def github_branch(self, repository, name):
+        """Whether the branch exists."""
+        repo = repository.source_url.removeprefix("https://github.com/")
+        try:
+            response = self.get(
+                f"{self.github}/repos/{repo}/branches/{quote(name, safe='')}",
+                headers=self.github_headers(),
+            )
+        except DomainError as exc:
+            if exc.code == "upstream_error" and "404" in exc.message:
+                return False
+            raise
+        if response.status_code != 200:
+            raise DomainError("upstream_error", f"Source returned HTTP {response.status_code}", 502)
+        return True
+
+    def github_commits(self, repository, branch=None, cursor=None, etag=None):
+        """(head, new commits oldest first, ETag) of `branch` since `cursor`, by default the
+        default branch since the repository's cursor. A branch's first check only sets its
+        Baseline at the head; a 304 for its ETag returns before any other request."""
+        if branch is None:
+            branch, cursor, etag = repository.source_ref or "HEAD", repository.cursor, repository.etag
+        repo = repository.source_url.removeprefix("https://github.com/")
+        headers = self.github_headers()
+        params = {"per_page": 100, "sha": branch}
+        response = self.get(
+            f"{self.github}/repos/{repo}/commits",
+            {**params, "page": 1},
+            {**headers, "If-None-Match": etag} if etag else headers,
+        )
+        if response.status_code == 304:
+            return cursor, [], etag
+        etag = response.headers.get("etag")
+        first = response.json()
         if not isinstance(first, list):
             raise DomainError("invalid_source_response", "GitHub did not return a commit list", 502)
-        head = first[0]["sha"] if first else program.cursor
+        head = first[0]["sha"] if first else cursor
         if head and not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
             raise DomainError(
                 "invalid_source_revision", "GitHub returned an invalid immutable revision", 502
             )
-        if program.cursor and head == program.cursor:
-            return head, []
+        if cursor is None or head == cursor:
+            return head, [], etag
         found, history_rewritten = [], False
         comparison = None
-        if program.cursor and head:
-            try:
-                comparison = self.get(
-                    f"{self.github}/repos/{repo}/compare/{program.cursor}...{head}",
-                    {"per_page": 100, "page": 1},
-                    headers,
-                ).json()
-            except DomainError as exc:
-                if exc.code != "upstream_error" or "404" not in exc.message:
-                    raise
-                history_rewritten = True
+        try:
+            comparison = self.get(
+                f"{self.github}/repos/{repo}/compare/{cursor}...{head}",
+                {"per_page": 100, "page": 1},
+                headers,
+            ).json()
+        except DomainError as exc:
+            if exc.code != "upstream_error" or "404" not in exc.message:
+                raise
+            history_rewritten = True
         if comparison and comparison.get("status") in ("ahead", "identical"):
             found = list(comparison.get("commits", []))
             total = comparison.get("total_commits")
@@ -156,7 +262,7 @@ class Sources:
             while len(found) < total:
                 extra = (
                     self.get(
-                        f"{self.github}/repos/{repo}/compare/{program.cursor}...{head}",
+                        f"{self.github}/repos/{repo}/compare/{cursor}...{head}",
                         {"per_page": 100, "page": page},
                         headers,
                     )
@@ -173,10 +279,10 @@ class Sources:
                 page += 1
             found.reverse()  # Compare order is chronological; common processing order below reverses again.
         else:
-            history_rewritten = history_rewritten or bool(program.cursor)
+            # The cursor is no longer an ancestor of the head: history was rewritten.
+            history_rewritten = True
             found = list(first)
-            # A baseline displays the newest page; later checks import every unseen revision.
-            if program.cursor and len(first) == 100:
+            if len(first) == 100:
                 for page in range(2, 1001):
                     items = self.get(
                         f"{self.github}/repos/{repo}/commits", {**params, "page": page}, headers
@@ -194,90 +300,105 @@ class Sources:
                         "Source history exceeds one bounded sync; no cursor was advanced",
                         422,
                     )
-        commits = []
-        for item in reversed(found):
-            revision = item["sha"]
-            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
-                raise DomainError(
-                    "invalid_source_revision", "GitHub returned an invalid commit revision", 502
-                )
-            detail = self.get(
-                f"{self.github}/repos/{repo}/commits/{revision}", {"per_page": 100}, headers
-            ).json()
-            files = list(detail.get("files", []))
-            # Commit endpoint paginates changed files independently of history.
-            if len(files) == 100:
-                for page in range(2, 31):
-                    extra = (
-                        self.get(
-                            f"{self.github}/repos/{repo}/commits/{revision}",
-                            {"per_page": 100, "page": page},
-                            headers,
-                        )
-                        .json()
-                        .get("files", [])
-                    )
-                    files.extend(extra)
-                    if len(extra) < 100:
-                        break
-                else:
-                    raise DomainError(
-                        "source_diff_limit", "Commit file pagination exceeded the bounded sync", 422
-                    )
-            if program.source_path:
-                prefix = program.source_path.rstrip("/")
-                files = [
-                    f
-                    for f in files
-                    if f.get("filename") == prefix
-                    or f.get("filename", "").startswith(prefix + "/")
-                    or f.get("previous_filename") == prefix
-                    or f.get("previous_filename", "").startswith(prefix + "/")
-                ]
-                if not files:
-                    continue
-            data = detail.get("commit", item.get("commit", {}))
-            diffs = []
-            complete = bool(files)
-            for f in files:
-                patch = f.get("patch")
-                if patch is None:
-                    complete = False
-                else:
-                    diffs.append(
-                        f"--- {f.get('previous_filename', f['filename'])}\n+++ {f['filename']}\n{patch}"
-                    )
-                    if len(patch) > 60000:
-                        complete = False
-            diff = "\n".join(diffs)
-            if len(diff.encode()) > 2 * 1024 * 1024:
-                diff, complete = diff[: 2 * 1024 * 1024], False
-            commits.append(
-                {
-                    "revision": revision,
-                    "message": data.get("message", ""),
-                    "author": data.get("author", {}).get("name", ""),
-                    "committed_at": data.get("committer", {}).get("date"),
-                    "url": f"{program.source_url}/commit/{revision}",
-                    "files": [
-                        {
-                            "path": f["filename"],
-                            "status": f.get("status"),
-                            "previous_path": f.get("previous_filename"),
-                        }
-                        for f in files
-                    ],
-                    "diff": diff,
-                    "diff_complete": complete,
-                    "history_rewritten": history_rewritten,
-                    **({"parent_revisions": github_parents(detail)} if "parents" in detail else {}),
-                }
-            )
-        return head or program.cursor, commits
+        records = [self.github_record(repository, item, history_rewritten) for item in reversed(found)]
+        return head, [record for record in records if record], etag
 
-    def snapshot_github(self, program, revision):
-        repo = program.source_url.removeprefix("https://github.com/")
-        headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+    def github_backfill(self, repository, count):
+        """The last `count` commits up to and including the Baseline, oldest first."""
+        repo = repository.source_url.removeprefix("https://github.com/")
+        items = self.get(
+            f"{self.github}/repos/{repo}/commits",
+            {"sha": repository.baseline_revision, "per_page": count},
+            self.github_headers(),
+        ).json()
+        if not isinstance(items, list):
+            raise DomainError("invalid_source_response", "GitHub did not return a commit list", 502)
+        records = [self.github_record(repository, item) for item in reversed(items[:count])]
+        return [record for record in records if record]
+
+    def github_record(self, repository, item, history_rewritten=False):
+        """One commit with its capped diff, or None when it changes nothing under source_path."""
+        repo = repository.source_url.removeprefix("https://github.com/")
+        headers = self.github_headers()
+        revision = item["sha"]
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", revision):
+            raise DomainError(
+                "invalid_source_revision", "GitHub returned an invalid commit revision", 502
+            )
+        detail = self.get(
+            f"{self.github}/repos/{repo}/commits/{revision}", {"per_page": 100}, headers
+        ).json()
+        files = list(detail.get("files", []))
+        # Commit endpoint paginates changed files independently of history.
+        if len(files) == 100:
+            for page in range(2, 31):
+                extra = (
+                    self.get(
+                        f"{self.github}/repos/{repo}/commits/{revision}",
+                        {"per_page": 100, "page": page},
+                        headers,
+                    )
+                    .json()
+                    .get("files", [])
+                )
+                files.extend(extra)
+                if len(extra) < 100:
+                    break
+            else:
+                raise DomainError(
+                    "source_diff_limit", "Commit file pagination exceeded the bounded sync", 422
+                )
+        if repository.source_path:
+            prefix = repository.source_path.rstrip("/")
+            files = [
+                f
+                for f in files
+                if f.get("filename") == prefix
+                or f.get("filename", "").startswith(prefix + "/")
+                or f.get("previous_filename") == prefix
+                or f.get("previous_filename", "").startswith(prefix + "/")
+            ]
+            if not files:
+                return None
+        data = detail.get("commit", item.get("commit", {}))
+        diffs = []
+        complete = bool(files)
+        for f in files:
+            patch = f.get("patch")
+            if patch is None:
+                complete = False
+            else:
+                diffs.append(
+                    f"--- {f.get('previous_filename', f['filename'])}\n+++ {f['filename']}\n{patch}"
+                )
+                if len(patch) > 60000:
+                    complete = False
+        diff = "\n".join(diffs)
+        if len(diff.encode()) > 2 * 1024 * 1024:
+            diff, complete = diff[: 2 * 1024 * 1024], False
+        return {
+            "revision": revision,
+            "message": data.get("message", ""),
+            "author": data.get("author", {}).get("name", ""),
+            "committed_at": data.get("committer", {}).get("date"),
+            "url": f"{repository.source_url}/commit/{revision}",
+            "files": [
+                {
+                    "path": f["filename"],
+                    "status": f.get("status"),
+                    "previous_path": f.get("previous_filename"),
+                }
+                for f in files
+            ],
+            "diff": diff,
+            "diff_complete": complete,
+            "history_rewritten": history_rewritten,
+            **({"parent_revisions": github_parents(detail)} if "parents" in detail else {}),
+        }
+
+    def snapshot_github(self, repository, revision):
+        repo = repository.source_url.removeprefix("https://github.com/")
+        headers = self.github_headers()
         response = self.get(
             f"{self.github}/repos/{repo}/tarball/{quote(revision, safe='')}", headers=headers
         )
@@ -297,9 +418,9 @@ class Sources:
                 relative = member.name.split("/", 1)[-1]
                 safe_path(relative)
                 if (
-                    program.source_path
-                    and not relative.startswith(program.source_path.rstrip("/") + "/")
-                    and relative != program.source_path
+                    repository.source_path
+                    and not relative.startswith(repository.source_path.rstrip("/") + "/")
+                    and relative != repository.source_path
                 ) or media(relative):
                     continue
                 total += member.size
@@ -310,10 +431,10 @@ class Sources:
                 files[relative] = archive.extractfile(member).read()
         return files
 
-    def github_tags(self, program):
+    def github_tags(self, repository):
         """Bounded newest-first tag catalog with each tag's immutable commit."""
-        repo = program.source_url.removeprefix("https://github.com/")
-        headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+        repo = repository.source_url.removeprefix("https://github.com/")
+        headers = self.github_headers()
         tags = []
         for page in range(1, TAG_PAGES + 1):
             batch = self.get(
@@ -330,10 +451,10 @@ class Sources:
                 break
         return tags
 
-    def vulnerable_tag(self, program, bound, inclusive, scheme):
+    def vulnerable_tag(self, repository, bound, inclusive, scheme):
         """Newest release tag a record still reports as affected, pinned to its own commit."""
         best = None
-        for name, sha in self.github_tags(program):
+        for name, sha in self.github_tags(repository):
             compared = compare_versions(name, bound, scheme)
             if compared is None or compared > 0 or (compared == 0 and not inclusive):
                 continue
@@ -341,10 +462,10 @@ class Sources:
                 best = {"version": name, "source_ref": sha}
         return best
 
-    def commit_ref(self, program, ref):
+    def commit_ref(self, repository, ref):
         """Resolve a tag, branch or abbreviated revision to its immutable commit."""
-        repo = program.source_url.removeprefix("https://github.com/")
-        headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+        repo = repository.source_url.removeprefix("https://github.com/")
+        headers = self.github_headers()
         try:
             data = self.get(
                 f"{self.github}/repos/{repo}/commits/{quote(ref, safe='/')}", headers=headers
@@ -360,9 +481,9 @@ class Sources:
             raise DomainError("invalid_source_response", "GitHub did not return a commit", 502)
         return sha
 
-    def commit_parents(self, program, revision):
-        repo = program.source_url.removeprefix("https://github.com/")
-        headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+    def commit_parents(self, repository, revision):
+        repo = repository.source_url.removeprefix("https://github.com/")
+        headers = self.github_headers()
         data = self.get(f"{self.github}/repos/{repo}/commits/{quote(revision, safe='')}", headers=headers).json()
         if not isinstance(data, dict) or data.get("sha") != revision:
             raise DomainError("invalid_source_response", "Source returned a different commit while resolving its parents", 502)
@@ -390,60 +511,65 @@ class Sources:
                 retryable=True,
             ) from exc
 
-    def wordpress_commits(self, program):
-        base = program.source_url
+    def svn_url(self, repository):
+        base = repository.source_url
         if self.config.test_mode and os.getenv("NUMEN_WORDPRESS_SVN_URL"):
-            base = os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + program.plugin_slug
-        path = program.source_ref or "trunk"
-        if program.source_path:
-            path += "/" + program.source_path
-        url = base + "/" + path
+            base = os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + repository.plugin_slug
+        path = repository.source_ref or "trunk"
+        if repository.source_path:
+            path += "/" + repository.source_path
+        return base + "/" + path
+
+    def wordpress_commits(self, repository):
+        """(head, new revisions oldest first, None). The first check only sets the Baseline."""
+        url = self.svn_url(repository)
         info = ET.fromstring(self.svn("info", "--xml", url))
         head = info.find("entry").attrib["revision"]
-        start = int(program.cursor) + 1 if program.cursor else 1
-        if start > int(head):
-            return head, []
-        log = ET.fromstring(self.svn("log", "--xml", "-v", "-r", f"{start}:{head}", url))
+        if repository.cursor is None or int(repository.cursor) >= int(head):
+            return head, [], None
+        log = ET.fromstring(
+            self.svn("log", "--xml", "-v", "-r", f"{int(repository.cursor) + 1}:{head}", url)
+        )
         entries = list(log.findall("logentry"))
         if len(entries) > 10000:
             raise DomainError(
                 "source_history_limit", "WordPress history exceeds the bounded sync", 422
             )
-        commits = []
-        for entry in entries:
-            rev = entry.attrib["revision"]
-            try:
-                diff = self.svn("diff", "-c", rev, url).decode(errors="replace")
-                complete = len(diff.encode()) <= 2 * 1024 * 1024
-            except DomainError:
-                diff, complete = "", False
-            commits.append(
-                {
-                    "revision": rev,
-                    "message": entry.findtext("msg", ""),
-                    "author": entry.findtext("author", ""),
-                    "committed_at": entry.findtext("date"),
-                    "url": f"https://plugins.trac.wordpress.org/changeset/{rev}/{program.plugin_slug}",
-                    "files": [
-                        {"path": p.text, "status": p.attrib.get("action")}
-                        for p in entry.findall("paths/path")
-                    ],
-                    "diff": diff[: 2 * 1024 * 1024],
-                    "diff_complete": complete,
-                }
-            )
-        return head, commits
+        return head, [self.svn_record(repository, url, entry) for entry in entries], None
 
-    def snapshot_wordpress(self, program, revision):
-        base = program.source_url
-        if self.config.test_mode and os.getenv("NUMEN_WORDPRESS_SVN_URL"):
-            base = os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + program.plugin_slug
-        path = program.source_ref or "trunk"
-        if program.source_path:
-            path += "/" + program.source_path
+    def wordpress_backfill(self, repository, count):
+        """The last `count` revisions up to and including the Baseline, oldest first."""
+        url = self.svn_url(repository)
+        log = ET.fromstring(self.svn(
+            "log", "--xml", "-v", "-l", str(count), "-r", f"{repository.baseline_revision}:1", url
+        ))
+        return [self.svn_record(repository, url, entry) for entry in reversed(log.findall("logentry"))]
+
+    def svn_record(self, repository, url, entry):
+        rev = entry.attrib["revision"]
+        try:
+            diff = self.svn("diff", "-c", rev, url).decode(errors="replace")
+            complete = len(diff.encode()) <= 2 * 1024 * 1024
+        except DomainError:
+            diff, complete = "", False
+        return {
+            "revision": rev,
+            "message": entry.findtext("msg", ""),
+            "author": entry.findtext("author", ""),
+            "committed_at": entry.findtext("date"),
+            "url": f"https://plugins.trac.wordpress.org/changeset/{rev}/{repository.plugin_slug}",
+            "files": [
+                {"path": p.text, "status": p.attrib.get("action")}
+                for p in entry.findall("paths/path")
+            ],
+            "diff": diff[: 2 * 1024 * 1024],
+            "diff_complete": complete,
+        }
+
+    def snapshot_wordpress(self, repository, revision):
         with tempfile.TemporaryDirectory(prefix="numen-svn-") as directory:
             dest = Path(directory) / "source"
-            self.svn("export", "-r", revision, base + "/" + path, str(dest))
+            self.svn("export", "-r", revision, self.svn_url(repository), str(dest))
             files, total = {}, 0
             for file in dest.rglob("*"):
                 if file.is_symlink():
@@ -530,7 +656,7 @@ class Sources:
                         )
         return list(results.values()), finished.isoformat()
 
-    def release_corpus(self, program):
+    def release_corpus(self, repository):
         """Pin a bounded release corpus, retaining exactly which distributed bytes were available."""
         import hashlib
         from copy import copy
@@ -540,14 +666,14 @@ class Sources:
             "releases": [],
             "fingerprints": {},
             "limitations": [],
-            "source_generation": program.source_generation,
+            "source_generation": repository.source_generation,
             "normalization": "none; exact bytes",
             "complete": False,
         }
         source_releases = []
-        if program.source_kind == "github":
-            repo = program.source_url.removeprefix("https://github.com/")
-            headers = {"Authorization": f"Bearer {self.github_key}"} if self.github_key else {}
+        if repository.source_kind == "github":
+            repo = repository.source_url.removeprefix("https://github.com/")
+            headers = self.github_headers()
             try:
                 releases = self.get(
                     f"{self.github}/repos/{repo}/releases", {"per_page": 12}, headers
@@ -568,12 +694,12 @@ class Sources:
             except DomainError as exc:
                 corpus["limitations"].append("Release catalog unavailable: " + exc.code)
         else:
-            base = program.source_url
+            base = repository.source_url
             if self.config.test_mode and os.getenv("NUMEN_WORDPRESS_SVN_URL"):
-                base = os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + program.plugin_slug
+                base = os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + repository.plugin_slug
             try:
                 catalog = ET.fromstring(
-                    self.svn("list", "--xml", "-r", program.cursor, base + "/tags")
+                    self.svn("list", "--xml", "-r", repository.cursor, base + "/tags")
                 )
                 tags = [
                     entry.findtext("name")
@@ -594,15 +720,15 @@ class Sources:
             }
             files = {}
             try:
-                if program.source_kind == "wordpress":
-                    release_program = copy(program)
-                    release_program.source_ref, release_program.source_path = (
+                if repository.source_kind == "wordpress":
+                    release_repository = copy(repository)
+                    release_repository.source_ref, release_repository.source_path = (
                         "tags/" + version,
                         None,
                     )
-                    files = self.snapshot_wordpress(release_program, program.cursor)
+                    files = self.snapshot_wordpress(release_repository, repository.cursor)
                     release.update(
-                        source_ref=program.cursor, source_path="tags/" + version, distributed=True
+                        source_ref=repository.cursor, source_path="tags/" + version, distributed=True
                     )
                 else:
                     # Uploaded release packages are actual distribution bytes; source archives are
@@ -672,7 +798,7 @@ class Sources:
                     if files:
                         release["distributed"] = True
                     else:
-                        files = self.snapshot_github(program, version)
+                        files = self.snapshot_github(repository, version)
                         corpus["limitations"].append(
                             f"{version}: source archive only; installed/minified/distributed assets may differ"
                         )

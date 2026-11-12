@@ -10,9 +10,10 @@ import {
 import { useResource } from "../hooks";
 import {
   dashboardSchema,
-  programSchema,
-  programState,
-  programsSchema,
+  applicationSchema,
+  applicationState,
+  applicationsSchema,
+  failingRepositories,
 } from "../types";
 import {
   Badge,
@@ -28,13 +29,13 @@ import {
 } from "../components/ui";
 export function Dashboard() {
   const dashboard = useResource("/dashboard", dashboardSchema, 30000);
-  const programs = useResource("/programs", programsSchema);
+  const applications = useResource("/applications", applicationsSchema);
   const data = dashboard.data;
-  const failing = programs.data?.items.filter(
-    (p) => p.last_error && !p.archived,
+  const failing = applications.data?.items.filter(
+    (p) => failingRepositories(p).length && !p.archived,
   );
-  const due = (data?.due_programs || []).flatMap((value) => {
-    const parsed = programSchema.safeParse(value);
+  const due = (data?.due_applications || []).flatMap((value) => {
+    const parsed = applicationSchema.safeParse(value);
     return parsed.success ? [parsed.data] : [];
   });
   return (
@@ -44,9 +45,9 @@ export function Dashboard() {
         title="Dashboard"
         description="Assets, upstream changes, and evidence that need your attention."
         actions={
-          <Link className="primary button" to="/programs/new">
+          <Link className="primary button" to="/applications/new">
             <Plus size={16} aria-hidden="true" />
-            Insert program
+            Insert application
           </Link>
         }
       />
@@ -61,10 +62,10 @@ export function Dashboard() {
             <div className="metrics-grid">
               {[
                 {
-                  label: "Monitored programs",
-                  value: data.programs,
+                  label: "Monitored applications",
+                  value: data.applications,
                   icon: Radar,
-                  to: "/programs",
+                  to: "/applications",
                   foot: failing?.length
                     ? `${failing.length} with a failed check`
                     : "Asset / software pairs",
@@ -114,53 +115,56 @@ export function Dashboard() {
                 title="Monitoring"
                 description="Latest observed versions and source-check health"
                 actions={
-                  <Link className="inline-link" to="/programs">
-                    All programs
+                  <Link className="inline-link" to="/applications">
+                    All applications
                     <ArrowRight size={14} aria-hidden="true" />
                   </Link>
                 }
               >
                 <DataState
-                  loading={programs.loading}
-                  error={programs.error}
-                  retry={programs.refresh}
-                  hasData={!!programs.data}
+                  loading={applications.loading}
+                  error={applications.error}
+                  retry={applications.refresh}
+                  hasData={!!applications.data}
                 >
-                  {programs.data?.items.length ? (
+                  {applications.data?.items.length ? (
                     <div className="row-list">
-                      {programs.data.items.slice(0, 6).map((program) => (
-                        <Link
-                          key={program.id}
-                          to={`/programs/${program.id}`}
-                          className="list-row"
-                        >
-                          <span className="asset-monogram" aria-hidden="true">
-                            {program.asset_name.slice(0, 2).toUpperCase()}
-                          </span>
-                          <span className="list-row-main">
-                            <strong>{program.asset_name}</strong>
-                            <span>
-                              {program.product_name} ·{" "}
-                              {program.version?.version ||
-                                (program.version?.candidates?.length
-                                  ? `${program.version.candidates.length} candidate versions`
-                                  : "Version unknown")}
+                      {applications.data.items
+                        .slice(0, 6)
+                        .map((application) => (
+                          <Link
+                            key={application.id}
+                            to={`/applications/${application.id}`}
+                            className="list-row"
+                          >
+                            <span className="asset-monogram" aria-hidden="true">
+                              {application.asset_name.slice(0, 2).toUpperCase()}
                             </span>
-                          </span>
-                          <span className="list-row-end">
-                            <Badge>{programState(program)}</Badge>
-                            <small>
-                              {program.last_check_at ? (
-                                <>
-                                  Checked <Time value={program.last_check_at} />
-                                </>
-                              ) : (
-                                "Not checked yet"
-                              )}
-                            </small>
-                          </span>
-                        </Link>
-                      ))}
+                            <span className="list-row-main">
+                              <strong>{application.asset_name}</strong>
+                              <span>
+                                {application.product_name} ·{" "}
+                                {application.version?.version ||
+                                  (application.version?.candidates?.length
+                                    ? `${application.version.candidates.length} candidate versions`
+                                    : "Version unknown")}
+                              </span>
+                            </span>
+                            <span className="list-row-end">
+                              <Badge>{applicationState(application)}</Badge>
+                              <small>
+                                {application.last_check_at ? (
+                                  <>
+                                    Checked{" "}
+                                    <Time value={application.last_check_at} />
+                                  </>
+                                ) : (
+                                  "Not checked yet"
+                                )}
+                              </small>
+                            </span>
+                          </Link>
+                        ))}
                     </div>
                   ) : (
                     <Empty
@@ -168,9 +172,9 @@ export function Dashboard() {
                       title="Your monitoring starts here"
                       description="Register an asset and its upstream software to begin tracking changes."
                       action={
-                        <Link className="primary button" to="/programs/new">
+                        <Link className="primary button" to="/applications/new">
                           <Plus size={15} aria-hidden="true" />
-                          Insert your first program
+                          Insert your first application
                         </Link>
                       }
                     />
@@ -204,19 +208,19 @@ export function Dashboard() {
                     <span className="attention-group-label">
                       <span className="status-dot warm" aria-hidden="true" />
                       Checks due
-                      <strong>{data.due_programs.length}</strong>
+                      <strong>{data.due_applications.length}</strong>
                     </span>
-                    {due.map((program) => (
+                    {due.map((application) => (
                       <Link
-                        key={program.id}
+                        key={application.id}
                         className="attention-item"
-                        to={`/programs/${program.id}`}
+                        to={`/applications/${application.id}`}
                       >
-                        <span>{program.asset_name}</span>
+                        <span>{application.asset_name}</span>
                         <small>
-                          {program.next_check_at ? (
+                          {application.next_check_at ? (
                             <>
-                              Due <Time value={program.next_check_at} />
+                              Due <Time value={application.next_check_at} />
                             </>
                           ) : (
                             "Never checked"
@@ -235,16 +239,17 @@ export function Dashboard() {
                         Source check errors
                         <strong>{failing.length}</strong>
                       </span>
-                      {failing.map((program) => (
+                      {failing.map((application) => (
                         <Link
-                          key={program.id}
+                          key={application.id}
                           className="attention-item"
-                          to={`/programs/${program.id}`}
+                          to={`/applications/${application.id}`}
                         >
-                          <span>{program.asset_name}</span>
+                          <span>{application.asset_name}</span>
                           <small className="clamp">
-                            {describeError(program.last_error) ||
-                              "Check failed"}
+                            {describeError(
+                              failingRepositories(application)[0]?.last_error,
+                            ) || "Check failed"}
                           </small>
                         </Link>
                       ))}
@@ -252,7 +257,7 @@ export function Dashboard() {
                   )}
                 </div>
                 {!data.failed_jobs &&
-                  !data.due_programs.length &&
+                  !data.due_applications.length &&
                   !failing?.length && (
                     <div className="panel-body">
                       <Callout tone="good">

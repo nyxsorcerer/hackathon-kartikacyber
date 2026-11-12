@@ -87,6 +87,11 @@ def items(value):
     return value['items']
 
 
+def check_now(client, application):
+    """Check now queues one source check per repository; wait for every one."""
+    return [client.wait(queued) for queued in items(client.request('POST', f'/api/applications/{application["id"]}/checks', {}, expect=(202,)))]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base-url', default='http://localhost:18788')
@@ -97,11 +102,18 @@ def main():
     fixture = Client(args.fixture_url)
     suffix = uuid.uuid4().hex[:8]
     fixture.request('POST', '/admin/reset', {})
-    client.request('GET', '/api/programs', expect=(401,))
+    client.request('GET', '/api/applications', expect=(401,))
     session = client.request('POST', '/api/auth/login', {'username': 'admin', 'password': args.password_file.read_text().strip()})
     client.csrf = session['csrf_token']
     assert client.request('GET', '/api/auth/session')['authenticated']
-    print('PASS operator login and unauthenticated program protection')
+    print('PASS operator login and unauthenticated Application protection')
+
+    # GitHub repositories are never polled without a read token; the fixture accepts any.
+    if not [a for a in items(client.request('GET', '/api/accounts')) if a['provider'] == 'github' and a['credential_configured']]:
+        client.request('POST', '/api/accounts', {
+            'label': 'Fixture GitHub token', 'provider': 'github', 'auth_type': 'api_key',
+            'api_key': 'fixture-github-token',
+        }, expect=(201,))
 
     config = {
         'triage_mode': 'disabled',
@@ -115,41 +127,61 @@ def main():
     }
     common = {
         'asset_url': 'http://fixtures:8090/target', 'product_name': 'Numen Fixture',
-        'monitor_interval_days': 3, 'monitor_enabled': False, 'config': config,
+        'monitor_interval_seconds': 300, 'monitor_enabled': False, 'config': config,
     }
-    github = client.request('POST', '/api/programs', {
+    github = client.request('POST', '/api/applications', {
         **common, 'asset_name': f'GitHub fixture {suffix}', 'product_kind': 'CMS',
-        'source_kind': 'github', 'source_url': 'https://github.com/numen/fixture',
-        'source_ref': 'main', 'source_path': '',
     }, expect=(200, 201))
-    wordpress = client.request('POST', '/api/programs', {
+    wordpress = client.request('POST', '/api/applications', {
         **common, 'asset_name': f'WordPress fixture {suffix}', 'product_kind': 'plugin',
-        'source_kind': 'wordpress', 'plugin_slug': 'fixture-plugin',
-        'source_url': 'https://plugins.svn.wordpress.org/fixture-plugin/',
-        'source_ref': 'trunk', 'source_path': '',
     }, expect=(200, 201))
-    for program in [github, wordpress]:
-        actual = client.request('GET', f'/api/programs/{program["id"]}')
-        assert actual['asset_name'] == program['asset_name']
-        assert actual['monitor_interval_days'] == 3
+    sources = {
+        github['id']: {'source_kind': 'github', 'source_url': f'https://github.com/numen/fixture-{suffix}', 'source_ref': 'main'},
+        wordpress['id']: {'source_kind': 'wordpress', 'plugin_slug': 'fixture-plugin', 'source_ref': 'trunk'},
+    }
+    for application in [github, wordpress]:
+        client.request('POST', f'/api/applications/{application["id"]}/repositories', sources[application['id']], expect=(201,))
+        actual = client.request('GET', f'/api/applications/{application["id"]}')
+        assert actual['asset_name'] == application['asset_name']
+        assert actual['monitor_interval_seconds'] == 300
         assert actual['monitor_enabled'] is False
-        client.wait(client.request('POST', f'/api/programs/{program["id"]}/checks', {}, expect=(202,)))
-    before = items(client.request('GET', f'/api/programs/{github["id"]}/commits'))
-    wp_before = items(client.request('GET', f'/api/programs/{wordpress["id"]}/commits'))
-    assert len(before) >= 1 and len(wp_before) >= 1
-    print('PASS persisted GitHub and WordPress programs and real source checks')
+        assert [r['role'] for r in actual['repositories']] == ['upstream']
+        # The Baseline is the head: nothing earlier is imported, on GitHub or over SVN.
+        assert [job['result']['imported'] for job in check_now(client, application)] == [0]
+    assert items(client.request('GET', f'/api/applications/{github["id"]}/commits')) == []
+    print('PASS persisted GitHub and WordPress Applications and a Baseline that imports no history')
+
+    def svn_cursor():
+        return client.request('GET', f'/api/applications/{wordpress["id"]}')['repositories'][0]['cursor']
+
+    def github_revisions():
+        commits = items(client.request('GET', f'/api/applications/{github["id"]}/commits'))
+        assert len({row['revision'] for row in commits}) == len(commits)
+        return commits, {row['revision'] for row in commits}
+
+    # Repositories outlive a journey run (one row per URL), so compare revisions, not counts.
+    wp_cursor = svn_cursor()
 
     fixture.request('POST', '/admin/advance', {'version': '1.2.1'})
-    for program in [github, wordpress]:
-        client.wait(client.request('POST', f'/api/programs/{program["id"]}/checks', {}, expect=(202,)))
-    commits = items(client.request('GET', f'/api/programs/{github["id"]}/commits'))
-    assert {'a' * 40, 'b' * 40, 'c' * 40}.issubset({row['revision'] for row in commits})
-    assert len({row['revision'] for row in commits}) == len(commits)
-    wp_commits = items(client.request('GET', f'/api/programs/{wordpress["id"]}/commits'))
-    assert len(wp_commits) > len(wp_before)
+    for application in [github, wordpress]:
+        check_now(client, application)
+    commits, revisions = github_revisions()
+    assert revisions == {'b' * 40, 'c' * 40}
+    wp_commits = items(client.request('GET', f'/api/applications/{wordpress["id"]}/commits'))
+    assert svn_cursor() != wp_cursor and svn_cursor() in {row['revision'] for row in wp_commits}
     jobs = items(client.request('GET', '/api/jobs'))
-    assert not [job for job in jobs if job.get('program_id') == github['id'] and job['kind'] in ('commit_triage', 'commit_analysis')]
+    assert not [job for job in jobs if job.get('application_id') == github['id'] and job['kind'] in ('commit_triage', 'commit_analysis')]
     print('PASS unseen/old-dated revisions, SVN changes, deduplication, and AI-off boundary')
+
+    repository_id = client.request('GET', f'/api/applications/{github["id"]}')['repositories'][0]['repository_id']
+    backfill = client.wait(client.request('POST', f'/api/applications/{github["id"]}/repositories/{repository_id}/backfills', {'count': 1}, expect=(202,)))
+    assert backfill['result']['imported'] == 1
+    _, revisions = github_revisions()
+    assert revisions == {'a' * 40, 'b' * 40, 'c' * 40}
+    unchanged = check_now(client, github)[0]['result']
+    assert unchanged['not_modified'] is True and unchanged['imported'] == 0
+    assert github_revisions()[1] == revisions
+    print('PASS Backfill of the Baseline commit and a 304 that imports nothing')
 
     client.request('PATCH', '/api/settings', {'webhook_url': 'http://fixtures:8090/webhooks/test', 'webhook_enabled': True})
     candidate = next(row for row in commits if row['revision'] == 'b' * 40)
@@ -162,29 +194,29 @@ def main():
         time.sleep(0.5)
     else:
         raise AssertionError('Candidate notification was not delivered to fixture webhook')
-    assert not [job for job in items(client.request('GET', '/api/jobs')) if job.get('program_id') == github['id'] and job['kind'] == 'commit_analysis']
+    assert not [job for job in items(client.request('GET', '/api/jobs')) if job.get('application_id') == github['id'] and job['kind'] == 'commit_analysis']
     client.request('POST', f'/api/commits/{candidate["id"]}/analyses', {}, expect=(409, 422))
     print('PASS captured Discord delivery and explicit analysis/profile prerequisite')
 
-    client.wait(client.request('POST', f'/api/programs/{github["id"]}/cve-sync', {}, expect=(202,)))
-    cves = items(client.request('GET', f'/api/cves?program_id={github["id"]}'))
+    client.wait(client.request('POST', f'/api/applications/{github["id"]}/cve-sync', {}, expect=(202,)))
+    cves = items(client.request('GET', f'/api/cves?application_id={github["id"]}'))
     assert {'CVE-2026-99001', 'CVE-2026-99002'}.issubset({row['id'] for row in cves})
     for cve in cves:
-        client.request('POST', f'/api/programs/{github["id"]}/cves/{cve["id"]}/match', {'confirmed': True})
-    eligible = items(client.request('GET', f'/api/cves?program_id={github["id"]}'))
+        client.request('POST', f'/api/applications/{github["id"]}/cves/{cve["id"]}/match', {'confirmed': True})
+    eligible = items(client.request('GET', f'/api/cves?application_id={github["id"]}'))
     scored = next(row for row in eligible if row['id'] == 'CVE-2026-99001')
     unscored = next(row for row in eligible if row['id'] == 'CVE-2026-99002')
     assert scored['eligible'] is True and unscored['eligible'] is False
-    client.request('POST', f'/api/programs/{github["id"]}/cves/CVE-2026-99002/analyses', {}, expect=(409, 422))
+    client.request('POST', f'/api/applications/{github["id"]}/cves/CVE-2026-99002/analyses', {}, expect=(409, 422))
     fixture.request('POST', '/admin/advance', {'score': 6.9})
-    client.wait(client.request('POST', f'/api/programs/{github["id"]}/cve-sync', {}, expect=(202,)))
-    scored = next(row for row in items(client.request('GET', f'/api/cves?program_id={github["id"]}')) if row['id'] == 'CVE-2026-99001')
+    client.wait(client.request('POST', f'/api/applications/{github["id"]}/cve-sync', {}, expect=(202,)))
+    scored = next(row for row in items(client.request('GET', f'/api/cves?application_id={github["id"]}')) if row['id'] == 'CVE-2026-99001')
     assert scored['eligible'] is False
-    client.request('POST', f'/api/programs/{github["id"]}/cves/CVE-2026-99001/analyses', {}, expect=(409, 422))
+    client.request('POST', f'/api/applications/{github["id"]}/cves/CVE-2026-99001/analyses', {}, expect=(409, 422))
     print('PASS inclusive CVSS gate, missing-score rejection, and modified-record refresh')
 
     finding = client.request('POST', '/api/findings', {
-        'program_id': github['id'], 'kind': '0day', 'title': f'Fixture metadata boundary {suffix}',
+        'application_id': github['id'], 'kind': '0day', 'title': f'Fixture metadata boundary {suffix}',
         'status': 'open', 'source_commit_id': candidate['id'],
         'affected_versions': ['1.2.0'], 'fixed_versions': ['1.2.1'],
     }, expect=(200, 201))
@@ -208,11 +240,11 @@ def main():
     assert client.request('GET', f'/api/findings/{finding["id"]}')['status'] == 'open'
     print('PASS draft/completed finding bundle integrity and independent upstream status')
 
-    for program in [github, wordpress]:
-        client.request('PATCH', f'/api/programs/{program["id"]}', {'archived': True, 'monitor_enabled': False})
+    for application in [github, wordpress]:
+        client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})
     client.request('POST', '/api/auth/logout', {})
     client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(401,), raw=True)
-    print('PASS logout revokes artifact access; test programs archived')
+    print('PASS logout revokes artifact access; test Applications archived')
     print('JOURNEY PASSED')
 
 

@@ -86,7 +86,7 @@ services:
     command: [python, -m, numen.scheduler]
     networks: [application, control]
   runner-broker:
-    image: numen-broker:0.1.0
+    image: asset-monitor-broker:0.1.0
     build:
       context: .
       dockerfile: Dockerfile.runner
@@ -161,7 +161,7 @@ services:
   backend-tests:
     <<: *app
     profiles: [test]
-    image: numen-backend-test:0.1.0
+    image: asset-monitor-backend-test:0.1.0
     build: {context: ., dockerfile: Dockerfile, target: test}
     restart: no
     command: [pytest, -q, -p, no:cacheprovider]
@@ -172,7 +172,7 @@ services:
     command: [pytest, -q, -p, no:cacheprovider]
     network_mode: none
   frontend-tests:
-    image: numen-frontend-test:0.1.0
+    image: asset-monitor-frontend-test:0.1.0
     profiles: [test]
     build: {context: ., dockerfile: Dockerfile, target: frontend-tests}
     command: [npm, test]

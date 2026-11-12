@@ -8,9 +8,9 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from conftest import FixtureBroker, connection, program, source_snapshot
+from conftest import FixtureBroker, check_now, connection, application, github_account, repository_of, source_snapshot
 from numen import artifacts, cves, domain
-from numen.models import Account, CVE, JobAttempt, Program, ProgramCVE, VersionRecipe, now
+from numen.models import Account, CVE, JobAttempt, Application, ApplicationCVE, Repository, VersionRecipe, now
 from numen.queue import claim, recover
 from numen.security import fingerprint
 from numen.sources import Sources
@@ -64,7 +64,7 @@ def seed_cve(app, ident, raw):
         row = CVE(id=raw["id"], raw=raw, record_hash=fingerprint(raw), data=cves.parse_cve(raw))
         db.add(row)
         db.flush()
-        db.add(ProgramCVE(program_id=ident, cve_id=row.id, confirmed=None, data={}))
+        db.add(ApplicationCVE(application_id=ident, cve_id=row.id, confirmed=None, data={}))
 
 
 @pytest.mark.parametrize(
@@ -74,7 +74,7 @@ def seed_cve(app, ident, raw):
 def test_score_gate_all_manual_paths(system, score, version, eligible):
     app, client, _ = system
     connection(app)
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
@@ -87,7 +87,7 @@ def test_score_gate_all_manual_paths(system, score, version, eligible):
     row = client.get("/api/cves").json()["items"][0]
     assert row["eligible"] is eligible
     assert row["applicability"] == "unknown"
-    response = client.post(f"/api/programs/{p['id']}/cves/{row['id']}/analyses", json={})
+    response = client.post(f"/api/applications/{p['id']}/cves/{row['id']}/analyses", json={})
     assert response.status_code == (202 if eligible else 422)
     if not eligible:
         assert response.json()["code"] == "criteria_not_met"
@@ -97,7 +97,7 @@ def test_score_gate_all_manual_paths(system, score, version, eligible):
 def test_unconfirmed_match_and_changed_queued_policy(system):
     app, client, config = system
     connection(app)
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "keyword", "value": "plugin"}],
@@ -106,12 +106,12 @@ def test_unconfirmed_match_and_changed_queued_policy(system):
         },
     )
     seed_cve(app, p["id"], cve_raw())
-    endpoint = f"/api/programs/{p['id']}/cves/CVE-2026-12345"
+    endpoint = f"/api/applications/{p['id']}/cves/CVE-2026-12345"
     assert client.post(endpoint + "/analyses", json={}).status_code == 422
     assert client.post(endpoint + "/match", json={"confirmed": True}).json()["eligible"] is True
     queued = client.post(endpoint + "/analyses", json={}).json()["job_id"]
     assert (
-        client.patch(f"/api/programs/{p['id']}", json={"config": {"cve_min_score": 8}}).status_code
+        client.patch(f"/api/applications/{p['id']}", json={"config": {"cve_min_score": 8}}).status_code
         == 200
     )
     broker = FixtureBroker()
@@ -124,7 +124,7 @@ def test_unconfirmed_match_and_changed_queued_policy(system):
 
 def test_cve_applicability_keeps_environment_unknown(system):
     app, client, _ = system
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
@@ -133,12 +133,12 @@ def test_cve_applicability_keeps_environment_unknown(system):
     )
     seed_cve(app, p["id"], cve_raw())
     client.post(
-        f"/api/programs/{p['id']}/version-observations",
+        f"/api/applications/{p['id']}/version-observations",
         json={"version": "1.5.0", "evidence": ["fixture"]},
     )
     assert client.get("/api/cves").json()["items"][0]["applicability"] == "affected"
     client.post(
-        f"/api/programs/{p['id']}/version-observations",
+        f"/api/applications/{p['id']}/version-observations",
         json={"version": "2.0.0", "evidence": ["fixture"]},
     )
     assert client.get("/api/cves").json()["items"][0]["applicability"] == "not affected"
@@ -174,7 +174,7 @@ def test_profile_runtime_effort_and_frozen_retry(system):
             ],
         },
     )
-    p = program(client)
+    p = application(client)
     commit_id = source_snapshot(app, p["id"])
     endpoint = f"/api/commits/{commit_id}/analyses"
     assert (
@@ -203,7 +203,7 @@ def test_profile_runtime_effort_and_frozen_retry(system):
 def test_explicit_commit_analysis_retains_report_and_category(system):
     app, client, config = system
     profile = connection(app)
-    p = program(client)
+    p = application(client)
     commit_id = source_snapshot(app, p["id"])
     assert (
         client.post(f"/api/commits/{commit_id}/review", json={"decision": "candidate"}).status_code
@@ -244,24 +244,28 @@ def test_explicit_commit_analysis_retains_report_and_category(system):
 
 def test_pause_scheduler_manual_and_source_generation(system):
     app, client, _ = system
-    p = program(client, monitor_enabled=False)
+    p = application(client, monitor_enabled=False)
     with app.state.factory.begin() as db:
         assert domain.schedule(db) == 0
-    assert client.post(f"/api/programs/{p['id']}/checks").status_code == 202
+    assert client.post(f"/api/applications/{p['id']}/checks").status_code == 202
     source_snapshot(app, p["id"])
-    changed = client.patch(f"/api/programs/{p['id']}", json={"source_ref": "release"}).json()
-    assert changed["source_generation"] == 2
-    assert changed["version"] is None
-    assert len(client.get(f"/api/programs/{p['id']}/commits").json()["items"]) == 1
+    assert len(client.get(f"/api/applications/{p['id']}/commits").json()["items"]) == 1
 
 
 def test_github_old_dated_history_and_partial_retry(system, monkeypatch):
     app, client, config = system
-    p = program(client)
-    revisions = ["b" * 40, "a" * 40]
+    github_account(app)
+    p = application(client)
+    revisions = ["b" * 40, "a" * 40, "c" * 40]
+    with app.state.factory.begin() as db:
+        repository_of(db, p["id"]).cursor = "c" * 40  # the Baseline
     failures = {"enabled": True}
 
     def http(request):
+        if "/compare/" in request.url.path:
+            return httpx.Response(
+                200, json={"status": "ahead", "total_commits": 2, "commits": [{"sha": "a" * 40}, {"sha": "b" * 40}]}
+            )
         if request.url.path.endswith("/commits"):
             return httpx.Response(
                 200,
@@ -300,43 +304,47 @@ def test_github_old_dated_history_and_partial_retry(system, monkeypatch):
         self.client = httpx.Client(transport=httpx.MockTransport(http))
 
     monkeypatch.setattr(Sources, "__init__", setup)
-    queued = client.post(f"/api/programs/{p['id']}/checks").json()["job_id"]
+    queued = check_now(client, p["id"])
     run_once(config, app.state.factory, FixtureBroker())
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "failed"
-    assert client.get(f"/api/programs/{p['id']}/commits").json()["items"] == []
+    assert client.get(f"/api/applications/{p['id']}/commits").json()["items"] == []
     with app.state.factory() as db:
-        assert db.get(Program, p["id"]).cursor is None
+        assert repository_of(db, p["id"]).cursor == "c" * 40
+    # The failure is shown on the repository, and the Application reports it.
+    failed = client.get(f"/api/applications/{p['id']}").json()["repositories"][0]
+    assert failed["last_error"]["code"] and failed["last_check_at"] is None
     failures["enabled"] = False
     client.post(f"/api/jobs/{queued}/retry")
     run_once(config, app.state.factory, FixtureBroker())
-    commits = client.get(f"/api/programs/{p['id']}/commits").json()["items"]
+    assert client.get(f"/api/applications/{p['id']}").json()["repositories"][0]["last_error"] is None
+    commits = client.get(f"/api/applications/{p['id']}/commits").json()["items"]
     assert len(commits) == 2 and all(c["triage_status"] == "disabled" for c in commits)
     assert all(j["kind"] != "commit_triage" for j in client.get("/api/jobs").json()["items"])
-    client.post(f"/api/programs/{p['id']}/checks")
+    client.post(f"/api/applications/{p['id']}/checks")
     run_once(config, app.state.factory, FixtureBroker())
-    assert len(client.get(f"/api/programs/{p['id']}/commits").json()["items"]) == 2
+    assert len(client.get(f"/api/applications/{p['id']}/commits").json()["items"]) == 2
 
 
 def test_github_archive_path_safety(system, monkeypatch):
     _, client, config = system
-    p = program(client)
+    p = application(client)
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w:gz") as archive:
         member = tarfile.TarInfo("root/../../escape")
         member.size = 3
         archive.addfile(member, io.BytesIO(b"bad"))
-    source = Sources(config)
+    source = Sources(config, "fixture-github-token")
     monkeypatch.setattr(
         source, "get", lambda *args, **kwargs: httpx.Response(200, content=stream.getvalue())
     )
     with system[0].state.factory() as db:
         with pytest.raises(ValueError):
-            source.snapshot_github(db.get(Program, p["id"]), "a" * 40)
+            source.snapshot_github(repository_of(db, p["id"]), "a" * 40)
 
 
 def test_github_snapshot_omits_media_and_fits_cms_scale_sources(system, monkeypatch):
     app, client, config = system
-    p = program(client)
+    p = application(client)
     stream = io.BytesIO()
     names = [f"root/src/{index}.php" for index in range(4500)]
     with tarfile.open(fileobj=stream, mode="w:gz") as archive:
@@ -344,12 +352,12 @@ def test_github_snapshot_omits_media_and_fits_cms_scale_sources(system, monkeypa
             member = tarfile.TarInfo(name)
             member.size = 1
             archive.addfile(member, io.BytesIO(b"x"))
-    source = Sources(config)
+    source = Sources(config, "fixture-github-token")
     monkeypatch.setattr(
         source, "get", lambda *args, **kwargs: httpx.Response(200, content=stream.getvalue())
     )
     with app.state.factory() as db:
-        files = source.snapshot_github(db.get(Program, p["id"]), "a" * 40)
+        files = source.snapshot_github(repository_of(db, p["id"]), "a" * 40)
     assert sorted(files) == sorted(name.removeprefix("root/") for name in names)
 
 
@@ -358,9 +366,9 @@ def test_short_work_slot_never_claims_long_jobs(system):
 
     app, client, _ = system
     connection(app)
-    p = program(client)
-    audit = client.post(f"/api/programs/{p['id']}/audit-contexts", json={}).json()["job_id"]
-    check = client.post(f"/api/programs/{p['id']}/checks").json()["job_id"]
+    p = application(client)
+    audit = client.post(f"/api/applications/{p['id']}/audit-contexts", json={}).json()["job_id"]
+    check = check_now(client, p["id"])
     with app.state.factory.begin() as db:
         assert claim(db, "slot/short", LONG_KINDS).id == check
     with app.state.factory.begin() as db:
@@ -371,7 +379,7 @@ def test_release_corpus_falls_back_to_source_archives_for_unusable_packages(syst
     from numen.artifacts import MAX_SET
 
     app, client, config = system
-    p = program(client)
+    p = application(client)
     asset = "https://api.github.com/repos/demo/plugin/releases/assets/"
     releases = [
         {"tag_name": "2.0.0", "assets": [{"name": "app.zip", "size": MAX_SET + 1, "url": asset + "2"}]},
@@ -385,11 +393,11 @@ def test_release_corpus_falls_back_to_source_archives_for_unusable_packages(syst
             return httpx.Response(200, json=releases)
         return httpx.Response(200, content=b"not a zip")
 
-    source = Sources(config)
+    source = Sources(config, "fixture-github-token")
     monkeypatch.setattr(source, "get", get)
     monkeypatch.setattr(source, "snapshot_github", lambda _, tag: {"app.js": tag.encode()})
     with app.state.factory() as db:
-        corpus = source.release_corpus(db.get(Program, p["id"]))
+        corpus = source.release_corpus(repository_of(db, p["id"]))
     assert [release["version"] for release in corpus["releases"]] == ["2.0.0", "1.0.0"]
     assert asset + "2" not in requested  # The oversized package is never downloaded.
     versions = [v for record in corpus["fingerprints"]["app.js"].values() for v in record["versions"]]
@@ -402,8 +410,8 @@ def test_release_corpus_falls_back_to_source_archives_for_unusable_packages(syst
 
 def test_lease_recovery_fences_old_attempt(system):
     app, client, _ = system
-    p = program(client)
-    queued = client.post(f"/api/programs/{p['id']}/checks").json()["job_id"]
+    p = application(client)
+    queued = check_now(client, p["id"])
     with app.state.factory.begin() as db:
         old = claim(db, "old-worker")
         old_token = old.attempt_token
@@ -418,11 +426,11 @@ def test_lease_recovery_fences_old_attempt(system):
 
 def test_probe_reuse_and_failure_preserves_success(system):
     app, client, config = system
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     with app.state.factory.begin() as db:
         recipe = VersionRecipe(
-            program_id=p["id"], source_generation=1, source_ref="a" * 40, status="active", data={}
+            application_id=p["id"], source_generation=1, source_ref="a" * 40, status="active", data={}
         )
         db.add(recipe)
         db.flush()
@@ -435,7 +443,7 @@ def test_probe_reuse_and_failure_preserves_success(system):
             recipe.id,
             {"determine_version.py": b"print('fixture')", "recipe.json": b"{}"},
         )
-        row = db.get(Program, p["id"])
+        row = db.get(Application, p["id"])
         row.config = {**row.config, "active_recipe_id": recipe.id}
     result = {
         "status": "detected",
@@ -447,10 +455,10 @@ def test_probe_reuse_and_failure_preserves_success(system):
         "limitations": [],
     }
     broker = FixtureBroker(result)
-    client.post(f"/api/programs/{p['id']}/version-checks")
+    client.post(f"/api/applications/{p['id']}/version-checks")
     run_once(config, app.state.factory, broker)
     assert broker.calls[0]["kind"] == "probe" and broker.calls[0]["profile"] is None
-    assert client.get(f"/api/programs/{p['id']}").json()["version"]["version"] == "1.0.0"
+    assert client.get(f"/api/applications/{p['id']}").json()["version"]["version"] == "1.0.0"
     broker.result = {
         "status": "error",
         "version": None,
@@ -458,9 +466,9 @@ def test_probe_reuse_and_failure_preserves_success(system):
         "evidence": [],
         "limitations": ["Target unavailable"],
     }
-    client.post(f"/api/programs/{p['id']}/version-checks")
+    client.post(f"/api/applications/{p['id']}/version-checks")
     run_once(config, app.state.factory, broker)
-    row = client.get(f"/api/programs/{p['id']}").json()
+    row = client.get(f"/api/applications/{p['id']}").json()
     assert row["version"]["version"] == "1.0.0"
     assert row["latest_version_check"]["status"] == "error"
     assert all(c["kind"] == "probe" for c in broker.calls)
@@ -469,7 +477,7 @@ def test_probe_reuse_and_failure_preserves_success(system):
 def test_audit_coordinator_pinned_skill_and_partial_units(system, tmp_path, monkeypatch):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     skill = tmp_path / "skill"
     skill.mkdir()
@@ -497,13 +505,13 @@ def test_audit_coordinator_pinned_skill_and_partial_units(system, tmp_path, monk
         }
 
     queued = client.post(
-        f"/api/programs/{p['id']}/audit-contexts", json={"focus": "Parser"}
+        f"/api/applications/{p['id']}/audit-contexts", json={"focus": "Parser"}
     ).json()["job_id"]
     broker = FixtureBroker(handler=handler)
     run_once(config, app.state.factory, broker)
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == "succeeded", job
-    row = client.get(f"/api/programs/{p['id']}/audit-contexts").json()["items"][0]
+    row = client.get(f"/api/applications/{p['id']}/audit-contexts").json()["items"][0]
     assert row["status"] == "partial" and row["coverage"]["failed"] == 1
     assert len(row["skill_revision"]) == 64
     assert {"functions/001.md", "audit-context-building.md"}.issubset(
@@ -515,7 +523,7 @@ def test_audit_coordinator_pinned_skill_and_partial_units(system, tmp_path, monk
 def test_audit_accepts_workspace_unit_paths_and_the_skill_dossier(system, tmp_path, monkeypatch):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     skill = tmp_path / "skill"
     skill.mkdir()
@@ -538,10 +546,10 @@ def test_audit_accepts_workspace_unit_paths_and_the_skill_dossier(system, tmp_pa
             "audit-context/DOSSIER.md": b"# Dossier"
         }
 
-    queued = client.post(f"/api/programs/{p['id']}/audit-contexts", json={}).json()["job_id"]
+    queued = client.post(f"/api/applications/{p['id']}/audit-contexts", json={}).json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker(handler=handler))
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
-    row = client.get(f"/api/programs/{p['id']}/audit-contexts").json()["items"][0]
+    row = client.get(f"/api/applications/{p['id']}/audit-contexts").json()["items"][0]
     assert row["coverage"]["completed"] == 1 and row["coverage"]["failed"] == 0
     with app.state.factory() as db:
         files = artifacts.resource_files(
@@ -557,7 +565,7 @@ def test_audit_function_limit_is_configurable_and_records_reach_synthesis_as_a_f
 ):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     skill = tmp_path / "skill"
     skill.mkdir()
@@ -584,7 +592,7 @@ def test_audit_function_limit_is_configurable_and_records_reach_synthesis_as_a_f
 
     for limit in (1, 2):
         queued = client.post(
-            f"/api/programs/{p['id']}/audit-contexts", json={"max_functions": limit}
+            f"/api/applications/{p['id']}/audit-contexts", json={"max_functions": limit}
         ).json()["job_id"]
         run_once(config, app.state.factory, FixtureBroker(handler=handler))
         job = client.get(f"/api/jobs/{queued}").json()
@@ -603,7 +611,7 @@ def test_audit_function_limit_is_configurable_and_records_reach_synthesis_as_a_f
     assert '"function_records": "audit-functions.json"' in seen["synthesis"]["prompt"]
     for value in (0, 101):
         response = client.post(
-            f"/api/programs/{p['id']}/audit-contexts", json={"max_functions": value}
+            f"/api/applications/{p['id']}/audit-contexts", json={"max_functions": value}
         )
         assert response.status_code == 422
 
@@ -611,7 +619,7 @@ def test_audit_function_limit_is_configurable_and_records_reach_synthesis_as_a_f
 def audit_setup(system, tmp_path, monkeypatch, count):
     app, client, _ = system
     connection(app)
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     skill = tmp_path / "skill"
     skill.mkdir()
@@ -632,7 +640,7 @@ def audit_setup(system, tmp_path, monkeypatch, count):
             "audit-context/DOSSIER.md": b"# Dossier"
         }
 
-    queued = client.post(f"/api/programs/{p['id']}/audit-contexts", json={}).json()["job_id"]
+    queued = client.post(f"/api/applications/{p['id']}/audit-contexts", json={}).json()["job_id"]
     return queued, handler
 
 
@@ -699,7 +707,7 @@ def test_interrupted_audit_continues_without_repeating_work(system, tmp_path, mo
 
     app, client, config = system
     queued, handler = audit_setup(system, tmp_path, monkeypatch, 2)
-    program_id = client.get(f"/api/jobs/{queued}").json()["program_id"]
+    application_id = client.get(f"/api/jobs/{queued}").json()["application_id"]
 
     class InterruptedBroker(FixtureBroker):
         def wait(self, run_id, heartbeat, progress, deadline=900):
@@ -718,7 +726,7 @@ def test_interrupted_audit_continues_without_repeating_work(system, tmp_path, mo
     assert client.get(f"/api/jobs/{retried}").json()["status"] == "succeeded"
     # Orientation and function 0 are reused; only the unfinished function and synthesis run.
     assert [call["token"].split(":", 1)[1] for call in broker.calls] == ["function:1", "synthesis"]
-    contexts = client.get(f"/api/programs/{program_id}/audit-contexts").json()["items"]
+    contexts = client.get(f"/api/applications/{application_id}/audit-contexts").json()["items"]
     latest, first = contexts[0], contexts[1]
     assert latest["job_id"] == retried and latest["status"] in ("complete", "partial")
     assert latest["coverage"]["resumed_from"] == first["id"]
@@ -728,7 +736,7 @@ def test_interrupted_audit_continues_without_repeating_work(system, tmp_path, mo
 
     # A continued checkpoint is not reused again; fresh or a different scope starts over too.
     for body in ({}, {"fresh": True}, {"max_functions": 5}):
-        client.post(f"/api/programs/{program_id}/audit-contexts", json=body)
+        client.post(f"/api/applications/{application_id}/audit-contexts", json=body)
         restart = FixtureBroker(handler=handler)
         run_once(config, app.state.factory, restart)
         assert restart.calls[0]["token"].endswith(":orientation"), body
@@ -803,7 +811,8 @@ def test_capabilities_exact_runtime_native_ingress_and_secret_redaction(system):
 
 def test_ancestry_compare_imports_old_dated_commit_after_baseline(system, monkeypatch):
     app, client, config = system
-    p = program(client)
+    github_account(app)
+    p = application(client)
     baseline, head, merged_old = "a" * 40, "b" * 40, "c" * 40
     source_snapshot(app, p["id"], baseline)
 
@@ -838,27 +847,31 @@ def test_ancestry_compare_imports_old_dated_commit_after_baseline(system, monkey
         self.client = httpx.Client(transport=httpx.MockTransport(http))
 
     monkeypatch.setattr(Sources, "__init__", setup)
-    client.post(f"/api/programs/{p['id']}/checks")
+    client.post(f"/api/applications/{p['id']}/checks")
     run_once(config, app.state.factory, FixtureBroker())
     assert {baseline, head, merged_old} == {
-        c["revision"] for c in client.get(f"/api/programs/{p['id']}/commits").json()["items"]
+        c["revision"] for c in client.get(f"/api/applications/{p['id']}/commits").json()["items"]
     }
 
 
 def test_compressed_upstream_responses_are_decoded_once(system, monkeypatch):
     app, client, config = system
-    p = program(client)
+    github_account(app)
+    p = application(client)
     revision = "a" * 40
+    with app.state.factory.begin() as db:
+        repository_of(db, p["id"]).cursor = "b" * 40
 
     def http(request):
-        payload = (
-            [{"sha": revision}]
-            if request.url.path.endswith("/commits")
-            else {
+        if request.url.path.endswith("/commits"):
+            payload = [{"sha": revision}]
+        elif "/compare/" in request.url.path:
+            payload = {"status": "ahead", "total_commits": 1, "commits": [{"sha": revision}]}
+        else:
+            payload = {
                 "commit": {"message": "Change", "committer": {"date": "2026-01-01T00:00:00Z"}},
                 "files": [{"filename": "main.py", "patch": "@@ -1 +1 @@\n-a\n+b"}],
             }
-        )
         # GitHub and NVD compress JSON; the transport delivers the encoded bytes.
         return httpx.Response(
             200,
@@ -873,16 +886,17 @@ def test_compressed_upstream_responses_are_decoded_once(system, monkeypatch):
         self.client = httpx.Client(transport=httpx.MockTransport(http))
 
     monkeypatch.setattr(Sources, "__init__", setup)
-    queued = client.post(f"/api/programs/{p['id']}/checks").json()["job_id"]
+    queued = check_now(client, p["id"])
     run_once(config, app.state.factory, FixtureBroker())
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
-    commits = client.get(f"/api/programs/{p['id']}/commits").json()["items"]
+    commits = client.get(f"/api/applications/{p['id']}/commits").json()["items"]
     assert [c["revision"] for c in commits] == [revision]
 
 
-def test_baseline_imports_only_newest_history_page(system, monkeypatch):
+def test_baseline_sets_the_head_without_importing_history(system, monkeypatch):
     app, client, config = system
-    p = program(client)
+    github_account(app)
+    p = application(client)
     history = [f"{index:040x}" for index in range(150, 0, -1)]
     pages = []
 
@@ -908,19 +922,19 @@ def test_baseline_imports_only_newest_history_page(system, monkeypatch):
         self.client = httpx.Client(transport=httpx.MockTransport(http))
 
     monkeypatch.setattr(Sources, "__init__", setup)
-    queued = client.post(f"/api/programs/{p['id']}/checks").json()["job_id"]
+    queued = check_now(client, p["id"])
     run_once(config, app.state.factory, FixtureBroker())
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
     assert pages == [1]
-    commits = client.get(f"/api/programs/{p['id']}/commits?limit=200").json()["items"]
-    assert {c["revision"] for c in commits} == set(history[:100])
+    assert client.get(f"/api/applications/{p['id']}/commits?limit=200").json()["items"] == []
     with app.state.factory() as db:
-        assert db.get(Program, p["id"]).cursor == history[0]
+        repository = repository_of(db, p["id"])
+        assert repository.cursor == repository.baseline_revision == history[0]
 
 
 def test_nvd_incomplete_pages_and_updates_preserve_completed_cursor(system, monkeypatch):
     app, client, config = system
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
@@ -944,12 +958,12 @@ def test_nvd_incomplete_pages_and_updates_preserve_completed_cursor(system, monk
         self.client = httpx.Client(transport=httpx.MockTransport(http))
 
     monkeypatch.setattr(Sources, "__init__", setup)
-    queued = client.post(f"/api/programs/{p['id']}/cve-sync").json()["job_id"]
+    queued = client.post(f"/api/applications/{p['id']}/cve-sync").json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker())
     assert client.get(f"/api/jobs/{queued}").json()["error"]["code"] == "incomplete_cve_page"
     assert client.get("/api/cves").json()["items"] == []
     with app.state.factory() as db:
-        assert db.get(Program, p["id"]).cve_cursor == {}
+        assert db.get(Application, p["id"]).cve_cursor == {}
     state["partial"] = False
     client.post(f"/api/jobs/{queued}/retry")
     run_once(config, app.state.factory, FixtureBroker())
@@ -958,11 +972,11 @@ def test_nvd_incomplete_pages_and_updates_preserve_completed_cursor(system, monk
     while run_once(config, app.state.factory, FixtureBroker()):
         pass
     state["score"] = 6.9
-    client.post(f"/api/programs/{p['id']}/cve-sync")
+    client.post(f"/api/applications/{p['id']}/cve-sync")
     run_once(config, app.state.factory, FixtureBroker())
     assert all(not row["eligible"] for row in client.get("/api/cves").json()["items"])
     with app.state.factory() as db:
-        assert db.get(Program, p["id"]).cve_cursor["completed_at"]
+        assert db.get(Application, p["id"]).cve_cursor["completed_at"]
 
 
 def test_cpe_selectors_query_nvd_by_product(system):
@@ -991,7 +1005,7 @@ def test_cpe_selectors_query_nvd_by_product(system):
 def test_audit_failed_synthesis_retains_function_checkpoint(system, tmp_path, monkeypatch):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     skill = tmp_path / "skill"
     skill.mkdir()
@@ -1012,10 +1026,10 @@ def test_audit_failed_synthesis_retains_function_checkpoint(system, tmp_path, mo
             }, {"function.md": b"# Preserved function evidence"}
         return {"invalid": True}, {}
 
-    queued = client.post(f"/api/programs/{p['id']}/audit-contexts", json={}).json()["job_id"]
+    queued = client.post(f"/api/applications/{p['id']}/audit-contexts", json={}).json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker(handler=handler))
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "failed"
-    report = client.get(f"/api/programs/{p['id']}/audit-contexts").json()["items"][0]
+    report = client.get(f"/api/applications/{p['id']}/audit-contexts").json()["items"][0]
     assert report["status"] == "partial" and report["coverage"]["completed"] == 1
     function = next(a for a in report["artifacts"] if a["path"] == "functions/001.md")
     assert (
@@ -1027,19 +1041,20 @@ def test_audit_failed_synthesis_retains_function_checkpoint(system, tmp_path, mo
 def test_broker_failure_version_observation_and_unrelated_profile_edits(system):
     app, client, config = system
     profile = connection(app)
-    p = program(client, config={"profiles": {"commit_analysis": profile}})
+    p = application(client, config={"profiles": {"commit_analysis": profile}})
     commit_id = source_snapshot(app, p["id"])
     with app.state.factory.begin() as db:
         db.get(Account, profile["connection_id"]).data = {"status": "expired", "models": []}
     assert (
-        client.patch(f"/api/programs/{p['id']}", json={"monitor_enabled": False}).status_code == 200
+        client.patch(f"/api/applications/{p['id']}", json={"monitor_enabled": False}).status_code == 200
     )
-    assert client.patch("/api/settings", json={"monitor_interval_days": 5}).status_code == 200
+    assert client.patch("/api/settings", json={"monitor_interval_seconds": 432000}).status_code == 200
     assert client.post(f"/api/commits/{commit_id}/analyses", json={}).status_code == 422
     with app.state.factory.begin() as db:
-        row = db.get(Program, p["id"])
+        row = db.get(Application, p["id"])
         recipe = VersionRecipe(
-            program_id=p["id"], source_generation=1, source_ref=row.cursor, status="active", data={}
+            application_id=p["id"], source_generation=1, source_ref=repository_of(db, p["id"]).cursor,
+            status="active", data={},
         )
         db.add(recipe)
         db.flush()
@@ -1054,7 +1069,7 @@ def test_broker_failure_version_observation_and_unrelated_profile_edits(system):
         )
         row.config = {**row.config, "active_recipe_id": recipe.id}
     client.post(
-        f"/api/programs/{p['id']}/version-observations",
+        f"/api/applications/{p['id']}/version-observations",
         json={"version": "1.0.0", "evidence": ["Before outage"]},
     )
 
@@ -1064,9 +1079,9 @@ def test_broker_failure_version_observation_and_unrelated_profile_edits(system):
 
             raise DomainError("broker_unavailable", "Execution broker is unavailable", 503)
 
-    client.post(f"/api/programs/{p['id']}/version-checks")
+    client.post(f"/api/applications/{p['id']}/version-checks")
     run_once(config, app.state.factory, UnavailableBroker())
-    changed = client.get(f"/api/programs/{p['id']}").json()
+    changed = client.get(f"/api/applications/{p['id']}").json()
     assert (
         changed["version"]["version"] == "1.0.0"
         and changed["latest_version_check"]["status"] == "error"
@@ -1104,33 +1119,36 @@ def test_actual_wordpress_svn_import_export_and_subsequent_revision(system, tmp_
     subprocess.run(["svnadmin", "create", str(repo)], check=True, capture_output=True)
     svn("import", str(seed), repo.as_uri(), "-m", "First plugin release")
     monkeypatch.setenv("NUMEN_WORDPRESS_SVN_URL", repo.as_uri())
-    p = program(
+    p = application(
         client, source_kind="wordpress", source_url=None, plugin_slug="fixture", source_ref="trunk"
     )
-    client.post(f"/api/programs/{p['id']}/checks")
+    client.post(f"/api/applications/{p['id']}/checks")
     run_once(config, app.state.factory, FixtureBroker())
-    first = client.get(f"/api/programs/{p['id']}/commits").json()["items"]
-    assert len(first) == 1 and first[0]["revision"] == "1"
+    # The Baseline is the head; nothing before it is imported.
+    assert client.get(f"/api/applications/{p['id']}/commits").json()["items"] == []
     svn("checkout", repo.as_uri() + "/fixture/trunk", str(checkout))
     (checkout / "plugin.php").write_text(
         "<?php /* Version: 1.0.1 */\nfunction get_data($x) { return htmlentities($x); }\n"
     )
     svn("commit", str(checkout), "-m", "Encode output")
-    client.post(f"/api/programs/{p['id']}/checks")
+    client.post(f"/api/applications/{p['id']}/checks")
     run_once(config, app.state.factory, FixtureBroker())
-    rows = client.get(f"/api/programs/{p['id']}/commits").json()["items"]
-    assert {row["revision"] for row in rows} == {"1", "2"}
+    rows = client.get(f"/api/applications/{p['id']}/commits").json()["items"]
+    assert [row["revision"] for row in rows] == ["2"]
     revised = next(row for row in rows if row["revision"] == "2")
     assert revised["diff_complete"] is True and "htmlentities" in revised["diff"]
     with app.state.factory() as db:
-        snapshot = Sources(config).snapshot_wordpress(db.get(Program, p["id"]), "2")
+        # The SVN revision cursor lives on the repository row.
+        repository = db.scalar(select(Repository).where(Repository.plugin_slug == "fixture"))
+        assert (repository.source_url, repository.cursor) == ("https://plugins.svn.wordpress.org/fixture", "2")
+        snapshot = Sources(config).snapshot_wordpress(repository, "2")
         assert b"Version: 1.0.1" in snapshot["plugin.php"]
 
 
 def test_administrative_cve_update_does_not_queue_duplicate_auto_analysis(system):
     app, client, _ = system
     connection(app)
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
@@ -1143,9 +1161,9 @@ def test_administrative_cve_update_does_not_queue_duplicate_auto_analysis(system
     raw = cve_raw()
     seed_cve(app, p["id"], raw)
     with app.state.factory.begin() as db:
-        monitored = db.get(Program, p["id"])
+        monitored = db.get(Application, p["id"])
         row = db.get(CVE, raw["id"])
-        link = db.scalar(select(ProgramCVE).where(ProgramCVE.program_id == monitored.id))
+        link = db.scalar(select(ApplicationCVE).where(ApplicationCVE.application_id == monitored.id))
         domain.refresh_cve_policy(db, monitored, row, link)
         original_hash = cves.gate_hash(monitored, row, link)
     before = [
@@ -1156,8 +1174,8 @@ def test_administrative_cve_update_does_not_queue_duplicate_auto_analysis(system
         row = db.get(CVE, raw["id"])
         row.raw = {**raw, "lastModified": "2026-10-04T00:00:00Z"}
         row.record_hash, row.data = fingerprint(row.raw), cves.parse_cve(row.raw)
-        monitored = db.get(Program, p["id"])
-        link = db.scalar(select(ProgramCVE).where(ProgramCVE.program_id == monitored.id))
+        monitored = db.get(Application, p["id"])
+        link = db.scalar(select(ApplicationCVE).where(ApplicationCVE.application_id == monitored.id))
         assert cves.gate_hash(monitored, row, link) == original_hash
         domain.refresh_cve_policy(db, monitored, row, link)
     after = [
@@ -1169,7 +1187,7 @@ def test_administrative_cve_update_does_not_queue_duplicate_auto_analysis(system
 def test_auto_analysis_waits_for_the_baseline_source_check(system, monkeypatch):
     app, client, config = system
     connection(app)
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
@@ -1181,8 +1199,8 @@ def test_auto_analysis_waits_for_the_baseline_source_check(system, monkeypatch):
     raw = cve_raw()
     seed_cve(app, p["id"], raw)
     with app.state.factory.begin() as db:
-        monitored = db.get(Program, p["id"])
-        link = db.scalar(select(ProgramCVE).where(ProgramCVE.program_id == monitored.id))
+        monitored = db.get(Application, p["id"])
+        link = db.scalar(select(ApplicationCVE).where(ApplicationCVE.application_id == monitored.id))
         domain.refresh_cve_policy(db, monitored, db.get(CVE, raw["id"]), link)
     # Drain disabled notifications; nothing else may be queued before the source check.
     while run_once(config, app.state.factory, FixtureBroker()):
@@ -1192,11 +1210,11 @@ def test_auto_analysis_waits_for_the_baseline_source_check(system, monkeypatch):
         return [j for j in client.get("/api/jobs").json()["items"] if j["kind"] == "cve_analysis"]
 
     def blocked():
-        return client.get(f"/api/cves?program_id={p['id']}").json()["items"][0]["analysis_blocked"]
+        return client.get(f"/api/cves?application_id={p['id']}").json()["items"][0]["analysis_blocked"]
 
     assert analyses() == [] and blocked()["code"] == "source_not_checked"
-    monkeypatch.setattr(Sources, "github_commits", lambda *_: ("b" * 40, []))
-    client.post(f"/api/programs/{p['id']}/checks")
+    monkeypatch.setattr(Sources, "github_commits", lambda *_: ("b" * 40, [], None))
+    client.post(f"/api/applications/{p['id']}/checks")
     run_once(config, app.state.factory, FixtureBroker())
     assert len(analyses()) == 1 and blocked() is None
 
@@ -1247,7 +1265,7 @@ def test_generated_recipe_validation_activation_and_retained_rejected_revision(
 ):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     corpus = {
         "schema_version": 1,
@@ -1272,11 +1290,11 @@ def test_generated_recipe_validation_activation_and_retained_rejected_revision(
         assert "recipe.py" in call["files"] and "target.json" in call["files"]
         return {"status": "validated" if passing else "error", "fixtures_passed": passing}, {}
 
-    queued = client.post(f"/api/programs/{p['id']}/version-recipes", json={}).json()["job_id"]
+    queued = client.post(f"/api/applications/{p['id']}/version-recipes", json={}).json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker(handler=handler))
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == ("succeeded" if passing else "failed"), job
-    recipe = client.get(f"/api/programs/{p['id']}/version-recipes").json()["items"][0]
+    recipe = client.get(f"/api/applications/{p['id']}/version-recipes").json()["items"][0]
     assert recipe["status"] == ("active" if passing else "rejected")
     assert recipe["metadata"]["allowed_origins"] == ["https://example.com"]
     import hashlib
@@ -1284,14 +1302,14 @@ def test_generated_recipe_validation_activation_and_retained_rejected_revision(
     assert recipe["metadata"]["script_sha256"] == hashlib.sha256(script).hexdigest()
     assert any(artifact["path"] == "determine_version.py" for artifact in recipe["artifacts"])
     assert (
-        bool(client.get(f"/api/programs/{p['id']}").json()["config"]["active_recipe_id"]) is passing
+        bool(client.get(f"/api/applications/{p['id']}").json()["config"]["active_recipe_id"]) is passing
     )
 
 
 def test_recipe_fingerprints_come_from_the_corpus_file_not_the_prompt(system, monkeypatch):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     source_snapshot(app, p["id"])
     digest = "f" * 64
     corpus = {
@@ -1326,7 +1344,7 @@ def test_recipe_fingerprints_come_from_the_corpus_file_not_the_prompt(system, mo
             deadlines[kind] = deadline
             return super().wait(run_id, heartbeat, progress, deadline)
 
-    queued = client.post(f"/api/programs/{p['id']}/version-recipes", json={}).json()["job_id"]
+    queued = client.post(f"/api/applications/{p['id']}/version-recipes", json={}).json()["job_id"]
     run_once(config, app.state.factory, RecordingBroker(handler=handler))
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
     assert json.loads(probe_files["fingerprints.json"]) == {"fingerprints": corpus["fingerprints"]}
@@ -1373,16 +1391,24 @@ def source_record(revision):
     }
 
 
-def test_first_baseline_imports_history_without_automatic_ai_jobs(system, monkeypatch):
+def test_first_baseline_imports_no_history_and_queues_no_ai_jobs(system, monkeypatch):
     app, client, config = system
     connection(app)
-    p = program(client, config={"triage_mode": "codex"})
+    github_account(app)
+    p = application(client, config={"triage_mode": "codex"})
     head = "a" * 40
-    monkeypatch.setattr(Sources, "github_commits", lambda *_: (head, [source_record(head)]))
-    queued = client.post(f"/api/programs/{p['id']}/checks").json()["job_id"]
+    original = Sources.__init__
+
+    def setup(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.client = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=[{"sha": head}])))
+
+    monkeypatch.setattr(Sources, "__init__", setup)
+    queued = check_now(client, p["id"])
     run_once(config, app.state.factory, FixtureBroker())
-    assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
-    assert len(client.get(f"/api/programs/{p['id']}/commits").json()["items"]) == 1
+    job = client.get(f"/api/jobs/{queued}").json()
+    assert job["status"] == "succeeded" and job["result"]["source_ref"] == head
+    assert client.get(f"/api/applications/{p['id']}/commits").json()["items"] == []
     assert all(
         job["kind"] not in ("commit_triage", "jev_triage", "commit_analysis")
         for job in client.get("/api/jobs").json()["items"]
@@ -1392,11 +1418,11 @@ def test_first_baseline_imports_history_without_automatic_ai_jobs(system, monkey
 def test_genuine_head_advance_automatic_triage_runs_broker(system, monkeypatch):
     app, client, config = system
     connection(app)
-    p = program(client, config={"triage_mode": "codex"})
+    p = application(client, config={"triage_mode": "codex"})
     source_snapshot(app, p["id"], "a" * 40)
     head = "b" * 40
-    monkeypatch.setattr(Sources, "github_commits", lambda *_: (head, [source_record(head)]))
-    client.post(f"/api/programs/{p['id']}/checks")
+    monkeypatch.setattr(Sources, "github_commits", lambda *_: (head, [source_record(head)], None))
+    client.post(f"/api/applications/{p['id']}/checks")
     run_once(config, app.state.factory, FixtureBroker())
     triage = next(
         job for job in client.get("/api/jobs").json()["items"] if job["kind"] == "commit_triage"
@@ -1415,7 +1441,7 @@ def test_genuine_head_advance_automatic_triage_runs_broker(system, monkeypatch):
     assert len(broker.calls) == 1 and broker.calls[0]["profile"]["operation"] == "commit_triage"
     revised = next(
         commit
-        for commit in client.get(f"/api/programs/{p['id']}/commits").json()["items"]
+        for commit in client.get(f"/api/applications/{p['id']}/commits").json()["items"]
         if commit["revision"] == head
     )
     assert revised["triage_result"]["revision"] == head
@@ -1426,22 +1452,22 @@ def test_genuine_head_advance_automatic_triage_runs_broker(system, monkeypatch):
 def test_historical_pinned_commit_job_remains_valid_after_current_head_advances(system):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     pinned = "a" * 40
     commit_id = source_snapshot(app, p["id"], pinned)
     queued = client.post(f"/api/commits/{commit_id}/analyses", json={}).json()["job_id"]
     with app.state.factory.begin() as db:
-        monitored = db.get(Program, p["id"])
-        monitored.cursor = "b" * 40
+        monitored = db.get(Application, p["id"])
+        repository_of(db, p["id"]).cursor = "b" * 40
         from numen.models import AuditContext
         from numen.artifacts import publish
 
         context_job = domain.enqueue(
-            db, "audit_context", monitored, domain.job_input(monitored, source_ref=pinned)
+            db, "audit_context", monitored, domain.job_input(db, monitored, source_ref=pinned)
         )
         context_job.status = "succeeded"
         report = AuditContext(
-            program_id=monitored.id,
+            application_id=monitored.id,
             source_generation=1,
             source_ref=pinned,
             skill_revision="fixture-pinned-skill",
@@ -1491,10 +1517,11 @@ def test_historical_pinned_commit_job_remains_valid_after_current_head_advances(
 def test_changed_source_generation_still_blocks_pinned_commit_job(system):
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     commit_id = source_snapshot(app, p["id"])
     queued = client.post(f"/api/commits/{commit_id}/analyses", json={}).json()["job_id"]
-    client.patch(f"/api/programs/{p['id']}", json={"source_ref": "release"})
+    # Removing the source repository changes the source the queued analysis was pinned to.
+    client.delete(f"/api/applications/{p['id']}/repositories/{p['repositories'][0]['repository_id']}")
     broker = FixtureBroker()
     run_once(config, app.state.factory, broker)
     job = client.get(f"/api/jobs/{queued}").json()
@@ -1504,29 +1531,27 @@ def test_changed_source_generation_still_blocks_pinned_commit_job(system):
 
 def test_source_generation_changed_during_fetch_cannot_promote_old_cursor(system, monkeypatch):
     app, client, config = system
-    p = program(client)
+    p = application(client)
 
     def collect(*_):
         with app.state.factory.begin() as db:
-            row = db.get(Program, p["id"])
-            row.source_generation += 1
-            row.source_ref = "release"
-        return "a" * 40, [source_record("a" * 40)]
+            repository_of(db, p["id"]).source_generation += 1
+        return "a" * 40, [source_record("a" * 40)], None
 
     monkeypatch.setattr(Sources, "github_commits", collect)
-    queued = client.post(f"/api/programs/{p['id']}/checks").json()["job_id"]
+    queued = check_now(client, p["id"])
     run_once(config, app.state.factory, FixtureBroker())
     assert client.get(f"/api/jobs/{queued}").json()["error"]["code"] == "input_changed"
     with app.state.factory() as db:
-        row = db.get(Program, p["id"])
+        row = repository_of(db, p["id"])
         assert row.source_generation == 2 and row.cursor is None
-    assert client.get(f"/api/programs/{p['id']}/commits").json()["items"] == []
+    assert client.get(f"/api/applications/{p['id']}/commits").json()["items"] == []
 
 
 def test_queued_cve_score_update_still_rechecks_record_hash_before_dispatch(system):
     app, client, config = system
     connection(app)
-    p = program(
+    p = application(
         client,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
@@ -1536,7 +1561,7 @@ def test_queued_cve_score_update_still_rechecks_record_hash_before_dispatch(syst
     )
     source_snapshot(app, p["id"])
     seed_cve(app, p["id"], cve_raw(7))
-    queued = client.post(f"/api/programs/{p['id']}/cves/CVE-2026-12345/analyses", json={}).json()[
+    queued = client.post(f"/api/applications/{p['id']}/cves/CVE-2026-12345/analyses", json={}).json()[
         "job_id"
     ]
     with app.state.factory.begin() as db:
@@ -1558,7 +1583,7 @@ def test_unavailable_broker_never_reports_running_work_stopped_or_allows_retry(
 
     app, client, config = system
     connection(app)
-    p = program(client)
+    p = application(client)
     commit_id = source_snapshot(app, p["id"])
     queued = client.post(f"/api/commits/{commit_id}/analyses", json={}).json()["job_id"]
 

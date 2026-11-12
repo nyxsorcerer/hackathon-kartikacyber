@@ -85,6 +85,74 @@ export function humanize(value: string) {
   const text = value.replaceAll("_", " ").trim();
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
+const intervalUnits = [
+  ["days", 86400],
+  ["hours", 3600],
+  ["minutes", 60],
+] as const;
+/** The largest of days, hours or minutes that divides `seconds` evenly (days when empty). */
+function intervalUnit(seconds: number | null) {
+  return (
+    intervalUnits.find(([, size]) => (seconds ?? 0) % size === 0) ??
+    intervalUnits[2]
+  );
+}
+/** A monitoring interval in seconds as "5 minutes", "6 hours" or "7 days". */
+export function formatInterval(seconds: number) {
+  const [unit, size] = intervalUnit(seconds);
+  const count = seconds / size;
+  return `${count} ${count === 1 ? unit.slice(0, -1) : unit}`;
+}
+/** A number and a minutes/hours/days unit that emits seconds (null while empty). */
+export function IntervalInput({
+  label,
+  value,
+  onChange,
+  disabled,
+  invalid,
+}: {
+  label: string;
+  value: number | null;
+  onChange: (seconds: number | null) => void;
+  disabled?: boolean;
+  invalid?: boolean;
+}) {
+  const [, initial] = intervalUnit(value);
+  const [count, setCount] = useState(value ? String(value / initial) : "");
+  const [size, setSize] = useState<number>(initial);
+  function change(nextCount: string, nextSize: number) {
+    setCount(nextCount);
+    setSize(nextSize);
+    onChange(nextCount === "" ? null : Number(nextCount) * nextSize);
+  }
+  return (
+    <span className="interval-input">
+      <input
+        type="number"
+        aria-label={label}
+        aria-invalid={invalid}
+        required={!disabled}
+        disabled={disabled}
+        min={1}
+        step={1}
+        value={count}
+        onChange={(e) => change(e.target.value, size)}
+      />
+      <select
+        aria-label={`${label} unit`}
+        disabled={disabled}
+        value={size}
+        onChange={(e) => change(count, Number(e.target.value))}
+      >
+        {[...intervalUnits].reverse().map(([unit, unitSize]) => (
+          <option key={unit} value={unitSize}>
+            {unit}
+          </option>
+        ))}
+      </select>
+    </span>
+  );
+}
 /** End a message with punctuation so another sentence can follow it. */
 export function sentence(text: string) {
   return /[.!?]$/.test(text.trim()) ? text.trim() : `${text.trim()}.`;

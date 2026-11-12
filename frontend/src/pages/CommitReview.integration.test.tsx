@@ -5,22 +5,19 @@ import { afterEach, expect, it, vi } from "vitest";
 import { Reviews, CommitDetail } from "./Commits";
 
 afterEach(() => vi.unstubAllGlobals());
-const programs = ["alpha", "beta"].map((id) => ({
+const applications = ["alpha", "beta"].map((id) => ({
   id,
   asset_name: id === "alpha" ? "Customer portal" : "Partner site",
   asset_url: `https://${id}.example.test`,
   product_kind: "cms",
   product_name: "Example CMS",
-  source_kind: "github",
-  source_url: `https://github.com/example/${id}`,
-  source_ref: "main",
-  monitor_interval_days: 7,
+  monitor_interval_seconds: 604800,
   monitor_enabled: true,
   archived: false,
   source_generation: 1,
   last_check_at: null,
   next_check_at: null,
-  last_error: null,
+  repositories: [],
   version: null,
   config: {
     profiles: {},
@@ -32,7 +29,7 @@ const programs = ["alpha", "beta"].map((id) => ({
 }));
 const records = ["alpha", "beta"].map((id) => ({
   id: `${id}-commit`,
-  program_id: id,
+  application_id: id,
   revision: id === "alpha" ? "a".repeat(40) : "b".repeat(40),
   message:
     id === "alpha" ? "Update template handling" : "Adjust login processing",
@@ -59,12 +56,12 @@ const records = ["alpha", "beta"].map((id) => ({
 function fixture() {
   const fetch = vi.fn(async (url: string) => {
     const items =
-      url.includes("/programs") && !url.includes("/commits")
-        ? programs
+      url.includes("/applications") && !url.includes("/commits")
+        ? applications
         : records.filter(
             (c) =>
-              !url.includes("program_id=") ||
-              url.includes(`program_id=${c.program_id}`),
+              !url.includes("application_id=") ||
+              url.includes(`application_id=${c.application_id}`),
           );
     return new Response(JSON.stringify({ items, next_cursor: null }));
   });
@@ -72,7 +69,7 @@ function fixture() {
   return fetch;
 }
 
-it("starts with program selection and reviews only the chosen program's security queue", async () => {
+it("starts with application selection and reviews only the chosen application's security queue", async () => {
   const fetch = fixture();
   render(
     <MemoryRouter initialEntries={["/reviews"]}>
@@ -101,10 +98,10 @@ it("starts with program selection and reviews only the chosen program's security
   expect(
     fetch.mock.calls.some(
       ([url]) =>
-        url.startsWith("/api/commits?") && !url.includes("program_id="),
+        url.startsWith("/api/commits?") && !url.includes("application_id="),
     ),
   ).toBe(false);
-  await user.selectOptions(screen.getByLabelText("Program"), "beta");
+  await user.selectOptions(screen.getByLabelText("Application"), "beta");
   expect(
     await screen.findByRole("link", {
       name: "Potential authorization bypass in partner login",
@@ -189,8 +186,8 @@ it("presents finding and hardening verdicts separately and selects one report at
       const body =
         url === "/api/commits/alpha-commit"
           ? commit
-          : url === "/api/programs/alpha"
-            ? programs[0]
+          : url === "/api/applications/alpha"
+            ? applications[0]
             : url.startsWith("/api/jobs/")
               ? {
                   id: url.split("/").at(-1),
@@ -237,11 +234,11 @@ it("presents finding and hardening verdicts separately and selects one report at
   ).toHaveAttribute("href", "/api/analyses/finding-run/download");
   expect(screen.getByRole("link", { name: "Commit review" })).toHaveAttribute(
     "href",
-    "/reviews?prog=alpha",
+    "/reviews?application=alpha",
   );
 });
 
-/** A program queue whose decisions change through the batch endpoint. */
+/** An application queue whose decisions change through the batch endpoint. */
 function batchFixture() {
   const queue = ["one", "two", "three"].map((name, i) => ({
     ...records[0],
@@ -268,8 +265,8 @@ function batchFixture() {
       });
       return new Response(JSON.stringify({ items }));
     }
-    const items = url.includes("/programs")
-      ? programs
+    const items = url.includes("/applications")
+      ? applications
       : queue.map((c) => ({ ...c }));
     return new Response(JSON.stringify({ items, next_cursor: null }));
   });
@@ -288,7 +285,7 @@ function renderQueue(path: string) {
 
 it("sets one decision on a selected range of revisions and can undo it", async () => {
   const { queue, batches } = batchFixture();
-  renderQueue("/reviews?prog=alpha&decision=all");
+  renderQueue("/reviews?application=alpha&decision=all");
   const user = userEvent.setup();
   await user.click(
     await screen.findByRole("checkbox", { name: "Select Change one" }),
@@ -333,7 +330,7 @@ it("sets one decision on a selected range of revisions and can undo it", async (
 
 it("selects every matching revision but never changes a hidden one", async () => {
   const { batches } = batchFixture();
-  renderQueue("/reviews?prog=alpha&decision=pending");
+  renderQueue("/reviews?application=alpha&decision=pending");
   const user = userEvent.setup();
   await user.click(
     await screen.findByRole("checkbox", { name: "Select all shown revisions" }),
@@ -369,7 +366,7 @@ it("shows findings ready to confirm and confirms them from the queue", async () 
       },
     ],
   });
-  renderQueue("/reviews?prog=alpha");
+  renderQueue("/reviews?application=alpha");
   const user = userEvent.setup();
   const row = (
     await screen.findByRole("checkbox", { name: "Select Change one" })
@@ -415,8 +412,8 @@ it("prompts to confirm an analysed finding and to record a missing one", async (
       const body =
         url === "/api/commits/alpha-commit"
           ? commit
-          : url === "/api/programs/alpha"
-            ? programs[0]
+          : url === "/api/applications/alpha"
+            ? applications[0]
             : { items: [commit], next_cursor: null };
       return new Response(JSON.stringify(body));
     }),
@@ -440,7 +437,7 @@ it("prompts to confirm an analysed finding and to record a missing one", async (
   const href = new URL(create.getAttribute("href")!, "https://numen.test");
   expect(href.pathname).toBe("/findings/new");
   expect(Object.fromEntries(href.searchParams)).toEqual({
-    program_id: "alpha",
+    application_id: "alpha",
     source_commit_id: "alpha-commit",
     title: "Potential path traversal through template selection",
   });
@@ -495,19 +492,19 @@ it("queues a detailed analysis for each selected revision and reports skipped on
             }
           : url === "/api/settings"
             ? {
-                monitor_interval_days: 7,
+                monitor_interval_seconds: 604800,
                 default_profiles: { commit_analysis: profile },
                 webhook_enabled: false,
                 webhook_configured: false,
               }
             : {
-                items: url.includes("/programs") ? programs : queue,
+                items: url.includes("/applications") ? applications : queue,
                 next_cursor: null,
               };
       return new Response(JSON.stringify(body));
     }),
   );
-  renderQueue("/reviews?prog=alpha&decision=all");
+  renderQueue("/reviews?application=alpha&decision=all");
   const user = userEvent.setup();
   await user.click(
     await screen.findByRole("checkbox", { name: "Select all shown revisions" }),

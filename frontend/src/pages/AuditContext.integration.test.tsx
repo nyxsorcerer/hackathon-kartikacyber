@@ -5,26 +5,26 @@ import { afterEach, expect, it, vi } from "vitest";
 import { AuditTab } from "./AuditContext";
 import { JobLaunch } from "../components/JobLaunch";
 import { setCsrfToken } from "../api";
-import type { Program } from "../types";
+import type { Application } from "../types";
 
 afterEach(() => {
   vi.unstubAllGlobals();
   setCsrfToken(undefined);
 });
-const program: Program = {
-  id: "program",
+const application: Application = {
+  id: "application",
   asset_name: "Customer portal",
   asset_url: "https://example.test",
   product_kind: "cms",
   product_name: "Example CMS",
-  source_kind: "github",
-  monitor_interval_days: 7,
+  monitor_interval_seconds: 604800,
   monitor_enabled: true,
   archived: false,
   source_generation: 1,
   last_check_at: null,
   next_check_at: null,
-  last_error: null,
+  repositories: [],
+  unresolved_dependencies: [],
   version: null,
   config: {
     profiles: {},
@@ -73,7 +73,11 @@ it("shows what a refresh reused and offers to refresh a context behind the sourc
   const onRefresh = vi.fn();
   render(
     <MemoryRouter>
-      <AuditTab program={program} onGenerate={vi.fn()} onRefresh={onRefresh} />
+      <AuditTab
+        application={application}
+        onGenerate={vi.fn()}
+        onRefresh={onRefresh}
+      />
     </MemoryRouter>,
   );
   const refreshed = await screen.findByText(
@@ -117,7 +121,7 @@ it("starts a refresh with the chosen profile and the context's own scope", async
         JSON.stringify(
           url === "/api/settings"
             ? {
-                monitor_interval_days: 7,
+                monitor_interval_seconds: 604800,
                 default_profiles: { audit_context: profile },
                 webhook_enabled: false,
                 webhook_configured: false,
@@ -153,7 +157,7 @@ it("starts a refresh with the chosen profile and the context's own scope", async
   render(
     <MemoryRouter>
       <JobLaunch
-        path="/programs/program/audit-contexts"
+        path="/applications/application/audit-contexts"
         operation="audit_context"
         context="Example CMS"
         refresh={{ id: "base", revision: "a".repeat(40) }}

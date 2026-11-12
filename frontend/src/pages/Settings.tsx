@@ -37,6 +37,7 @@ import {
   ErrorNote,
   Evidence,
   ExternalLink,
+  IntervalInput,
   JobLink,
   Modal,
   notify,
@@ -264,7 +265,7 @@ function Accounts({ integrations = false }: { integrations?: boolean }) {
               }
               description={
                 integrations
-                  ? "Public upstream checks can work without credentials. Add tokens for authenticated or rate-limited sources."
+                  ? "GitHub repositories are polled only with a fine-grained, read-only GitHub token (Contents and Metadata). WordPress.org plugins need no token."
                   : "Connect an operator-owned account, check access, and refresh its model catalog before starting agent jobs."
               }
               action={
@@ -857,9 +858,7 @@ function DefaultsEditor({
   accounts: Account[];
   refresh: () => void;
 }) {
-  const [days, setDays] = useState(
-    String(settings.monitor_interval_days ?? ""),
-  );
+  const [seconds, setSeconds] = useState(settings.monitor_interval_seconds);
   const [profiles, setProfiles] = useState<Record<string, Profile>>(
     settings.default_profiles,
   );
@@ -867,34 +866,25 @@ function DefaultsEditor({
     <>
       <Panel
         title="Monitoring cadence"
-        description="New programs inherit this interval unless they set an explicit override."
+        description="New applications inherit this interval unless they set an explicit override. The minimum is 5 minutes."
       >
         <form className="cadence-form" onSubmit={(e) => e.preventDefault()}>
           <label>
-            Global monitoring interval in days
-            <input
-              required
-              type="number"
-              min={1}
-              max={3650}
-              step={1}
-              value={days}
-              onChange={(e) => setDays(e.target.value)}
-              placeholder="Not configured"
+            Global monitoring interval
+            <IntervalInput
+              label="Global monitoring interval"
+              value={seconds}
+              onChange={setSeconds}
             />
           </label>
           <ActionButton
             className="primary"
-            disabled={
-              !Number.isInteger(Number(days)) ||
-              Number(days) < 1 ||
-              Number(days) > 3650
-            }
+            disabled={seconds === null || !Number.isInteger(seconds)}
             onAction={async () => {
               await mutate(
                 "/settings",
                 settingsSchema,
-                { monitor_interval_days: Number(days) },
+                { monitor_interval_seconds: seconds },
                 "PATCH",
               );
               refresh();
@@ -909,7 +899,7 @@ function DefaultsEditor({
       </Panel>
       <Panel
         title="Default execution profiles"
-        description="Defaults prefill the job dialog. Program overrides and job selections take precedence."
+        description="Defaults prefill the job dialog. Application overrides and job selections take precedence."
       >
         {operations.map((operation) => (
           <div className="default-operation" key={operation}>

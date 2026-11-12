@@ -5,17 +5,17 @@ import zipfile
 import pytest
 from sqlalchemy import select
 
-from conftest import FixtureBroker, connection, program, source_snapshot
+from conftest import FixtureBroker, check_now, connection, application, repository_of, source_snapshot
 from test_artifacts import bundle
 from numen import domain
-from numen.models import Action, Artifact, Commit, Job, Notification, Program
+from numen.models import Action, Artifact, Commit, Job, Notification, Application
 from numen.worker import run_once
 
 
 def prepared(system):
     app, client, _ = system
     profile = connection(app)
-    monitored = program(client)
+    monitored = application(client)
     ident = source_snapshot(app, monitored["id"])
     with app.state.factory.begin() as db:
         commit = db.get(Commit, ident)
@@ -55,7 +55,7 @@ def test_triage_records_security_title_and_routes_review_decision(system, decisi
     app, client, config = system
     monitored, ident, profile = prepared(system)
     with app.state.factory.begin() as db:
-        row = db.get(Program, monitored["id"])
+        row = db.get(Application, monitored["id"])
         job = domain.submit_agent(db, "commit_triage", row, {"commit_id": ident, "source_ref": "a" * 40}, profile)
         job_id = job.id
     result = {"decision": decision, "change_kind": kind, "title": "Potential path traversal in template selection", "reason": "A source trust boundary was assessed", "confidence": {"level": "medium"}}
@@ -72,7 +72,7 @@ def test_late_manual_review_is_not_overwritten_by_triage(system):
     app, client, config = system
     monitored, ident, profile = prepared(system)
     with app.state.factory.begin() as db:
-        domain.submit_agent(db, "commit_triage", db.get(Program, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40}, profile)
+        domain.submit_agent(db, "commit_triage", db.get(Application, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40}, profile)
     client.post(f"/api/commits/{ident}/review", json={"decision": "dismissed"})
     run_once(config, app.state.factory, FixtureBroker({"decision": "security_candidate", "change_kind": "vulnerability_introduction", "title": "Potential path traversal", "reason": "A trust boundary changed", "confidence": {"level": "high"}}))
     row = client.get(f"/api/commits/{ident}").json()
@@ -185,8 +185,8 @@ def test_parent_lookup_checks_the_requested_commit_and_immutable_hashes(system, 
     app, client, config = system
     monitored, _, _ = prepared(system)
     with app.state.factory() as db:
-        row = db.get(Program, monitored["id"])
-        source = Sources(config)
+        row = repository_of(db, monitored["id"])
+        source = Sources(config, "fixture-github-token")
         response = {"sha": "a" * 40, "parents": [{"sha": "f" * 40}]}
         seen = []
         def get(url, **kwargs):
@@ -254,21 +254,21 @@ def test_late_batch_review_is_not_overwritten_by_triage(system):
     app, client, config = system
     monitored, ident, profile = prepared(system)
     with app.state.factory.begin() as db:
-        domain.submit_agent(db, "commit_triage", db.get(Program, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40}, profile)
+        domain.submit_agent(db, "commit_triage", db.get(Application, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40}, profile)
     client.post("/api/commits/review", json={"ids": [ident], "decision": "dismissed"})
     run_once(config, app.state.factory, FixtureBroker({"decision": "security_candidate", "change_kind": "vulnerability_introduction", "title": "Potential path traversal", "reason": "A trust boundary changed", "confidence": {"level": "high"}}))
     assert client.get(f"/api/commits/{ident}").json()["review_decision"] == "dismissed"
 
 
-def test_jobs_name_their_subject_and_program_without_exposing_raw_input(system):
+def test_jobs_name_their_subject_and_application_without_exposing_raw_input(system):
     app, client, _ = system
     monitored, ident, _ = prepared(system)
     with app.state.factory.begin() as db:
         db.get(Commit, ident).triage_result = {"title": "Potential path traversal in template selection"}
     analysis = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    check = client.post(f"/api/programs/{monitored['id']}/checks").json()["job_id"]
+    check = check_now(client, monitored["id"])
     job = client.get(f"/api/jobs/{analysis}").json()
-    assert job["program_name"] == monitored["asset_name"]
+    assert job["application_name"] == monitored["asset_name"]
     assert job["subject"] == {
         "type": "commit",
         "label": "Potential path traversal in template selection",
@@ -283,7 +283,7 @@ def test_jobs_name_their_subject_and_program_without_exposing_raw_input(system):
         "type": "source",
         "label": "demo/plugin",
         "ref": None,
-        "link": f"/programs/{monitored['id']}?tab=commits",
+        "link": f"/applications/{monitored['id']}?tab=repositories",
     }
 
 
@@ -293,13 +293,13 @@ def test_confirmed_commits_link_their_findings_without_a_candidate_notification(
     second = source_snapshot(app, monitored["id"], "b" * 40)
     assert client.get(f"/api/commits/{ident}").json()["findings"] == []
     finding = client.post("/api/findings", json={
-        "program_id": monitored["id"], "kind": "0day", "title": "Path traversal in template selection",
+        "application_id": monitored["id"], "kind": "0day", "title": "Path traversal in template selection",
         "source_commit_id": ident,
     })
     assert finding.status_code in (200, 201), finding.text
     linked = {"id": finding.json()["id"], "title": "Path traversal in template selection", "status": "open", "kind": "0day"}
     assert client.get(f"/api/commits/{ident}").json()["findings"] == [linked]
-    listed = {c["id"]: c for c in client.get(f"/api/programs/{monitored['id']}/commits").json()["items"]}
+    listed = {c["id"]: c for c in client.get(f"/api/applications/{monitored['id']}/commits").json()["items"]}
     assert listed[ident]["findings"] == [linked] and listed[second]["findings"] == []
     assert client.post(f"/api/commits/{ident}/review", json={"decision": "confirmed"}).json()["review_decision"] == "confirmed"
     batch = client.post("/api/commits/review", json={"ids": [second], "decision": "confirmed"}).json()
@@ -414,19 +414,40 @@ class RepositoryBroker(FixtureBroker):
         return submitted
 
 
-@pytest.mark.parametrize("broker_class,review,succeeds", [
-    (FixtureBroker, None, False),  # an incomplete upstream diff and no review
-    (FixtureBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}, False),  # a review without the repository
-    (RepositoryBroker, None, False),  # the repository without a review
-    (RepositoryBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}, True),
+@pytest.mark.parametrize("broker_class,review", [
+    (FixtureBroker, None),  # an incomplete upstream diff and no review
+    (FixtureBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}),  # a review without the repository
+    (RepositoryBroker, None),  # the repository without a review
+    (RepositoryBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}),  # even a whole-change review
 ])
-def test_an_incomplete_diff_is_ruled_unrelated_only_after_reviewing_the_whole_change(system, broker_class, review, succeeds):
+def test_an_incomplete_diff_never_yields_unrelated(system, broker_class, review):
     app, client, config = system
     _, ident, _ = prepared(system)
     with app.state.factory.begin() as db:
         commit = db.get(Commit, ident)
         commit.data = {**commit.data, "diff_complete": False}
     result = {**assessment("Unrelated change", "not_a_finding"), **({"diff_review": review} if review else {})}
+    queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
+    run_once(config, app.state.factory, broker_class(result, {"report.md": b"# Merge review"}))
+    job = client.get(f"/api/jobs/{queued}").json()
+    assert job["status"] == "succeeded", job
+    assert (job["result"]["category"], job["result"]["finding_decision"]) == ("Insufficient context", "needs_more_evidence")
+    commit = client.get(f"/api/commits/{ident}").json()
+    assert commit["review_decision"] == "pending"
+    assert commit["analyses"][0]["result"]["category"] == "Insufficient context"
+
+
+@pytest.mark.parametrize("broker_class,review,succeeds", [
+    (FixtureBroker, None, False),
+    (RepositoryBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}, True),
+])
+def test_an_incomplete_diff_is_ruled_not_a_finding_only_after_reviewing_the_whole_change(system, broker_class, review, succeeds):
+    app, client, config = system
+    _, ident, _ = prepared(system)
+    with app.state.factory.begin() as db:
+        commit = db.get(Commit, ident)
+        commit.data = {**commit.data, "diff_complete": False}
+    result = {**assessment("Security hardening", "not_a_finding"), **({"diff_review": review} if review else {})}
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     run_once(config, app.state.factory, broker_class(result, {"report.md": b"# Merge review"}))
     job = client.get(f"/api/jobs/{queued}").json()
@@ -498,7 +519,7 @@ def test_findings_are_deleted_together_and_any_blocked_one_deletes_none(system):
     run_once(config, app.state.factory, FixtureBroker(assessment(), pinned_bundle()))
     analyzed = client.get(f"/api/jobs/{queued}").json()["result"]["finding_id"]
     manual = [
-        client.post("/api/findings", json={"program_id": monitored["id"], "kind": "0day", "title": f"Duplicate {n}"}).json()["id"]
+        client.post("/api/findings", json={"application_id": monitored["id"], "kind": "0day", "title": f"Duplicate {n}"}).json()["id"]
         for n in range(2)
     ]
     ids = [analyzed, *manual]

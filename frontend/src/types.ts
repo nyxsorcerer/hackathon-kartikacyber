@@ -67,7 +67,7 @@ export const versionSchema = z.object({
   checked_at: z.string().optional(),
   origin: z.string().optional(),
   recipe_id: z.string().nullable().optional(),
-  program_id: z.string().optional(),
+  application_id: z.string().optional(),
   source_generation: z.number().optional(),
   profile: profileSchema.nullable().optional(),
   error: z.unknown().optional(),
@@ -86,7 +86,7 @@ export const configSchema = z
     cve_min_score: z.number().nullable().optional(),
     cve_versions: z.array(z.string()).default([]),
     cve_auto_analyze: z.boolean().default(false),
-    // Programs saved before this setting existed keep it off.
+    // Applications saved before this setting existed keep it off.
     audit_auto_refresh: z.boolean().default(false),
     active_recipe_id: z.string().nullable().optional(),
     version_scheme: z.enum(["semver", "php", "unknown"]).optional(),
@@ -97,35 +97,76 @@ export const configSchema = z
     monitor_interval_inherited: z.boolean().optional(),
   })
   .passthrough();
-export const programSchema = z.object({
+/** An Own or Upstream repository as one Application links it. */
+export const repositoryLinkSchema = z.object({
+  repository_id: z.string(),
+  role: z.enum(["own", "upstream"]),
+  enabled: z.boolean(),
+  removed_at: z.string().nullable(),
+  locked_version: z.string().nullable(),
+  locked_version_source: z.string().nullable(),
+  release_branch: z.string().nullable(),
+  // "unknown" is shown as "release branch unknown".
+  release_branch_status: z.enum(["pending", "matched", "unknown"]).nullable(),
+  // A derived Upstream link: the packages it stands for ("npm:react"); hand-added links: [].
+  packages: z.array(z.string()).default([]),
+  source_kind: z.enum(["github", "wordpress"]),
+  source_url: z.string(),
+  plugin_slug: z.string().nullable(),
+  source_ref: z.string().nullable(),
+  source_path: z.string().nullable(),
+  cursor: z.string().nullable(),
+  baseline_revision: z.string().nullable(),
+  last_check_at: z.string().nullable(),
+  last_error: z.unknown().nullable(),
+});
+export type RepositoryLink = z.infer<typeof repositoryLinkSchema>;
+export const applicationSchema = z.object({
   id: z.string(),
   asset_name: z.string(),
   asset_url: z.string(),
   product_kind: z.string(),
   product_name: z.string(),
-  source_kind: z.enum(["github", "wordpress"]),
-  source_url: z.string().nullable().optional(),
-  source_ref: z.string().nullable().optional(),
-  source_path: z.string().nullable().optional(),
-  plugin_slug: z.string().nullable().optional(),
-  monitor_interval_days: z.number().nullable(),
+  monitor_interval_seconds: z.number().nullable(),
   monitor_enabled: z.boolean(),
   archived: z.boolean(),
   source_generation: z.number(),
   last_check_at: z.string().nullable(),
   next_check_at: z.string().nullable(),
-  last_error: z.unknown().nullable(),
+  repositories: z.array(repositoryLinkSchema).default([]),
+  // Direct dependencies of the Own repository with no GitHub source repository.
+  unresolved_dependencies: z
+    .array(
+      z.object({
+        ecosystem: z.enum(["npm", "composer"]),
+        name: z.string(),
+        version: z.string().nullable(),
+        reason: z.string(),
+      }),
+    )
+    .default([]),
   version: versionSchema.nullable(),
   latest_version_check: versionSchema.nullable().optional(),
   config: configSchema,
 });
-export type Program = z.infer<typeof programSchema>;
-export function programState(program: Program) {
-  return program.archived
+export type Application = z.infer<typeof applicationSchema>;
+export function repositoryLabel(repository: RepositoryLink) {
+  return repository.source_kind === "wordpress"
+    ? `WordPress · ${repository.plugin_slug}`
+    : repository.source_url.replace("https://github.com/", "");
+}
+/** Polled repositories whose last check failed. */
+export function failingRepositories(application: Application) {
+  return application.repositories.filter(
+    (r) => r.enabled && !r.removed_at && r.last_error,
+  );
+}
+export function applicationState(application: Application) {
+  return application.archived
     ? "archived"
-    : program.last_error
+    : failingRepositories(application).length
       ? "error"
-      : program.monitor_enabled
+      : application.monitor_enabled
         ? "monitoring"
         : "paused";
 }
@@ -181,7 +222,9 @@ const commitFileSchema = z.union([
 export type CommitFile = z.infer<typeof commitFileSchema>;
 export const commitSchema = z.object({
   id: z.string(),
-  program_id: z.string(),
+  repository_id: z.string().optional(),
+  /** The first Application linking the commit's repository. */
+  application_id: z.string().nullable(),
   revision: z.string(),
   message: z.string(),
   author: z.string().nullable().optional(),
@@ -261,7 +304,7 @@ export const scoreSchema = z.object({
 });
 export const cveSchema = z.object({
   id: z.string(),
-  program_id: z.string(),
+  application_id: z.string(),
   title: z.string(),
   description: z.string(),
   published_at: z.string().nullable().optional(),
@@ -291,7 +334,7 @@ export const cveSchema = z.object({
 export type CVE = z.infer<typeof cveSchema>;
 export const findingSchema = z.object({
   id: z.string(),
-  program_id: z.string(),
+  application_id: z.string(),
   kind: z.enum(["cve", "0day"]),
   cve_id: z.string().nullable(),
   title: z.string(),
@@ -320,7 +363,7 @@ export type Finding = z.infer<typeof findingSchema>;
 export const findingSummarySchema = findingSchema
   .pick({
     id: true,
-    program_id: true,
+    application_id: true,
     kind: true,
     cve_id: true,
     title: true,
@@ -349,8 +392,8 @@ export type JobSubject = z.infer<typeof jobSubjectSchema>;
 export const jobSchema = z.object({
   id: z.string(),
   kind: z.string(),
-  program_id: z.string().nullable().optional(),
-  program_name: z.string().nullable().optional(),
+  application_id: z.string().nullable().optional(),
+  application_name: z.string().nullable().optional(),
   subject: jobSubjectSchema.nullable().optional(),
   status: z.string(),
   progress: z.unknown(),
@@ -365,7 +408,7 @@ export const jobSchema = z.object({
 export type Job = z.infer<typeof jobSchema>;
 export const settingsSchema = z
   .object({
-    monitor_interval_days: z.number().nullable(),
+    monitor_interval_seconds: z.number().nullable(),
     default_profiles: z.record(z.string(), profileSchema).default({}),
     webhook_enabled: z.boolean().default(false),
     webhook_configured: z.boolean().default(false),
@@ -462,14 +505,14 @@ export const sessionSchema = z.object({
 });
 export type Session = z.infer<typeof sessionSchema>;
 export const dashboardSchema = z.object({
-  programs: z.number(),
+  applications: z.number(),
   security_reviews: z.number(),
   eligible_cves: z.number(),
   open_findings: z.number(),
   running_jobs: z.number(),
   failed_jobs: z.number(),
   recent_events: z.array(z.unknown()),
-  due_programs: z.array(z.unknown()),
+  due_applications: z.array(z.unknown()),
 });
 export const agentSessionSchema = z.object({
   runs: z.array(z.string()),
@@ -483,6 +526,10 @@ export const agentSessionSchema = z.object({
 export const jobAcceptedSchema = z.object({
   job_id: z.string(),
   status_url: z.string(),
+});
+/** Check now queues one source check per polled repository. */
+export const checksAcceptedSchema = z.object({
+  items: z.array(jobAcceptedSchema.extend({ repository_id: z.string() })),
 });
 export const listSchema = <T extends z.ZodType>(schema: T) =>
   z.object({ items: z.array(schema), next_cursor: z.string().nullable() });
@@ -507,7 +554,7 @@ export function safeHref(value: string | null | undefined): string | undefined {
     return undefined;
   }
 }
-export const programsSchema = listSchema(programSchema);
+export const applicationsSchema = listSchema(applicationSchema);
 export const accountsSchema = listSchema(accountSchema);
 export const commitsSchema = listSchema(commitSchema);
 export const cvesSchema = listSchema(cveSchema);

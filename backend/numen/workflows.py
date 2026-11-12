@@ -13,7 +13,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from sqlalchemy import select
-from . import artifacts, cves, domain, prompts
+from yaml import YAMLError
+from . import artifacts, cves, dependencies, domain, prompts
 from . import fingerprints as fingerprinting
 from .models import (
     Account,
@@ -30,8 +31,10 @@ from .models import (
     LabRun,
     Notification,
     Observation,
-    Program,
-    ProgramCVE,
+    Application,
+    ApplicationCVE,
+    ApplicationRepository,
+    Repository,
     Snapshot,
     VersionRecipe,
     now,
@@ -39,7 +42,8 @@ from .models import (
 )
 from .schemas import AUDIT_MAX_FUNCTIONS, CATEGORIES, CHANGE_KINDS, ModelCapability
 from .security import DomainError, fingerprint, retry_delay
-from .sources import Sources
+from .prefilter import MANIFESTS, prefilter
+from .sources import Sources, release_branch_candidates
 
 
 EVIDENCE_SCHEMA = {"type": "array", "items": {"type": "object"}}
@@ -330,8 +334,8 @@ class Workflows:
         self.source_clients.append(client)
         return client
 
-    def snapshot(self, db, program, source_ref=None):
-        source_ref = source_ref or program.cursor
+    def snapshot(self, db, repository, source_ref=None):
+        source_ref = source_ref or repository.cursor
         if not source_ref:
             raise DomainError(
                 "source_not_checked",
@@ -340,8 +344,8 @@ class Workflows:
             )
         row = db.scalar(
             select(Snapshot).where(
-                Snapshot.program_id == program.id,
-                Snapshot.source_generation == program.source_generation,
+                Snapshot.repository_id == repository.id,
+                Snapshot.source_generation == repository.source_generation,
                 Snapshot.source_ref == source_ref,
             )
         )
@@ -349,17 +353,17 @@ class Workflows:
             return row, artifacts.resource_files(db, self.config.artifact_root, "snapshot", row.id)
         source = self.source_client(db)
         files = (
-            source.snapshot_github(program, source_ref)
-            if program.source_kind == "github"
-            else source.snapshot_wordpress(program, source_ref)
+            source.snapshot_github(repository, source_ref)
+            if repository.source_kind == "github"
+            else source.snapshot_wordpress(repository, source_ref)
         )
         if not files:
             raise DomainError("empty_snapshot", "Source snapshot contains no available files", 422)
         self.context.fence(db)
         row = Snapshot(
             id=uid(),
-            program_id=program.id,
-            source_generation=program.source_generation,
+            repository_id=repository.id,
+            source_generation=repository.source_generation,
             source_ref=source_ref,
             files=list(files),
         )
@@ -370,36 +374,36 @@ class Workflows:
             "snapshot",
             row.id,
             files,
-            {"source_ref": source_ref, "source_generation": program.source_generation},
+            {"source_ref": source_ref, "source_generation": repository.source_generation},
         )
         db.commit()  # Immutable source checkpoint; release the fence before starting a runtime.
         return row, files
 
-    def vulnerable_pin(self, db, job, program, cve):
+    def vulnerable_pin(self, db, job, application, repository, cve):
         """Pin the newest still-affected release; a published CVE's fix is already in HEAD."""
         requested = job.input.get("source_ref")
         if requested:
             ref = (
-                self.source_client(db).commit_ref(program, requested)
-                if program.source_kind == "github"
+                self.source_client(db).commit_ref(repository, requested)
+                if repository.source_kind == "github"
                 else requested
             )
             return ref, {"basis": "operator", "requested": requested, "source_ref": ref}
-        bound = cves.vulnerable_bound(program, cve) if cve else None
+        bound = cves.vulnerable_bound(application, repository, cve) if cve else None
 
         def unpinned(reason):
             return None, {"basis": "unpinned", "reason": reason, "bound": bound}
 
-        if program.source_kind != "github":
+        if repository.source_kind != "github":
             return unpinned("Vulnerable-release pinning is available for GitHub sources")
         if not bound:
             return unpinned("This record states no ordered affected-version bound")
-        scheme = cves.version_scheme(program)
+        scheme = cves.version_scheme(application, repository)
         if scheme == "unknown":
-            return unpinned("Set the program version scheme to rank its releases")
+            return unpinned("Set the Application version scheme to rank its releases")
         try:
             found = self.source_client(db).vulnerable_tag(
-                program, bound["version"], bound["inclusive"], scheme
+                repository, bound["version"], bound["inclusive"], scheme
             )
         except DomainError as exc:
             return unpinned("Release catalog unavailable: " + exc.code)
@@ -591,19 +595,26 @@ class Workflows:
         return result, outputs, state
 
     def execute(self, db, job):
-        program = domain.get(db, Program, job.program_id) if job.program_id else None
+        application = domain.get(db, Application, job.application_id) if job.application_id else None
+        # Repository work (source checks, Triage) follows the repository's generation.
+        owner = (
+            domain.get(db, Repository, job.input["repository_id"])
+            if job.input.get("repository_id")
+            else application
+        )
         if (
-            program
+            owner
             and job.kind != "lab_run"
-            and job.input.get("source_generation") != program.source_generation
+            and job.input.get("source_generation") != owner.source_generation
         ):
             raise DomainError(
-                "input_changed", "Program source changed after this job was queued", 409
+                "input_changed", "Application source changed after this job was queued", 409
             )
         if (
-            program
+            application
             and job.kind == "version_recipe"
-            and job.input.get("source_ref") != program.cursor
+            and job.input.get("source_ref")
+            != getattr(domain.source_repository(db, application), "cursor", None)
         ):
             raise DomainError(
                 "input_changed", "Source revision changed after this operation was queued", 409
@@ -611,112 +622,106 @@ class Workflows:
         handler = getattr(self, job.kind, None)
         if handler is None:
             raise DomainError("unsupported_job", "This job kind has no execution handler", 422)
-        return handler(db, job, program)
+        return handler(db, job, application)
 
-    def source_check(self, db, job, program):
-        baseline = program.cursor is None
-        captured_cursor = program.cursor
+    def source_check(self, db, job, application):
+        repository = domain.get(db, Repository, job.input["repository_id"])
+        captured_cursor, captured_etag = repository.cursor, repository.etag
+        baseline = captured_cursor is None
         source = self.source_client(db)
-        head, records = (
-            source.github_commits(program)
-            if program.source_kind == "github"
-            else source.wordpress_commits(program)
+        head, records, etag = (
+            source.github_commits(repository)
+            if repository.source_kind == "github"
+            else source.wordpress_commits(repository)
         )
+        # An Upstream GitHub repository also watches the Release branch of each Locked version
+        # its active links use. Own and WordPress repositories never resolve one.
+        links = [
+            link
+            for linked, link in domain.linked_applications(db, repository)
+            if repository.source_kind == "github"
+            and link.role == "upstream"
+            and link.enabled
+            and link.removed_at is None
+            and not linked.archived
+        ]
+        found = {}  # Locked version: the first candidate branch that exists, or None
+        for link in links:
+            version = link.locked_version
+            if version and version != link.release_branch_version and version not in found:
+                found[version] = next(
+                    (
+                        name
+                        for name in release_branch_candidates(version)
+                        if source.github_branch(repository, name)
+                    ),
+                    None,
+                )
+        branches = {
+            found.get(link.locked_version, link.release_branch) for link in links if link.locked_version
+        }
+        polled = {}
+        for name in sorted(branches - {None, repository.source_ref}):
+            state = repository.watched_branches.get(name, {})
+            polled[name] = source.github_commits(
+                repository, name, state.get("cursor"), state.get("etag")
+            )
         self.context.fence(db)
-        db.refresh(program, with_for_update=True)
-        if job.input.get("source_generation") != program.source_generation:
+        db.refresh(repository, with_for_update=True)
+        if job.input.get("source_generation") != repository.source_generation:
             raise DomainError(
                 "input_changed",
-                "Program source changed during synchronization; cursor retained",
+                "Repository source changed during synchronization; cursor retained",
                 409,
             )
-        if program.cursor != captured_cursor:
+        if repository.cursor != captured_cursor:
             raise DomainError(
                 "source_check_superseded",
                 "Another check advanced the source cursor; retry from the current baseline",
                 409,
                 retryable=True,
             )
-        mode = program.config.get("triage_mode", "disabled")
-        imported = []
-        for record in records:
-            existing = db.scalar(
-                select(Commit).where(
-                    Commit.program_id == program.id,
-                    Commit.source_generation == program.source_generation,
-                    Commit.revision == record["revision"],
-                )
+        repository.last_check_at = now()
+        repository.last_error = None
+        for link in links:
+            if link.locked_version != link.release_branch_version:
+                link.release_branch = found.get(link.locked_version)
+                link.release_branch_version = link.locked_version
+        watched = {name: {"cursor": cursor, "etag": tag} for name, (cursor, _, tag) in polled.items()}
+        if etag is not None and etag == captured_etag and watched == repository.watched_branches:
+            # 304 Not Modified on every branch: nothing advances and nothing is queued.
+            return {"source_ref": head, "imported": 0, "commit_ids": [], "baseline": False, "not_modified": True}
+        # A revision already imported from another branch is skipped.
+        imported = self.import_commits(db, repository, records)
+        for name, (_, branch_records, _) in polled.items():
+            imported += self.import_commits(
+                db, repository, [{**record, "branch": name} for record in branch_records]
             )
-            if existing:
-                continue
-            commit = Commit(
-                program_id=program.id,
-                source_generation=program.source_generation,
-                revision=record.pop("revision"),
-                data=record,
-                triage_status="disabled"
-                if mode == "disabled"
-                else ("baseline" if baseline else "pending"),
-            )
-            db.add(commit)
-            db.flush()
-            imported.append(commit.id)
-            if mode != "disabled" and not baseline:
-                try:
-                    if mode == "jev":
-                        selected = domain.resolve_jev(db, program.config)
-                        domain.enqueue(
-                            db,
-                            "jev_triage",
-                            program,
-                            domain.job_input(
-                                program, commit_id=commit.id, source_ref=commit.revision, **selected
-                            ),
-                        )
-                    else:
-                        profile = domain.resolve_profile(db, program, "commit_triage")
-                        if profile["agent"] != mode:
-                            raise DomainError(
-                                "triage_profile_mismatch",
-                                "Triage mode and agent profile differ",
-                                422,
-                            )
-                        domain.enqueue(
-                            db,
-                            "commit_triage",
-                            program,
-                            domain.job_input(
-                                program, commit_id=commit.id, source_ref=commit.revision
-                            ),
-                            profile,
-                        )
-                except DomainError as exc:
-                    commit.triage_status = "blocked"
-                    commit.triage_result = {
-                        "decision": "insufficient_context",
-                        "reason": exc.message,
-                        "error": exc.code,
-                    }
-        changed = program.cursor != head
-        program.cursor = head
-        program.last_check_at = now()
-        program.next_check_at = now() + timedelta(days=program.monitor_interval_days)
-        program.last_error = None
+        repository.watched_branches = watched
+        changed = repository.cursor != head
+        repository.cursor, repository.etag = head, etag
         if baseline:
-            # Automatic CVE analysis held for a missing source baseline can now run.
-            for link in db.scalars(select(ProgramCVE).where(ProgramCVE.program_id == program.id)):
-                if (link.data.get("analysis_blocked") or {}).get("code") == "source_not_checked":
-                    domain.refresh_cve_policy(db, program, db.get(CVE, link.cve_id), link)
-        if changed:
-            for report in db.scalars(
-                select(AuditContext).where(
-                    AuditContext.program_id == program.id,
-                    AuditContext.status.in_(["complete", "partial"]),
-                )
-            ):
-                if report.source_ref != head:
-                    report.status = "stale"
-        self.queue_audit_refresh(db, job, program)
+            repository.baseline_revision = head
+        self.queue_derivation(db, repository, head, imported)
+        for linked, _ in domain.linked_applications(db, repository):
+            source = domain.source_repository(db, linked)
+            if source is None or source.id != repository.id:
+                continue
+            if baseline:
+                # Automatic CVE analysis held for a missing source baseline can now run.
+                for link in db.scalars(select(ApplicationCVE).where(ApplicationCVE.application_id == linked.id)):
+                    if (link.data.get("analysis_blocked") or {}).get("code") == "source_not_checked":
+                        domain.refresh_cve_policy(db, linked, db.get(CVE, link.cve_id), link)
+            if changed:
+                for report in db.scalars(
+                    select(AuditContext).where(
+                        AuditContext.application_id == linked.id,
+                        AuditContext.status.in_(["complete", "partial"]),
+                    )
+                ):
+                    if report.source_ref != head:
+                        report.status = "stale"
+            self.queue_audit_refresh(db, job, linked)
         return {
             "source_ref": head,
             "imported": len(imported),
@@ -724,16 +729,223 @@ class Workflows:
             "baseline": baseline,
         }
 
-    def queue_audit_refresh(self, db, job, program):
-        """When the program keeps its audit context current, queues a refresh whenever the newest
+    def backfill(self, db, job, application):
+        """Imports and triages the last `count` commits up to the Baseline."""
+        repository = domain.get(db, Repository, job.input["repository_id"])
+        source = self.source_client(db)
+        records = (
+            source.github_backfill(repository, job.input["count"])
+            if repository.source_kind == "github"
+            else source.wordpress_backfill(repository, job.input["count"])
+        )
+        self.context.fence(db)
+        db.refresh(repository, with_for_update=True)
+        imported = self.import_commits(db, repository, [{**r, "backfill": True} for r in records])
+        return {"imported": len(imported), "commit_ids": imported}
+
+    def queue_derivation(self, db, repository, head, imported):
+        """Derives the Upstream repositories of each Application whose Own repository this is:
+        first after its Baseline, then whenever a new commit changes a manifest or lockfile."""
+        changed = any(
+            flag["rule"] == "dependency_manifest"
+            for ident in imported
+            for flag in db.get(Commit, ident).data["prefilter"]
+        )
+        for linked, link in domain.linked_applications(db, repository):
+            if (
+                link.role == "own"
+                and link.removed_at is None
+                and not linked.archived
+                and (changed or link.derived_revision is None)
+            ):
+                domain.enqueue(
+                    db,
+                    "derive_upstreams",
+                    linked,
+                    domain.repository_input(repository, source_ref=head),
+                    idempotency_key=f"derive:{linked.id}:{head}",
+                )
+
+    def derive_upstreams(self, db, job, application):
+        """Links the Upstream repositories of the Own repository's direct dependencies at
+        source_ref. All are on at the first derivation and later additions start off; a
+        dependency that is gone marks its link removed, and hand-added links are never touched."""
+        own = domain.get(db, Repository, job.input["repository_id"])
+        ref = job.input["source_ref"]
+        source = self.source_client(db)
+        files = {name: source.github_file(own, name, ref) for name in sorted(MANIFESTS)}
+        files = {name: text for name, text in files.items() if text is not None}
+        try:
+            wanted = dependencies.direct_dependencies(files)
+            locked = dependencies.locked_versions(files)
+            recorded = dependencies.composer_sources(files)
+        # Valid JSON or YAML of the wrong shape (an array, a string entry, a package without a
+        # name) fails as AttributeError, KeyError or TypeError.
+        except (ValueError, YAMLError, AttributeError, KeyError, TypeError) as exc:
+            raise DomainError(
+                "invalid_manifest", f"A manifest or lockfile could not be read: {exc}", 422
+            ) from exc
+        found, unresolved = {}, []  # found: {GitHub URL: [(package, Locked version)]}
+        for ecosystem, name, _ in wanted:
+            version = locked.get((ecosystem, name))
+            try:
+                metadata = (
+                    recorded.get(name) or source.packagist_repository(name, version)
+                    if ecosystem == "composer"
+                    else source.npm_repository(name, version)
+                )
+            except (ValueError, AttributeError, KeyError, TypeError):
+                metadata = False  # the registry answered with something other than its JSON object
+            url = dependencies.github_url(metadata)
+            if url:
+                found.setdefault(url, []).append((f"{ecosystem}:{name}", version))
+                continue
+            where = metadata.get("url") if isinstance(metadata, dict) else metadata
+            if metadata is False:
+                reason = "Registry metadata could not be read"
+            elif metadata is None:
+                registry = "the npm registry" if ecosystem == "npm" else "Packagist"
+                reason = f"Package not found in {registry}"
+            elif not where:
+                reason = "Package metadata names no source repository"
+            else:
+                reason = f"Source repository is not on GitHub: {where}"
+            unresolved.append(
+                {"ecosystem": ecosystem, "name": name, "version": version, "reason": reason}
+            )
+        self.context.fence(db)
+        # ponytail: no per-Application lock, so two derivations running at once apply in the order
+        # they finish; lock the Own link and compare revisions if that ever matters.
+        rows = domain.links(db, application)
+        own_link = next(
+            (
+                link
+                for link, repository in rows
+                if repository.id == own.id and link.role == "own" and link.removed_at is None
+            ),
+            None,
+        )
+        if own_link is None:
+            raise DomainError("input_changed", "This repository is no longer the Own repository", 409)
+        previous = domain.source_repository(db, application)
+        current = {repository.source_url: link for link, repository in rows}
+        added, removed = [], []
+        for url, packages in found.items():
+            link = current.get(url)
+            if link is not None and link.role == "own":
+                continue  # the Own repository depends on itself
+            version = packages[0][1]
+            if link is None:
+                repository = domain.repository_for(db, url, source_kind="github")
+                link = ApplicationRepository(
+                    application_id=application.id,
+                    repository_id=repository.id,
+                    role="upstream",
+                    enabled=own_link.derived_revision is None,
+                    locked_version=version,
+                    locked_version_source="manifest" if version else None,
+                )
+                db.add(link)
+                added.append(url)
+            elif link.locked_version_source in (None, "manifest"):
+                link.locked_version = version
+                link.locked_version_source = "manifest" if version else None
+            link.packages, link.removed_at = [package for package, _ in packages], None
+        for url, link in current.items():
+            derived = link.role == "upstream" and link.packages
+            if derived and url not in found and link.removed_at is None:
+                link.removed_at = now()  # its commits stay: they belong to the repository
+                removed.append(url)
+        own_link.unresolved, own_link.derived_revision = unresolved, ref
+        db.flush()
+        domain.source_changed(db, application, previous.id if previous else None)
+        if added and application.monitor_enabled and not application.archived:
+            application.next_check_at = now()  # new repositories get their Baseline
+        return {
+            "source_ref": ref,
+            "repositories": len(found),
+            "added": added,
+            "removed": removed,
+            "unresolved": len(unresolved),
+        }
+
+    def import_commits(self, db, repository, records):
+        """Stores the records not seen before, each with its Pre-filter result, and queues their
+        Triage. A repository shared by several Applications is triaged once, with one of their
+        profiles. Returns the new commit ids."""
+        triage = domain.triage_application(db, repository)
+        mode = triage.config["triage_mode"] if triage else "disabled"
+        imported = []
+        for record in records:
+            existing = db.scalar(
+                select(Commit).where(
+                    Commit.repository_id == repository.id,
+                    Commit.source_generation == repository.source_generation,
+                    Commit.revision == record["revision"],
+                )
+            )
+            if existing:
+                continue
+            commit = Commit(
+                repository_id=repository.id,
+                source_generation=repository.source_generation,
+                revision=record.pop("revision"),
+                data={**record, "prefilter": prefilter(record.get("files", []), record.get("diff"))},
+                triage_status="disabled" if mode == "disabled" else "pending",
+            )
+            db.add(commit)
+            db.flush()
+            imported.append(commit.id)
+            if mode == "disabled":
+                continue
+            try:
+                if mode == "jev":
+                    selected = domain.resolve_jev(db, triage.config)
+                    domain.enqueue(
+                        db,
+                        "jev_triage",
+                        triage,
+                        domain.repository_input(
+                            repository, commit_id=commit.id, source_ref=commit.revision, **selected
+                        ),
+                    )
+                else:
+                    profile = domain.resolve_profile(db, triage, "commit_triage")
+                    if profile["agent"] != mode:
+                        raise DomainError(
+                            "triage_profile_mismatch",
+                            "Triage mode and agent profile differ",
+                            422,
+                        )
+                    domain.enqueue(
+                        db,
+                        "commit_triage",
+                        triage,
+                        domain.repository_input(
+                            repository, commit_id=commit.id, source_ref=commit.revision
+                        ),
+                        profile,
+                    )
+            except DomainError as exc:
+                commit.triage_status = "blocked"
+                commit.triage_result = {
+                    "decision": "insufficient_context",
+                    "reason": exc.message,
+                    "error": exc.code,
+                }
+        return imported
+
+    def queue_audit_refresh(self, db, job, application):
+        """When the Application keeps its audit context current, queues a refresh whenever the newest
         context lags the source head and no audit is queued or running. Checked on every source
         check, so a head that moved during a refresh is caught by the next check."""
-        if not program.config.get("audit_auto_refresh") or not program.cursor:
+        cursor = getattr(domain.source_repository(db, application), "cursor", None)
+        if not application.config.get("audit_auto_refresh") or not cursor:
             return None
         busy = db.scalar(
             select(Job.id)
             .where(
-                Job.program_id == program.id,
+                Job.application_id == application.id,
                 Job.kind == "audit_context",
                 Job.status.in_(["queued", "running", "cancelling"]),
             )
@@ -742,23 +954,23 @@ class Workflows:
         newest = db.scalar(
             select(AuditContext)
             .where(
-                AuditContext.program_id == program.id,
-                AuditContext.source_generation == program.source_generation,
+                AuditContext.application_id == application.id,
+                AuditContext.source_generation == application.source_generation,
             )
             .order_by(AuditContext.created_at.desc())
             .limit(1)
         )
-        base = self.audit_context_for(db, program, program.cursor)
-        if busy or newest is None or newest.source_ref == program.cursor or base is None:
+        base = self.audit_context_for(db, application, cursor)
+        if busy or newest is None or newest.source_ref == cursor or base is None:
             return None
         try:
             return domain.submit_agent(
                 db,
                 "audit_context",
-                program,
-                domain.audit_refresh_input(db, program, base),
+                application,
+                domain.audit_refresh_input(db, application, base),
                 None,
-                f"audit-refresh:{program.id}:{program.cursor}",
+                f"audit-refresh:{application.id}:{cursor}",
             )
         except DomainError as exc:
             # The source check itself succeeded; the refresh waits for an operator.
@@ -810,7 +1022,7 @@ class Workflows:
             )
         return result
 
-    def commit_triage(self, db, job, program):
+    def commit_triage(self, db, job, application):
         commit = domain.get(db, Commit, job.input["commit_id"])
         result, _, _ = self.agent(
             db,
@@ -828,7 +1040,7 @@ class Workflows:
             else "https://api.typesafe.ai"
         )
 
-    def jev_triage(self, db, job, program):
+    def jev_triage(self, db, job, application):
         account = domain.get(db, Account, job.input["jev_connection_id"])
         model = job.input["model_id"]
         if (
@@ -951,16 +1163,16 @@ class Workflows:
             result.update(decision="insufficient_context", change_kind="insufficient_context", reason="Typed judgments disagree on the security change; further review is needed")
         issue = ISSUE_TYPES[result["issue_type"]]
         result["title"] = {
-            "vulnerability_fix": f"Potential {issue.lower()} fix in {program.product_name}",
-            "vulnerability_introduction": f"Potential {issue.lower()} introduced in {program.product_name}",
-            "security_hardening": f"Security hardening in {program.product_name}",
-            "unrelated": f"Unrelated change in {program.product_name}",
-            "insufficient_context": f"Uncertain security change in {program.product_name}",
+            "vulnerability_fix": f"Potential {issue.lower()} fix in {application.product_name}",
+            "vulnerability_introduction": f"Potential {issue.lower()} introduced in {application.product_name}",
+            "security_hardening": f"Security hardening in {application.product_name}",
+            "unrelated": f"Unrelated change in {application.product_name}",
+            "insufficient_context": f"Uncertain security change in {application.product_name}",
         }[result["change_kind"]][:300]
         artifacts.clean_files({"triage.json": json.dumps(result).encode()}, [key])
         return self.triage_result(db, job, commit, result)
 
-    def audit_context_for(self, db, program, source_ref):
+    def audit_context_for(self, db, application, source_ref):
         """The audit context an analysis of `source_ref` starts from: a complete one built at that
         revision, else the newest complete one of the current source, else the one with finished
         work nearest in time. A context built at another revision still maps the codebase."""
@@ -969,8 +1181,8 @@ class Workflows:
             for r in db.scalars(
                 select(AuditContext)
                 .where(
-                    AuditContext.program_id == program.id,
-                    AuditContext.source_generation == program.source_generation,
+                    AuditContext.application_id == application.id,
+                    AuditContext.source_generation == application.source_generation,
                     AuditContext.status.in_(["complete", "partial", "stale"]),
                 )
                 .order_by(AuditContext.created_at.desc())
@@ -988,12 +1200,11 @@ class Workflows:
                 return candidates[0]
         return None
 
-    def context_inputs(self, db, program, source_files, source_ref=None):
+    def context_inputs(self, db, application, source_files, source_ref):
         """Source files plus the audit context the analysis starts from, with facts describing that
         context (None when there is none to supply)."""
         files = source_inputs(source_files)
-        source_ref = source_ref or program.cursor
-        report = self.audit_context_for(db, program, source_ref)
+        report = self.audit_context_for(db, application, source_ref)
         if report is None:
             return files, None
         context = {
@@ -1051,18 +1262,19 @@ class Workflows:
             .limit(1)
         ) is not None
 
-    def commit_analysis(self, db, job, program):
+    def commit_analysis(self, db, job, application):
         commit = domain.get(db, Commit, job.input["commit_id"])
-        snapshot, source_files = self.snapshot(db, program, commit.revision)
+        repository = db.get(Repository, commit.repository_id)
+        snapshot, source_files = self.snapshot(db, repository, commit.revision)
         # Commit analysis judges the change itself; it does not take the audit context.
         files = source_inputs(source_files)
         files.update(commit_inputs(db, commit))
         before_ref = None
         before_error = None
-        if program.source_kind == "wordpress" and commit.revision.isdecimal() and int(commit.revision) > 1:
+        if repository.source_kind == "wordpress" and commit.revision.isdecimal() and int(commit.revision) > 1:
             before_ref = str(int(commit.revision) - 1)
             try:
-                _, before_files = self.snapshot(db, program, before_ref)
+                _, before_files = self.snapshot(db, repository, before_ref)
                 files.update({"before-source/" + path: data for path, data in before_files.items() if path != "manifest.json"})
             except DomainError as exc:
                 before_error = {"code": exc.code, "message": exc.message}
@@ -1075,19 +1287,22 @@ class Workflows:
                 "source_ref": snapshot.source_ref,
                 "commit_revision": commit.revision,
                 "diff_complete": commit.data.get("diff_complete"),
-                "source_url": program.source_url,
-                "source_kind": program.source_kind,
+                "source_url": repository.source_url,
+                "source_kind": repository.source_kind,
                 "parent_revisions": commit.data.get("parent_revisions", []),
                 "before_ref": before_ref,
                 "before_source_error": before_error,
                 "source_delta": "Source is pinned to the analyzed commit revision; its diff supplies before/after evidence.",
             },
             build=True,
-            repository=source_repository(program, commit.revision),
+            repository=source_repository(repository, commit.revision),
         )
         if "report.md" not in outputs:
             raise DomainError("missing_report", "Analysis completed without report.md", 422)
-        if (
+        if not commit.data.get("diff_complete") and result["category"] == "Unrelated change":
+            # A capped diff can never be ruled Unrelated, even after a whole-change review.
+            result = {**result, "category": "Insufficient context", "finding_decision": "needs_more_evidence"}
+        elif (
             not commit.data.get("diff_complete")
             and result["finding_decision"] == "not_a_finding"
             and not self.reviewed_complete_change(db, job, state, result)
@@ -1104,14 +1319,14 @@ class Workflows:
             try:
                 # Legacy parent resolution and SVN snapshotting may heartbeat or
                 # perform source I/O. Finish them before holding the publication fence.
-                vulnerable_ref = self.commit_finding_ref(db, program, commit, result, outputs)
+                vulnerable_ref = self.commit_finding_ref(db, repository, commit, result, outputs)
             except DomainError as exc:
                 revision_error = exc
         self.context.fence(db)
         db.refresh(commit, with_for_update=True)
         analysis = Analysis(
             id=uid(),
-            program_id=program.id,
+            application_id=application.id,
             kind=job.kind,
             subject_id=commit.id,
             job_id=job.id,
@@ -1142,21 +1357,21 @@ class Workflows:
             db.commit()  # Keep the report and invalid proposal inspectable, without a finding.
             raise revision_error
         finding = db.scalar(select(Finding).where(
-            Finding.program_id == program.id, Finding.kind == "0day",
+            Finding.application_id == application.id, Finding.kind == "0day",
             Finding.data["source_commit_id"].as_string() == commit.id,
         ).order_by(Finding.created_at.desc()).with_for_update())
         if finding is None:
-            finding = Finding(program_id=program.id, kind="0day", title=result["title"], status="open", data={})
+            finding = Finding(application_id=application.id, kind="0day", title=result["title"], status="open", data={})
             db.add(finding)
             db.flush()
         finding.data = {**finding.data, "source_commit_id": commit.id, "source_analysis_id": analysis.id,
                         "evidence": result["evidence"], "target_applicability": "unknown"}
         analysis.result = {**result, "finding_id": finding.id}
-        return self.publish_finding_bundle(db, job, program, finding, vulnerable_ref, outputs, response)
+        return self.publish_finding_bundle(db, job, application, finding, vulnerable_ref, outputs, response)
 
-    def commit_finding_ref(self, db, program, commit, result, outputs):
+    def commit_finding_ref(self, db, repository, commit, result, outputs):
         ref = result["vulnerable_ref"]
-        if program.source_kind == "github":
+        if repository.source_kind == "github":
             if not re.fullmatch(r"[0-9a-fA-F]{40,64}", ref):
                 raise DomainError("invalid_finding_revision", "A commit finding must pin a full immutable source revision", 422)
             if result["category"] == "Potentially introduced vulnerability":
@@ -1164,27 +1379,28 @@ class Workflows:
             else:
                 allowed = commit.data.get("parent_revisions")
                 if allowed is None:
-                    allowed = self.source_client(db).commit_parents(program, commit.revision)
+                    allowed = self.source_client(db).commit_parents(repository, commit.revision)
             if ref.lower() not in [parent.lower() for parent in allowed]:
                 raise DomainError("invalid_finding_revision", "A fix finding must use a parent; an introduction must use the analyzed commit", 422)
         else:
             expected = commit.revision if result["category"] == "Potentially introduced vulnerability" else str(int(commit.revision) - 1)
             if ref != expected:
                 raise DomainError("invalid_finding_revision", "The vulnerable SVN revision must match the selected before/after source", 422)
-            self.snapshot(db, program, expected)
+            self.snapshot(db, repository, expected)
         raw_lock = outputs.get("vulnerable-app/application.lock.json")
         if raw_lock:
             try:
                 lock = json.loads(raw_lock)
             except (ValueError, UnicodeDecodeError):
                 return ref  # Completeness validation retains malformed output as a draft.
-            if isinstance(lock, dict) and program.source_kind == "github" and lock.get("source_ref") != ref:
+            if isinstance(lock, dict) and repository.source_kind == "github" and lock.get("source_ref") != ref:
                 raise DomainError("invalid_finding_revision", "Application lock does not pin the finding's vulnerable revision", 422)
         return ref
 
-    def version_recipe(self, db, job, program):
-        snapshot, files = self.snapshot(db, program)
-        corpus = self.source_client(db).release_corpus(program)
+    def version_recipe(self, db, job, application):
+        repository = domain.required_repository(db, application)
+        snapshot, files = self.snapshot(db, repository)
+        corpus = self.source_client(db).release_corpus(repository)
         inputs = {"source/" + p: d for p, d in files.items()}
         inputs["release-corpus.json"] = json.dumps(corpus, sort_keys=True).encode()
         coverage = fingerprinting.coverage(corpus)
@@ -1194,7 +1410,7 @@ class Workflows:
             "version_recipe",
             inputs,
             {
-                "program": domain.program_json(db, program),
+                "application": domain.application_json(db, application),
                 "source_ref": snapshot.source_ref,
                 # A CMS fingerprint map exceeds the prompt bound; release-corpus.json carries it.
                 "corpus": {
@@ -1202,7 +1418,7 @@ class Workflows:
                     "first_distinguishing_paths": [p["path"] for p in corpus.get("probes", [])[:12]],
                 },
             },
-            policy=self.target_policy(program),
+            policy=self.target_policy(application),
         )
         outputs.setdefault(
             "fingerprints.json",
@@ -1235,10 +1451,10 @@ class Workflows:
         metadata = {
             **metadata,
             "schema_version": 1,
-            "program_id": program.id,
+            "application_id": application.id,
             "source_ref": snapshot.source_ref,
-            "source_generation": program.source_generation,
-            "allowed_origins": self.target_policy(program)["origins"],
+            "source_generation": application.source_generation,
+            "allowed_origins": self.target_policy(application)["origins"],
             "script_sha256": hashlib.sha256(outputs["determine_version.py"]).hexdigest(),
             "fingerprints_sha256": hashlib.sha256(outputs["fingerprints.json"]).hexdigest(),
             "corpus_coverage": coverage,
@@ -1248,8 +1464,8 @@ class Workflows:
         self.context.fence(db)
         recipe = VersionRecipe(
             id=uid(),
-            program_id=program.id,
-            source_generation=program.source_generation,
+            application_id=application.id,
+            source_generation=application.source_generation,
             source_ref=snapshot.source_ref,
             status="validating",
             data={
@@ -1294,10 +1510,11 @@ class Workflows:
                 "Recipe fixture execution did not report validated passing checks",
                 422,
             )
-        db.refresh(program, with_for_update=True)
+        db.refresh(application, with_for_update=True)
+        db.refresh(repository)
         if (
-            program.source_generation != recipe.source_generation
-            or program.cursor != snapshot.source_ref
+            application.source_generation != recipe.source_generation
+            or repository.cursor != snapshot.source_ref
         ):
             recipe.status = "rejected"
             db.commit()
@@ -1308,23 +1525,23 @@ class Workflows:
             )
         for old in db.scalars(
             select(VersionRecipe).where(
-                VersionRecipe.program_id == program.id, VersionRecipe.status == "active"
+                VersionRecipe.application_id == application.id, VersionRecipe.status == "active"
             )
         ):
             old.status = "superseded"
         recipe.status = "active"
-        program.config = {**program.config, "active_recipe_id": recipe.id}
+        application.config = {**application.config, "active_recipe_id": recipe.id}
         return {"recipe_id": recipe.id, "validation": validation}
 
-    def version_check(self, db, job, program):
+    def version_check(self, db, job, application):
         recipe = domain.get(
             db,
             VersionRecipe,
-            job.input.get("recipe_id") or program.config.get("active_recipe_id", ""),
+            job.input.get("recipe_id") or application.config.get("active_recipe_id", ""),
         )
         if (
-            recipe.program_id != program.id
-            or recipe.source_generation != program.source_generation
+            recipe.application_id != application.id
+            or recipe.source_generation != application.source_generation
             or recipe.status not in ("active", "superseded")
         ):
             raise DomainError(
@@ -1332,12 +1549,13 @@ class Workflows:
                 "The saved recipe does not belong to this source generation",
                 422,
             )
+        repository = domain.required_repository(db, application)
         files = artifacts.resource_files(db, self.config.artifact_root, "recipe", recipe.id)
         files["recipe.py"] = files["determine_version.py"]
         files["target.json"] = json.dumps(
-            {"asset_url": program.asset_url, "recipe_id": recipe.id, "mode": "observe"}
+            {"asset_url": application.asset_url, "recipe_id": recipe.id, "mode": "observe"}
         ).encode()
-        policy = self.target_policy(program)
+        policy = self.target_policy(application)
         result, _, _ = self.run(db, job, "probe", files=files, policy=policy)
         if result.get("status") not in (
             "detected",
@@ -1372,7 +1590,7 @@ class Workflows:
                         "release-corpus.json": files["release-corpus.json"],
                         "target.json": json.dumps(
                             {
-                                "base_url": fingerprint_base(program, metadata, policy),
+                                "base_url": fingerprint_base(application, repository, metadata, policy),
                                 "budget": FINGERPRINT_BUDGET,
                             }
                         ).encode(),
@@ -1384,27 +1602,28 @@ class Workflows:
         self.context.fence(db)
         row = Observation(
             id=uid(),
-            program_id=program.id,
+            application_id=application.id,
             recipe_id=recipe.id,
-            source_generation=program.source_generation,
+            source_generation=application.source_generation,
             data={**result, "origin": "script", "profile": recipe.data.get("profile")},
         )
         db.add(row)
         return {"observation_id": row.id, **result}
 
-    def target_policy(self, program):
-        parsed = urlparse(program.asset_url)
+    def target_policy(self, application):
+        parsed = urlparse(application.asset_url)
         return {
             "origins": [
                 f"{parsed.scheme}://{parsed.netloc}",
-                *program.config.get("asset_origins", []),
+                *application.config.get("asset_origins", []),
             ],
             "methods": ["GET", "HEAD"],
             "request_budget": 25,
         }
 
-    def audit_context(self, db, job, program):
-        snapshot, source_files = self.snapshot(db, program, job.input.get("source_ref"))
+    def audit_context(self, db, job, application):
+        repository = domain.required_repository(db, application)
+        snapshot, source_files = self.snapshot(db, repository, job.input.get("source_ref"))
         root = Path(os.getenv("NUMEN_SKILL_ROOT", "../skills/trailofbits/audit-context-building"))
         if not (root / "SKILL.md").is_file():
             raise DomainError(
@@ -1432,8 +1651,8 @@ class Workflows:
         }
         row = AuditContext(
             id=uid(),
-            program_id=program.id,
-            source_generation=program.source_generation,
+            application_id=application.id,
+            source_generation=application.source_generation,
             source_ref=snapshot.source_ref,
             skill_revision=revision,
             coverage={},
@@ -1479,7 +1698,7 @@ class Workflows:
             )
         elif job.input.get("refresh_from"):
             orientation, orientation_files, completed, docs, refresh = self.refresh_base(
-                db, program, row, source_files, job.input["refresh_from"]
+                db, application, repository, row, source_files, job.input["refresh_from"]
             )
             resumed = {"refresh": refresh, "reused_functions": len(completed)}
             domain.event(
@@ -1677,11 +1896,12 @@ class Workflows:
                 + (f"\n## Open questions\n\n{questions}" if questions else "")
             ).encode()
         self.context.fence(db)
-        db.refresh(program)
+        db.refresh(application)
+        db.refresh(repository)
         row.status = (
             "stale"
-            if program.cursor != snapshot.source_ref
-            or program.source_generation != snapshot.source_generation
+            if repository.cursor != snapshot.source_ref
+            or application.source_generation != row.source_generation
             else ("partial" if failed else "complete")
         )
         coverage = {**coverage, "stage": "complete"}
@@ -1706,12 +1926,12 @@ class Workflows:
         row.coverage = {**coverage, "artifact_revision": artifact_revision}
         return {"audit_context_id": row.id, "status": row.status, "coverage": coverage, **synthesis}
 
-    def refresh_base(self, db, program, row, source_files, base_id):
+    def refresh_base(self, db, application, repository, row, source_files, base_id):
         """Starts from a finished audit context of an earlier revision: its orientation, and the
         documents of functions whose own file is unchanged. Functions in changed files are
         analysed again, those in deleted files are recorded as removed, and synthesis runs anew."""
         base = db.get(AuditContext, base_id)
-        if base is None or base.program_id != program.id:
+        if base is None or base.application_id != application.id:
             raise DomainError("not_found", "The audit context to refresh no longer exists", 404)
         if base.source_generation != row.source_generation:
             raise DomainError(
@@ -1738,7 +1958,7 @@ class Workflows:
         orientation_files = {
             p.removeprefix("orientation/"): d for p, d in saved.items() if p.startswith("orientation/")
         }
-        _, base_files = self.snapshot(db, program, base.source_ref)
+        _, base_files = self.snapshot(db, repository, base.source_ref)
         changed = sorted(
             path
             for path in set(base_files) | set(source_files)
@@ -1783,7 +2003,7 @@ class Workflows:
         for report in db.scalars(
             select(AuditContext)
             .where(
-                AuditContext.program_id == row.program_id,
+                AuditContext.application_id == row.application_id,
                 AuditContext.status == "partial",
                 AuditContext.source_generation == row.source_generation,
                 AuditContext.source_ref == row.source_ref,
@@ -1807,8 +2027,8 @@ class Workflows:
                 return report
         return None
 
-    def cve_sync(self, db, job, program):
-        selectors = program.config.get("cve_selectors", [])
+    def cve_sync(self, db, job, application):
+        selectors = application.config.get("cve_selectors", [])
         if not selectors:
             raise DomainError(
                 "cve_selectors_required",
@@ -1817,18 +2037,18 @@ class Workflows:
             )
         selector_hash = fingerprint(selectors)
         cursor = (
-            program.cve_cursor if program.cve_cursor.get("selector_hash") == selector_hash else {}
+            application.cve_cursor if application.cve_cursor.get("selector_hash") == selector_hash else {}
         )
         records, completed = self.source_client(db).collect_cves(selectors, cursor)
         self.context.fence(db)
-        db.refresh(program, with_for_update=True)
+        db.refresh(application, with_for_update=True)
         if (
-            job.input.get("source_generation") != program.source_generation
-            or fingerprint(program.config.get("cve_selectors", [])) != selector_hash
+            job.input.get("source_generation") != application.source_generation
+            or fingerprint(application.config.get("cve_selectors", [])) != selector_hash
         ):
             raise DomainError(
                 "input_changed",
-                "Program source or CVE selectors changed during synchronization; cursor retained",
+                "Application source or CVE selectors changed during synchronization; cursor retained",
                 409,
             )
         for raw in records:
@@ -1841,54 +2061,57 @@ class Workflows:
                 row.raw, row.record_hash, row.data = raw, digest, cves.parse_cve(raw)
             db.flush()
             link = db.scalar(
-                select(ProgramCVE).where(
-                    ProgramCVE.program_id == program.id, ProgramCVE.cve_id == row.id
+                select(ApplicationCVE).where(
+                    ApplicationCVE.application_id == application.id, ApplicationCVE.cve_id == row.id
                 )
             )
             if not link:
-                link = ProgramCVE(program_id=program.id, cve_id=row.id, confirmed=None, data={})
+                link = ApplicationCVE(application_id=application.id, cve_id=row.id, confirmed=None, data={})
                 db.add(link)
                 db.flush()
-            domain.refresh_cve_policy(db, program, row, link)
-        program.cve_cursor = {"selector_hash": selector_hash, "completed_at": completed}
+            domain.refresh_cve_policy(db, application, row, link)
+        application.cve_cursor = {"selector_hash": selector_hash, "completed_at": completed}
         return {"imported": len(records), "completed_at": completed}
 
-    def cve_analysis(self, db, job, program):
+    def cve_analysis(self, db, job, application):
         row = domain.get(db, CVE, job.input["cve_id"])
         link = db.scalar(
-            select(ProgramCVE).where(
-                ProgramCVE.program_id == program.id, ProgramCVE.cve_id == row.id
+            select(ApplicationCVE).where(
+                ApplicationCVE.application_id == application.id, ApplicationCVE.cve_id == row.id
             )
         )
-        if not link or not cves.gate(program, row, link)["eligible"]:
+        if not link or not cves.gate(application, row, link)["eligible"]:
             raise DomainError(
                 "criteria_not_met", "CVE no longer meets the current product/score gate", 422
             )
-        if cves.gate_hash(program, row, link) != job.input["gate_hash"]:
+        if cves.gate_hash(application, row, link) != job.input["gate_hash"]:
             raise DomainError(
                 "input_changed", "CVE record or saved policy changed while the job was queued", 409
             )
-        source_ref, pin = self.vulnerable_pin(db, job, program, row)
+        repository = domain.required_repository(db, application)
+        source_ref, pin = self.vulnerable_pin(db, job, application, repository, row)
         domain.event(db, job, "source_pin", pin_message(pin), **pin)
         db.commit()  # Expose the resolved revision before a long agent run begins.
-        snapshot, source_files = self.snapshot(db, program, source_ref)
+        snapshot, source_files = self.snapshot(db, repository, source_ref)
         facts = {
             "cve_id": row.id,
             "source_record_hash": job.input["record_hash"],
             "source_ref": snapshot.source_ref,
             "source_pin": pin,
-            "source_url": program.source_url,
-            "product_name": program.product_name,
-            "eligibility": cves.gate(program, row, link),
-            "applicability": cves.applicability(program, row, domain.last_observation(db, program)),
+            "source_url": repository.source_url,
+            "product_name": application.product_name,
+            "eligibility": cves.gate(application, row, link),
+            "applicability": cves.applicability(
+                application, repository, row, domain.last_observation(db, application)
+            ),
         }
         files, facts["audit_context"] = self.context_inputs(
-            db, program, source_files, snapshot.source_ref
+            db, application, source_files, snapshot.source_ref
         )
         files["cve.json"] = json.dumps(job.input.get("source_record", row.raw)).encode()
         result, outputs, _ = self.agent(
             db, job, "cve_analysis", files, facts, build=True,
-            repository=source_repository(program, snapshot.source_ref),
+            repository=source_repository(repository, snapshot.source_ref),
         )
         if (
             result["cve_id"] != row.id
@@ -1903,7 +2126,7 @@ class Workflows:
         self.context.fence(db)
         analysis = Analysis(
             id=uid(),
-            program_id=program.id,
+            application_id=application.id,
             kind=job.kind,
             subject_id=row.id,
             job_id=job.id,
@@ -1919,14 +2142,14 @@ class Workflows:
         db.add(analysis)
         finding = db.scalar(
             select(Finding)
-            .where(Finding.program_id == program.id, Finding.kind == "cve", Finding.cve_id == row.id)
+            .where(Finding.application_id == application.id, Finding.kind == "cve", Finding.cve_id == row.id)
             .order_by(Finding.created_at.desc())
             .with_for_update()
         )
         if finding is None:
             finding = Finding(
                 id=uid(),
-                program_id=program.id,
+                application_id=application.id,
                 kind="cve",
                 cve_id=row.id,
                 title=(row.data.get("title") or result["summary"] or row.id)[:300],
@@ -1953,29 +2176,32 @@ class Workflows:
             all_secrets(db, self.vault),
         )
         return self.publish_finding_bundle(
-            db, job, program, finding, snapshot.source_ref, outputs, {"analysis_id": analysis.id, **result}
+            db, job, application, finding, snapshot.source_ref, outputs, {"analysis_id": analysis.id, **result}
         )
 
-    def finding_artifacts(self, db, job, program):
+    def finding_artifacts(self, db, job, application):
         finding = domain.get(db, Finding, job.input["finding_id"])
         cve = domain.get(db, CVE, finding.cve_id) if finding.cve_id else None
         analysis_id = finding.data.get("source_analysis_id")
         analysis = domain.get(db, Analysis, analysis_id) if analysis_id else None
-        if analysis and analysis.program_id != program.id:
-            raise DomainError("invalid_reference", "Finding analysis belongs to another program", 422)
+        if analysis and analysis.application_id != application.id:
+            raise DomainError("invalid_reference", "Finding analysis belongs to another Application", 422)
         if analysis and analysis.kind == "commit_analysis" and analysis.result.get("vulnerable_ref") and not job.input.get("source_ref"):
             origin = domain.get(db, Commit, analysis.subject_id)
-            source_ref = self.commit_finding_ref(db, program, origin, analysis.result, {})
+            # The vulnerable revision belongs to the analysed commit's repository.
+            repository = db.get(Repository, origin.repository_id)
+            source_ref = self.commit_finding_ref(db, repository, origin, analysis.result, {})
             pin = {"basis": "commit_finding", "source_ref": source_ref, "analysis_id": analysis.id}
         else:
-            source_ref, pin = self.vulnerable_pin(db, job, program, cve)
+            repository = domain.required_repository(db, application)
+            source_ref, pin = self.vulnerable_pin(db, job, application, repository, cve)
         domain.event(db, job, "source_pin", pin_message(pin), **pin)
         db.commit()  # Expose the resolved revision before a long agent run begins.
-        snapshot, source_files = self.snapshot(db, program, source_ref)
-        files, context = self.context_inputs(db, program, source_files, snapshot.source_ref)
+        snapshot, source_files = self.snapshot(db, repository, source_ref)
+        files, context = self.context_inputs(db, application, source_files, snapshot.source_ref)
         files["finding.json"] = json.dumps({
             "id": finding.id,
-            "program_id": finding.program_id,
+            "application_id": finding.application_id,
             "kind": finding.kind,
             "cve_id": finding.cve_id,
             "title": finding.title,
@@ -2007,8 +2233,8 @@ class Workflows:
             "evidence_file": "finding.json",
             "source_ref": snapshot.source_ref,
             "source_pin": pin,
-            "source_url": program.source_url,
-            "product_name": program.product_name,
+            "source_url": repository.source_url,
+            "product_name": application.product_name,
             "audit_context": context,
         }
         result, outputs, _ = self.agent(
@@ -2018,9 +2244,9 @@ class Workflows:
             files,
             facts,
         )
-        return self.publish_finding_bundle(db, job, program, finding, snapshot.source_ref, outputs, result)
+        return self.publish_finding_bundle(db, job, application, finding, snapshot.source_ref, outputs, result)
 
-    def publish_finding_bundle(self, db, job, program, finding, source_ref, outputs, result):
+    def publish_finding_bundle(self, db, job, application, finding, source_ref, outputs, result):
         locked = self.context.fence(db)
         revision, _ = artifacts.publish(
             db,
@@ -2029,7 +2255,7 @@ class Workflows:
             finding.id,
             outputs,
             {
-                "program_id": program.id,
+                "application_id": application.id,
                 "source_ref": source_ref,
                 "profile": job.profile,
                 "source_analysis_id": finding.data.get("source_analysis_id"),
@@ -2056,7 +2282,7 @@ class Workflows:
             )
         return result
 
-    def lab_run(self, db, job, program):
+    def lab_run(self, db, job, application):
         row = db.scalar(select(LabRun).where(LabRun.job_id == job.id))
         if not row:
             raise DomainError("missing_lab_run", "Lab metadata was not recorded", 422)
@@ -2110,9 +2336,9 @@ class Workflows:
             )
         return {"lab_run_id": row.id, **row.data}
 
-    def account_capabilities(self, db, job, program):
+    def account_capabilities(self, db, job, application):
         if domain.get(db, Account, job.input["account_id"]).provider in ("github", "nvd", "jev"):
-            return self.account_check(db, job, program)
+            return self.account_check(db, job, application)
         account = domain.get(db, Account, job.input["account_id"])
         if account.revision != job.input["credential_revision"]:
             raise DomainError(
@@ -2208,10 +2434,10 @@ class Workflows:
             "usage": usage,
         }
 
-    def account_check(self, db, job, program):
+    def account_check(self, db, job, application):
         account = domain.get(db, Account, job.input["account_id"])
         if account.provider not in ("github", "nvd", "jev"):
-            return self.account_capabilities(db, job, program)
+            return self.account_capabilities(db, job, application)
         if not account.credential:
             raise DomainError(
                 "credential_required", "Configure this integration credential first", 422
@@ -2255,7 +2481,7 @@ class Workflows:
         }
         return {"account_id": account.id, "status": "ready"}
 
-    def account_login(self, db, job, program):
+    def account_login(self, db, job, application):
         account = domain.get(db, Account, job.input["account_id"])
         if account.auth_type != "native_oauth":
             raise DomainError("unsupported_login", "This connection uses an API key", 422)
@@ -2334,7 +2560,7 @@ class Workflows:
                     )
                 )
 
-    def credential_cleanup(self, db, job, program):
+    def credential_cleanup(self, db, job, application):
         try:
             self.broker.delete_credential(job.input["run_id"])
         except DomainError as exc:
@@ -2351,7 +2577,7 @@ class Workflows:
             raise
         return {"status": "deleted", "run_id": job.input["run_id"]}
 
-    def notification(self, db, job, program):
+    def notification(self, db, job, application):
         row = domain.get(db, Notification, job.input["notification_id"])
         setting = domain.settings(db, self.config)
         if not setting.data.get("webhook_enabled") or not setting.webhook_secret:
@@ -2446,10 +2672,10 @@ def commit_inputs(db, commit):
     return files
 
 
-def source_repository(program, ref):
+def source_repository(repository, ref):
     """The canonical repository a build run receives with full history (GitHub sources only)."""
-    url = (program.source_url or "").rstrip("/")
-    if program.source_kind != "github" or not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", url):
+    url = (repository.source_url or "").rstrip("/")
+    if repository.source_kind != "github" or not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", url):
         return None
     if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", ref or ""):
         return None
@@ -2459,19 +2685,19 @@ def source_repository(program, ref):
 FINGERPRINT_BUDGET = 10  # requests for Numen's own fingerprint stage, apart from the recipe's
 
 
-def fingerprint_base(program, metadata, policy):
+def fingerprint_base(application, repository, metadata, policy):
     """Where the release's files are served: the recipe's asset_base when it stays on an
     allowed origin, a WordPress plugin directory, or the asset URL."""
-    root = program.asset_url.rstrip("/") + "/"
+    root = application.asset_url.rstrip("/") + "/"
     base = metadata.get("asset_base") if isinstance(metadata, dict) else None
     if isinstance(base, str) and base.strip():
         candidate = urljoin(root, base.strip())
         parsed = urlparse(candidate)
         if f"{parsed.scheme}://{parsed.netloc}" in policy["origins"]:
             return candidate.rstrip("/") + "/"
-    if program.source_kind == "wordpress" and program.plugin_slug:
-        parsed = urlparse(program.asset_url)
-        return f"{parsed.scheme}://{parsed.netloc}/wp-content/plugins/{program.plugin_slug}/"
+    if repository and repository.source_kind == "wordpress" and repository.plugin_slug:
+        parsed = urlparse(application.asset_url)
+        return f"{parsed.scheme}://{parsed.netloc}/wp-content/plugins/{repository.plugin_slug}/"
     return root
 
 

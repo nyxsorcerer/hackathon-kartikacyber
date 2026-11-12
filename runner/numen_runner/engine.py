@@ -335,7 +335,7 @@ class DockerEngine:
             return self.client.volumes.create(name, labels={INSTANCE: self.instance, "org.pruferva.asset-monitor.cache": "git"})
 
     def seed_repository(self, request, image, network, labels, workspace, environment, event, stopping):
-        """Clone the program's repository, with every branch, tag and its full history, into
+        """Clone the Application's repository, with every branch, tag and its full history, into
         /workspace/repo before the agent starts, so the agent never has to clone it again.
 
         A shared mirror is created once and then only fetched, under a lock so concurrent runs

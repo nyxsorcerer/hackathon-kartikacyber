@@ -17,8 +17,8 @@ RUNTIME_EVENTS = {
     "build_rejected_image": "A build failed on an image this daemon cannot pull",
     "build_rejected_mount": "A build failed on a bind mount path not shared with this daemon",
     "build_rejected_disk": "A build failed because the daemon ran out of disk space",
-    "repository_ready": "Cloned the program's full repository, with history, into the workspace",
-    "repository_unavailable": "The program's repository could not be prepared; the agent may clone it itself",
+    "repository_ready": "Cloned the Application's full repository, with history, into the workspace",
+    "repository_unavailable": "The Application's repository could not be prepared; the agent may clone it itself",
     "lab_started": "Pinned application launched for lab verification",
     "lab_application_exited": "The pinned application stopped before it could be verified",
     "lab_base_fetch": "Fetching the bundle's pinned base before the offline lab build",
@@ -413,7 +413,7 @@ def recover(factory, broker):
                 attempt.status = "interrupted"
             for recipe in db.scalars(
                 select(VersionRecipe).where(
-                    VersionRecipe.program_id == row.program_id, VersionRecipe.status == "validating"
+                    VersionRecipe.application_id == row.application_id, VersionRecipe.status == "validating"
                 )
             ):
                 if recipe.data.get("job_id") == ident:

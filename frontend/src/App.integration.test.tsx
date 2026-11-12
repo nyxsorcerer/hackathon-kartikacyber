@@ -27,7 +27,7 @@ describe("operator authentication", () => {
         else if (url === "/api/commits/commit-1")
           body = {
             id: "commit-1",
-            program_id: "program-1",
+            application_id: "application-1",
             revision: "abc123",
             message: "Validate incoming paths",
             author: "Maintainer",
@@ -41,25 +41,20 @@ describe("operator authentication", () => {
             review_decision: "pending",
             analyses: [],
           };
-        else if (url === "/api/programs/program-1")
+        else if (url === "/api/applications/application-1")
           body = {
-            id: "program-1",
+            id: "application-1",
             asset_name: "Fixture asset",
             asset_url: "https://example.test",
             product_kind: "CMS",
             product_name: "Fixture",
-            source_kind: "github",
-            source_url: "https://github.com/example/fixture",
-            source_ref: "main",
-            source_path: "",
-            plugin_slug: null,
-            monitor_interval_days: 1,
+            monitor_interval_seconds: 86400,
             monitor_enabled: true,
             archived: false,
             source_generation: 1,
             last_check_at: null,
             next_check_at: null,
-            last_error: null,
+            repositories: [],
             version: null,
             config: {},
           };
@@ -144,7 +139,7 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
         body = { authenticated: true, username: "admin", csrf_token: "token" };
       else if (url === "/api/settings")
         body = {
-          monitor_interval_days: 2,
+          monitor_interval_seconds: 172800,
           default_profiles: {},
           webhook_enabled: false,
           webhook_configured: false,
@@ -157,7 +152,7 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
       } else if (url === "/api/commits/review-1")
         body = {
           id: "review-1",
-          program_id: "program-1",
+          application_id: "application-1",
           revision: "abc123",
           message: "Validate incoming paths",
           author: "Maintainer",
@@ -181,25 +176,20 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
             },
           ],
         };
-      else if (url === "/api/programs/program-1")
+      else if (url === "/api/applications/application-1")
         body = {
-          id: "program-1",
+          id: "application-1",
           asset_name: "Fixture asset",
           asset_url: "https://example.test",
           product_kind: "CMS",
           product_name: "Fixture",
-          source_kind: "github",
-          source_url: "https://github.com/example/fixture",
-          source_ref: "main",
-          source_path: "",
-          plugin_slug: null,
-          monitor_interval_days: 2,
+          monitor_interval_seconds: 172800,
           monitor_enabled: true,
           archived: false,
           source_generation: 1,
           last_check_at: null,
           next_check_at: null,
-          last_error: null,
+          repositories: [],
           version: null,
           config: {},
         };
@@ -217,7 +207,7 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
   ).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Create finding" })).toHaveAttribute(
     "href",
-    "/findings/new?program_id=program-1&source_commit_id=review-1&source_analysis_id=analysis-1",
+    "/findings/new?application_id=application-1&source_commit_id=review-1&source_analysis_id=analysis-1",
   );
   expect(submissions).toHaveLength(0);
   await user.click(screen.getByRole("button", { name: "Analyze" }));

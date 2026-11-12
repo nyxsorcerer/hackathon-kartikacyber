@@ -18,7 +18,7 @@ import {
   commitsSchema,
   cvesSchema,
   findingSummariesSchema,
-  programsSchema,
+  applicationsSchema,
 } from "../types";
 import { Kbd, matches, Modal } from "./ui";
 type Item = {
@@ -33,8 +33,8 @@ type Item = {
 };
 const pages: Item[] = [
   ["Dashboard", "/", LayoutDashboard, "home overview"],
-  ["Programs", "/programs", Radar, "assets inventory"],
-  ["Insert program", "/programs/new", Radar, "add new create"],
+  ["Applications", "/applications", Radar, "assets inventory"],
+  ["Insert application", "/applications/new", Radar, "add new create"],
   ["Commit review", "/reviews", GitCommitHorizontal, "commits queue"],
   ["CVEs", "/cves", ShieldAlert, "vulnerabilities"],
   ["Eligible CVEs", "/cves?elig=eligible", ShieldAlert, "score criteria"],
@@ -85,7 +85,7 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
   const listId = useId();
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
-  const programs = useResource("/programs", programsSchema);
+  const applications = useResource("/applications", applicationsSchema);
   const cves = useCollection("/cves", cvesSchema);
   // Commit lists carry full diffs, so the palette searches one page of them.
   const commits = useCollection("/commits", commitsSchema, 0, 200);
@@ -94,27 +94,27 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
     findingSummariesSchema,
   );
   const loading =
-    programs.loading || cves.loading || commits.loading || findings.loading;
+    applications.loading || cves.loading || commits.loading || findings.loading;
   const results = useMemo(() => {
     const q = query.trim();
-    const programName = (id: string) =>
-      programs.data?.items.find((p) => p.id === id)?.asset_name;
+    const applicationName = (id: string) =>
+      applications.data?.items.find((p) => p.id === id)?.asset_name;
     const groups: Record<string, Item[]> = {
       Pages: pages,
-      Programs: (programs.data?.items || []).map((p) => ({
-        id: `program:${p.id}`,
-        group: "Programs",
+      Applications: (applications.data?.items || []).map((p) => ({
+        id: `application:${p.id}`,
+        group: "Applications",
         title: p.asset_name,
         detail: `${p.product_name} · ${p.asset_url}`,
-        to: `/programs/${p.id}`,
+        to: `/applications/${p.id}`,
         icon: Radar,
       })),
       CVEs: (cves.data?.items || []).map((c) => ({
-        id: `cve:${c.program_id}:${c.id}`,
+        id: `cve:${c.application_id}:${c.id}`,
         group: "CVEs",
         title: c.id,
-        detail: `${programName(c.program_id) || "Program"} · ${c.title}`,
-        to: `/programs/${c.program_id}?tab=cves&cve=${encodeURIComponent(c.id)}`,
+        detail: `${applicationName(c.application_id) || "Application"} · ${c.title}`,
+        to: `/applications/${c.application_id}?tab=cves&cve=${encodeURIComponent(c.id)}`,
         icon: ShieldAlert,
         keywords: c.description,
       })),
@@ -137,18 +137,21 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
       })),
     };
     const order = /^cve-?\d/i.test(q)
-      ? ["CVEs", "Findings", "Programs", "Commits", "Pages"]
+      ? ["CVEs", "Findings", "Applications", "Commits", "Pages"]
       : /^[0-9a-f]{5,}$/i.test(q)
-        ? ["Commits", "Pages", "Programs", "CVEs", "Findings"]
-        : ["Pages", "Programs", "CVEs", "Findings", "Commits"];
+        ? ["Commits", "Pages", "Applications", "CVEs", "Findings"]
+        : ["Pages", "Applications", "CVEs", "Findings", "Commits"];
     if (!q)
-      return [...pages.slice(0, 10), ...groups.Programs.slice(0, GROUP_LIMIT)];
+      return [
+        ...pages.slice(0, 10),
+        ...groups.Applications.slice(0, GROUP_LIMIT),
+      ];
     return order.flatMap((name) =>
       groups[name]
         .filter((item) => matches(q, item.title, item.detail, item.keywords))
         .slice(0, GROUP_LIMIT),
     );
-  }, [query, programs.data, cves.data, commits.data, findings.data]);
+  }, [query, applications.data, cves.data, commits.data, findings.data]);
   const current = Math.min(active, Math.max(results.length - 1, 0));
   function go(item: Item | undefined) {
     if (!item) return;
@@ -168,7 +171,7 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
             results[current] ? `${listId}-${current}` : undefined
           }
           aria-label="Search pages and records"
-          placeholder="Search programs, CVE IDs, commits, findings, or pages"
+          placeholder="Search applications, CVE IDs, commits, findings, or pages"
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);

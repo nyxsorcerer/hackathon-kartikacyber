@@ -27,7 +27,7 @@ def make_database(config, initialize=False):
                     Setting(
                         id="global",
                         data={
-                            "monitor_interval_days": config.monitor_interval_days,
+                            "monitor_interval_seconds": config.monitor_interval_seconds,
                             "default_profiles": {},
                             "webhook_enabled": False,
                             "dashboard_url": "",
