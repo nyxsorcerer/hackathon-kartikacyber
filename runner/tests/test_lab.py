@@ -13,10 +13,10 @@ ENTRYPOINT ["sh", "/app/start.sh"]
     assert validate_dockerfile(built)
     for text in [
         "FROM python:latest",                                        # a floating base
-        "FROM numen-lab:0.1.0\nRUN --mount=type=secret echo secret",  # a build mount
-        "FROM numen-lab:0.1.0\nCOPY /etc/passwd /app/",               # a host path
-        "FROM numen-lab:0.1.0\nCOPY ../outside /app/",                # an escape
-        "FROM numen-lab:0.1.0\nCOPY --from=python:3.12 /x /y",        # a floating stage source
+        "FROM asset-monitor-lab:0.1.0\nRUN --mount=type=secret echo secret",  # a build mount
+        "FROM asset-monitor-lab:0.1.0\nCOPY /etc/passwd /app/",               # a host path
+        "FROM asset-monitor-lab:0.1.0\nCOPY ../outside /app/",                # an escape
+        "FROM asset-monitor-lab:0.1.0\nCOPY --from=python:3.12 /x /y",        # a floating stage source
     ]:
         with pytest.raises(ValueError):
             validate_dockerfile(text.encode())
@@ -25,7 +25,7 @@ ENTRYPOINT ["sh", "/app/start.sh"]
 # Duplicated verbatim from backend/tests/test_artifacts.py: the backend mirrors these rules in
 # artifacts.completeness(), and this asserts the authority still agrees with that mirror.
 LAB_BASES = [
-    ("numen-lab:0.1.0", True),
+    ("asset-monitor-lab:0.1.0", True),
     ("scratch", True),
     ("python@sha256:" + "a" * 64, True),
     ("docker.io/library/php@sha256:" + "b" * 64, True),

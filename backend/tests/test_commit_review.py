@@ -327,7 +327,7 @@ def test_analysis_gets_the_full_repository_and_prior_verdicts_only_as_a_checklis
     # The sandbox is described up front rather than discovered by trial.
     assert "How the build sandbox works" in call["prompt"]
     assert "never directly between two containers" in call["prompt"]
-    assert "numen-lab:0.1.0 is Debian bookworm with Python 3.12, curl, git, unzip" in call["prompt"]
+    assert "asset-monitor-lab:0.1.0 is Debian bookworm with Python 3.12, curl, git, unzip" in call["prompt"]
     second = FixtureBroker(assessment("Security hardening", "not_a_finding"), {"report.md": b"# Assessment"})
     client.post(f"/api/commits/{ident}/analyses", json={})
     run_once(config, app.state.factory, second)

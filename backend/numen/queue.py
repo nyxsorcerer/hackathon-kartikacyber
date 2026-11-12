@@ -38,7 +38,7 @@ def runtime_event(record, run_id):
         return {
             "kind": record["type"],
             "message": f"A build could not pull {image}: it does not exist or needs a login. "
-            "Use numen-lab:0.1.0, an image built earlier in the run, or a public image pinned by @sha256",
+            "Use asset-monitor-lab:0.1.0, an image built earlier in the run, or a public image pinned by @sha256",
             "image": image,
             "run_id": run_id,
         }

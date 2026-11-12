@@ -1,6 +1,6 @@
-name: numen
+name: asset-monitor
 x-app: &app
-  image: numen-app:0.1.0
+  image: asset-monitor-app:0.1.0
   build:
     context: .
     dockerfile: Dockerfile
@@ -16,7 +16,7 @@ x-app: &app
     NUMEN_FRONTEND_ROOT: /app/frontend/dist
     NUMEN_BROKER_URL: http://runner-broker:8081
     NUMEN_BROKER_TOKEN: ${NUMEN_BROKER_TOKEN:?Run setup first}
-    NUMEN_DASHBOARD_URL: ${NUMEN_DASHBOARD_URL:-http://localhost:8787}
+    NUMEN_DASHBOARD_URL: ${NUMEN_DASHBOARD_URL:-http://localhost:8788}
     NUMEN_MONITOR_INTERVAL_DAYS: ${NUMEN_MONITOR_INTERVAL_DAYS:-7}
   security_opt: [no-new-privileges:true]
   cap_drop: [ALL]
@@ -58,7 +58,7 @@ services:
     secrets: [bootstrap-password]
   app:
     <<: *app
-    ports: ["127.0.0.1:${NUMEN_PORT:-8787}:8080"]
+    ports: ["127.0.0.1:${NUMEN_PORT:-8788}:8080"]
     # Agent session chat relays operator input to the broker.
     networks: [application, control]
     healthcheck:
@@ -95,7 +95,7 @@ services:
     init: true
     networks: [control]
     environment:
-      NUMEN_RUNNER_INSTANCE: ${COMPOSE_PROJECT_NAME:-numen}
+      NUMEN_RUNNER_INSTANCE: ${COMPOSE_PROJECT_NAME:-asset-monitor}
       NUMEN_BROKER_TOKEN: ${NUMEN_BROKER_TOKEN:?Run setup first}
       NUMEN_RUNNER_STATE: /data/runner
       NUMEN_RUNNER_CONCURRENCY: ${NUMEN_RUNNER_CONCURRENCY:-4}
@@ -125,36 +125,36 @@ services:
       timeout: 5s
       retries: 20
   pi-image:
-    image: numen-pi:0.1.0
+    image: asset-monitor-pi:0.1.0
     profiles: [images]
     build: {context: ., dockerfile: Dockerfile.runner, target: pi}
     command: [pi, --version]
     network_mode: none
   claude-image:
-    image: numen-claude:0.1.0
+    image: asset-monitor-claude:0.1.0
     profiles: [images]
     build: {context: ., dockerfile: Dockerfile.runner, target: claude}
     command: [claude, --version]
     network_mode: none
   codex-image:
-    image: numen-codex:0.1.0
+    image: asset-monitor-codex:0.1.0
     profiles: [images]
     build: {context: ., dockerfile: Dockerfile.runner, target: codex}
     command: [codex, --version]
     network_mode: none
   dind-image:
-    image: numen-dind:0.1.0
+    image: asset-monitor-dind:0.1.0
     profiles: [images]
     build: {context: ., dockerfile: Dockerfile.runner, target: dind}
     entrypoint: [docker, --version]
     network_mode: none
   probe-image:
-    image: numen-probe:0.1.0
+    image: asset-monitor-probe:0.1.0
     profiles: [images]
     build: {context: ., dockerfile: Dockerfile.runner, target: probe}
     network_mode: none
   lab-image:
-    image: numen-lab:0.1.0
+    image: asset-monitor-lab:0.1.0
     profiles: [images]
     build: {context: ., dockerfile: Dockerfile.runner, target: lab}
     network_mode: none
@@ -166,7 +166,7 @@ services:
     restart: no
     command: [pytest, -q, -p, no:cacheprovider]
   runner-tests:
-    image: numen-runner-test:0.1.0
+    image: asset-monitor-runner-test:0.1.0
     profiles: [test]
     build: {context: ., dockerfile: Dockerfile.runner, target: test}
     command: [pytest, -q, -p, no:cacheprovider]
@@ -178,7 +178,7 @@ services:
     command: [npm, test]
     network_mode: none
   runner-runtime-tests:
-    image: numen-runner-test:0.1.0
+    image: asset-monitor-runner-test:0.1.0
     profiles: [test]
     build: {context: ., dockerfile: Dockerfile.runner, target: test}
     user: root

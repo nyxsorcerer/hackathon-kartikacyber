@@ -1,6 +1,6 @@
 """Observe the real Compose/API/worker/fixture journey without paid providers.
 
-Run against the isolated numen-test project. Required provider protocol and
+Run against the isolated asset-monitor-test project. Required provider protocol and
 container execution cases live in the backend and runner suites; this journey
 proves their application-facing integration, persistence, and human decision
 boundaries using the HTTP/SVN/NVD/webhook fixture service.
@@ -89,8 +89,8 @@ def items(value):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--base-url', default='http://localhost:18787')
-    parser.add_argument('--fixture-url', default='http://localhost:18090')
+    parser.add_argument('--base-url', default='http://localhost:18788')
+    parser.add_argument('--fixture-url', default='http://localhost:18091')
     parser.add_argument('--password-file', type=Path, default=Path('.numen/bootstrap-password'))
     args = parser.parse_args()
     client = Client(args.base_url)

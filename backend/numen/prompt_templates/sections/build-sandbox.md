@@ -6,7 +6,7 @@ When /workspace/repo exists it is a full clone of source_url, with every branch,
 
 Install the dependencies the pinned release declares, then docker build and docker run your bundle and exercise poc.py against it until it genuinely works. Record in report.md what you actually observed building and running.
 
-Ship the bundle on a base you actually built against: numen-lab:0.1.0 is preloaded in the build daemon. Iterate the way the verifier works, or the bundle passes for you and fails for it: build the final bundle with DOCKER_BUILDKIT=0 so you use the same builder, run it with the verifier's own bounds (--cpus 2 --memory 6144m --pids-limit 4096), publish 8080, and point TARGET_URL at it to exercise poc.py end to end.
+Ship the bundle on a base you actually built against: asset-monitor-lab:0.1.0 is preloaded in the build daemon. Iterate the way the verifier works, or the bundle passes for you and fails for it: build the final bundle with DOCKER_BUILDKIT=0 so you use the same builder, run it with the verifier's own bounds (--cpus 2 --memory 6144m --pids-limit 4096), publish 8080, and point TARGET_URL at it to exercise poc.py end to end.
 
 How the build sandbox works, so you do not have to discover it:
 

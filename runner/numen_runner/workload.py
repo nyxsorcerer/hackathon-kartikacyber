@@ -526,8 +526,8 @@ def execute(job):
             prompt += ("\nThis run has a shell, git and a private Docker daemon at DOCKER_HOST=" + env.get("DOCKER_HOST", "") +
                        ". /workspace is writable: clone, install dependencies, docker build and docker run there to prove the bundle actually works."
                        " Outbound network reaches source hosting, package registries and image registries only." +
-                       (" numen-lab:0.1.0 is already loaded in that daemon." if job.get("lab_base_loaded")
-                        else " numen-lab:0.1.0 is NOT available in that daemon, so build against an approved digest-pinned base instead and say so in the report.") +
+                       (" asset-monitor-lab:0.1.0 is already loaded in that daemon." if job.get("lab_base_loaded")
+                        else " asset-monitor-lab:0.1.0 is NOT available in that daemon, so build against an approved digest-pinned base instead and say so in the report.") +
                        " A bind mount's source path resolves in the daemon's filesystem, not yours:"
                        " only /workspace is shared with it, and /workspace/inputs is not part of that share, so a container you mount it into gets an empty directory."
                        " Containers the daemon starts cannot run as your user, so they can only write into /workspace/share; read their output from there,"

@@ -7,7 +7,7 @@ npm ci
 npm run dev
 ```
 
-The development server binds to `127.0.0.1:5173` and proxies `/api` to `http://127.0.0.1:8000`. Set `NUMEN_API_PROXY=http://127.0.0.1:8787` to review a Compose deployment through Vite. Use the Node version declared in the root Dockerfile. No credential belongs in a Vite environment variable or browser storage.
+The development server binds to `127.0.0.1:5173` and proxies `/api` to `http://127.0.0.1:8000`. Set `NUMEN_API_PROXY=http://127.0.0.1:8788` to review a Compose deployment through Vite. Use the Node version declared in the root Dockerfile. No credential belongs in a Vite environment variable or browser storage.
 
 ```sh
 npm run typecheck

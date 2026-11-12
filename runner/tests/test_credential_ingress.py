@@ -48,7 +48,7 @@ class FixtureContainers:
         return getattr(self.collection, name)
 
     def create(self, image, command=None, **kwargs):
-        if image == 'numen-codex:0.1.0' and command == ['python', '-m', 'numen_runner.workload']:
+        if image == 'asset-monitor-codex:0.1.0' and command == ['python', '-m', 'numen_runner.workload']:
             # Injection is confined to this test driver. The broker API has no image/command override.
             self.trace['stage'] = 'synthetic_native_login'
             container = self.collection.create(image, ['python', '-c', FIXTURE_COMMAND], **kwargs)
@@ -105,7 +105,7 @@ def test_private_cache_file_boundaries_fail_without_exposing_bytes(kind):
     engine.ping()
     engine.instance='credential-boundary-'+str(uuid.uuid4())
     run_id=str(uuid.uuid4())
-    labels={'org.pruferva.numen.run':run_id, 'org.pruferva.numen.instance':engine.instance}
+    labels={'org.pruferva.asset-monitor.run':run_id, 'org.pruferva.asset-monitor.instance':engine.instance}
     network=engine.client.networks.create('numen-credential-boundary-'+run_id,internal=True,labels=labels)
     request=RunRequest(attempt_token=run_id,kind='probe',limits={'timeout_seconds':10})
     setup='''import os,time
@@ -123,7 +123,7 @@ print('fixture_ready',flush=True)
 time.sleep(30)
 '''.replace('KIND',repr(kind))
     try:
-        container=engine.client.containers.create('numen-codex:0.1.0',['python','-c',setup],**engine.spec(request,network,labels))
+        container=engine.client.containers.create('asset-monitor-codex:0.1.0',['python','-c',setup],**engine.spec(request,network,labels))
         container.start()
         deadline=time.monotonic()+5
         while b'fixture_ready' not in container.logs():
@@ -145,7 +145,7 @@ def test_login_code_reaches_private_home_through_exec_stdin_on_real_engine():
     engine.ping()
     engine.instance='login-input-'+str(uuid.uuid4())
     run_id=str(uuid.uuid4())
-    labels={'org.pruferva.numen.run':run_id, 'org.pruferva.numen.instance':engine.instance}
+    labels={'org.pruferva.asset-monitor.run':run_id, 'org.pruferva.asset-monitor.instance':engine.instance}
     network=engine.client.networks.create('numen-login-input-'+run_id,internal=True,labels=labels)
     request=RunRequest(attempt_token=run_id,kind='probe',limits={'timeout_seconds':10})
     code='synthetic-authorization-code#synthetic-state'
@@ -160,7 +160,7 @@ info=path.stat()
 print(oct(info.st_mode&0o777),info.st_uid,hashlib.sha256(path.read_bytes()).hexdigest(),flush=True)
 '''
     try:
-        container=engine.client.containers.create('numen-claude:0.1.0',['python','-c',waiter],**engine.spec(request,network,labels))
+        container=engine.client.containers.create('asset-monitor-claude:0.1.0',['python','-c',waiter],**engine.spec(request,network,labels))
         container.start()
         deadline=time.monotonic()+5
         while b'fixture_ready' not in container.logs():

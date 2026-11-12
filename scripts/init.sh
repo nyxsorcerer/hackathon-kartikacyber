@@ -37,8 +37,8 @@ values = {
     'NUMEN_SECRET_KEY': base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
     'NUMEN_BROKER_TOKEN': secrets.token_urlsafe(32),
     'NUMEN_ADMIN_PASSWORD': password,
-    'NUMEN_PORT': '8787',
-    'NUMEN_DASHBOARD_URL': 'http://localhost:8787',
+    'NUMEN_PORT': '8788',
+    'NUMEN_DASHBOARD_URL': 'http://localhost:8788',
 }
 fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as stream:

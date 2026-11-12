@@ -151,7 +151,7 @@ for effort in ['low','medium','high','xhigh','max']:
 print(json.dumps(values))
 '''
     client=docker.from_env(timeout=60)
-    output=client.containers.run('numen-claude:0.1.0',['python','-c',script],network_mode='none',user='10001:10001',read_only=True,
+    output=client.containers.run('asset-monitor-claude:0.1.0',['python','-c',script],network_mode='none',user='10001:10001',read_only=True,
         cap_drop=['ALL'],security_opt=['no-new-privileges:true'],remove=True,working_dir='/workspace',mem_limit='768m',pids_limit=64,
         tmpfs={'/workspace':'rw,size=32m,uid=10001,gid=10001','/home/job':'rw,size=32m,uid=10001,gid=10001','/tmp':'rw,size=32m,uid=10001,gid=10001'})
     results=json.loads(output)
@@ -256,7 +256,7 @@ print(json.dumps({'exit':p.returncode,'private_denied':observed['private_denied'
 server.shutdown()
 '''
     client=docker.from_env(timeout=45)
-    output=client.containers.run('numen-claude:0.1.0',['python','-c',script],network_mode='none',user='10001:10001',read_only=True,
+    output=client.containers.run('asset-monitor-claude:0.1.0',['python','-c',script],network_mode='none',user='10001:10001',read_only=True,
         cap_drop=['ALL'],security_opt=['no-new-privileges:true'],remove=True,working_dir='/workspace',mem_limit='768m',pids_limit=64,
         tmpfs={'/workspace':'rw,size=32m,uid=10001,gid=10001','/home/job':'rw,size=32m,uid=10001,gid=10001','/tmp':'rw,size=32m,uid=10001,gid=10001'})
     result=json.loads(output)

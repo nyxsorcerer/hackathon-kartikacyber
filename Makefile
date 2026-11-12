@@ -13,7 +13,7 @@ build: init
 
 # Each rebuild leaves the previous Numen images untagged; remove only those, never other projects'.
 prune:
-	docker image prune -f --filter label=org.pruferva.numen.image=true
+	docker image prune -f --filter label=org.pruferva.asset-monitor.image=true
 
 up: build
 	$(COMPOSE) up -d --wait app worker scheduler runner-broker fetch-gateway

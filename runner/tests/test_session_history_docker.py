@@ -19,7 +19,7 @@ def test_full_native_history_survives_container_stop_and_private_archive_transpo
     engine = DockerEngine()
     run_id = str(uuid.uuid4())
     labels = {LABEL: run_id, INSTANCE: engine.instance}
-    image = "numen-runner-test:0.1.0"
+    image = "asset-monitor-runner-test:0.1.0"
     script = '''import json,time
 from pathlib import Path
 from numen_runner.session_history import save_state

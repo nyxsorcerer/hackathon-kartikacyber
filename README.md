@@ -17,7 +17,7 @@ Install Docker Engine/Desktop with Compose. No host Python, Node, or agent insta
 
 `make up` runs those steps together when Make is available.
 
-Open **http://localhost:8787**. The operator is **admin**. Read the generated password locally:
+Open **http://localhost:8788**. The operator is **admin**. Read the generated password locally:
 
 ```sh
 cat .numen/bootstrap-password
@@ -68,10 +68,10 @@ make test-journey
 
 `test-runtime` explicitly enables actual Docker Engine cases. `test-integration` includes PostgreSQL claims, fencing, persistence, source/CVE workflows, and native-cache handling. Named `CASE` values are validated; unknown cases and empty pytest selections fail.
 
-The journey uses an isolated `numen-test` project at http://localhost:18787, with real HTTP/SVN source fixtures and captured webhook delivery. It makes no authenticated inference or production-target requests. Stop that test stack afterward:
+The journey uses an isolated `asset-monitor-test` project at http://localhost:18788, with real HTTP/SVN source fixtures and captured webhook delivery. It makes no authenticated inference or production-target requests. Stop that test stack afterward:
 
 ```sh
-./scripts/compose.sh -p numen-test -f compose.yaml -f compose.test.yaml down
+./scripts/compose.sh -p asset-monitor-test -f compose.yaml -f compose.test.yaml down
 ```
 
 ## Backup and restore

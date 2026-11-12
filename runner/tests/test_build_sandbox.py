@@ -74,7 +74,7 @@ def test_seeding_uses_the_gateway_and_never_blocks_the_run(monkeypatch, code):
     events = []
     network = type("Network", (), {"name": "numen-job-1"})()
     ready = runtime.seed_repository(
-        request(), "numen-pi:0.1.0", network, {"label": "1"}, Volume("numen-workspace-1"),
+        request(), "asset-monitor-pi:0.1.0", network, {"label": "1"}, Volume("numen-workspace-1"),
         {"HOME": "/home/job", "HTTPS_PROXY": "http://gateway:8082", "NO_PROXY": "gateway"},
         events.append, lambda: None)
     seeder = runtime.client.created[0]
@@ -113,10 +113,10 @@ def test_a_build_run_does_not_start_on_a_nearly_full_docker_disk(monkeypatch):
     monkeypatch.setenv("NUMEN_BUILD_MIN_FREE_GB", "10")
     low = engine.DockerEngine(client=DiskClient(available_kb=1258291))  # 1.2 GB, as observed
     with pytest.raises(engine.RuntimeFailure) as refused:
-        low.require_build_disk("numen-pi:0.1.0", {})
+        low.require_build_disk("asset-monitor-pi:0.1.0", {})
     assert refused.value.code == "build_disk_low" and "1.2 GB of free disk" in refused.value.safe_message
     plenty = engine.DockerEngine(client=DiskClient(available_kb=30 * 1024 * 1024))
-    assert round(plenty.require_build_disk("numen-pi:0.1.0", {})) == 30
+    assert round(plenty.require_build_disk("asset-monitor-pi:0.1.0", {})) == 30
     # The check is advisory: when it cannot run, the build still starts.
     broken = engine.DockerEngine(client=DiskClient(error=docker.errors.APIError("engine busy")))
-    assert broken.require_build_disk("numen-pi:0.1.0", {}) is None
+    assert broken.require_build_disk("asset-monitor-pi:0.1.0", {}) is None

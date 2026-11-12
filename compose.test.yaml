@@ -1,12 +1,12 @@
 services:
   fixtures:
-    image: numen-app:0.1.0
+    image: asset-monitor-app:0.1.0
     user: root
     environment:
       NUMEN_FIXTURE_SVN: "1"
     entrypoint: [/fixtures/start.sh]
     volumes: [./tests/integration:/fixtures:ro]
-    ports: ["127.0.0.1:18090:8090"]
+    ports: ["127.0.0.1:18091:8090"]
     networks: [application]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]

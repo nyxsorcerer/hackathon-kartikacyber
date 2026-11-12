@@ -13,9 +13,9 @@ import docker
 import requests
 from .contracts import BUILD_HOSTS, PROVIDERS, collect_outputs, input_files
 
-LABEL = "org.pruferva.numen.run"
+LABEL = "org.pruferva.asset-monitor.run"
 BUNDLE_PREFIX = "bundle/"
-INSTANCE = "org.pruferva.numen.instance"
+INSTANCE = "org.pruferva.asset-monitor.instance"
 VERSION = "0.1.0"
 
 # Fixed Engine exec transports join the running workload's mount namespace.
@@ -96,7 +96,7 @@ class RuntimeFailure(Exception):
 LAB_DIRECTIVES = frozenset({"FROM", "RUN", "COPY", "ADD", "WORKDIR", "USER", "ENV", "ARG", "EXPOSE",
                             "CMD", "ENTRYPOINT", "LABEL", "VOLUME", "STOPSIGNAL", "SHELL", "HEALTHCHECK"})
 LAB_BASE = re.compile(
-    r"(?:numen-lab:0\.1\.0|scratch|[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64})"
+    r"(?:asset-monitor-lab:0\.1\.0|scratch|[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64})"
     r"(?: AS [a-zA-Z][a-zA-Z0-9_-]*)?"
 )
 
@@ -277,12 +277,12 @@ class DockerEngine:
         egress = self.client.networks.create("numen-build-" + run_id, labels=labels)
         b = request.bounds
         try:
-            self.client.images.get("numen-dind:" + VERSION)
+            self.client.images.get("asset-monitor-dind:" + VERSION)
         except docker.errors.DockerException as exc:
             raise RuntimeFailure("build_image_unavailable",
-                                 f"numen-dind:{VERSION} is not built; build the images profile first.") from exc
+                                 f"asset-monitor-dind:{VERSION} is not built; build the images profile first.") from exc
         daemon = self.client.containers.create(
-            "numen-dind:" + VERSION, command=["--host=tcp://0.0.0.0:2375"],
+            "asset-monitor-dind:" + VERSION, command=["--host=tcp://0.0.0.0:2375"],
             # ponytail: privileged is what nested containers actually need on Engine 20.10 without
             # cgroup delegation; the rootless image still runs its daemon unprivileged inside.
             privileged=True, environment={"DOCKER_TLS_CERTDIR":""}, network=egress.name,
@@ -332,7 +332,7 @@ class DockerEngine:
         try:
             return self.client.volumes.get(name)
         except docker.errors.NotFound:
-            return self.client.volumes.create(name, labels={INSTANCE: self.instance, "org.pruferva.numen.cache": "git"})
+            return self.client.volumes.create(name, labels={INSTANCE: self.instance, "org.pruferva.asset-monitor.cache": "git"})
 
     def seed_repository(self, request, image, network, labels, workspace, environment, event, stopping):
         """Clone the program's repository, with every branch, tag and its full history, into
@@ -394,7 +394,7 @@ class DockerEngine:
         rotates at its size bound, so it would arrive truncated rather than refused.
         """
         harvester = self.client.containers.create(
-            "numen-probe:" + VERSION, ["sleep","300"], network_mode="none", user="10001:10001",
+            "asset-monitor-probe:" + VERSION, ["sleep","300"], network_mode="none", user="10001:10001",
             read_only=True, cap_drop=["ALL"], security_opt=["no-new-privileges:true"],
             mem_limit="256m", pids_limit=16, nano_cpus=500000000, labels=labels,
             volumes={workspace.name:{"bind":"/workspace","mode":"ro"}}, use_config_proxy=False)
@@ -420,10 +420,10 @@ class DockerEngine:
         bundled lab base is streamed in. The lab verifier rebuilds a bundle offline, so a base the
         agent cannot obtain here is a base its bundle must not use."""
         try:
-            image = self.client.images.get("numen-lab:" + VERSION)
+            image = self.client.images.get("asset-monitor-lab:" + VERSION)
         except docker.errors.DockerException:
             event({"type":"build_base_unavailable",
-                   "message":f"numen-lab:{VERSION} is not built, so the build daemon has no offline lab base."})
+                   "message":f"asset-monitor-lab:{VERSION} is not built, so the build daemon has no offline lab base."})
             return False
         api = self.client.api
         try:
@@ -433,7 +433,7 @@ class DockerEngine:
             stream = api.exec_start(exec_id, socket=True)
             try:
                 raw = getattr(stream, "_sock", stream)
-                for chunk in image.save(named="numen-lab:" + VERSION):
+                for chunk in image.save(named="asset-monitor-lab:" + VERSION):
                     raw.sendall(chunk)
                 raw.shutdown(socket.SHUT_WR)
                 deadline = time.monotonic() + 600
@@ -450,7 +450,7 @@ class DockerEngine:
         except (docker.errors.DockerException, OSError, RuntimeError) as exc:
             raise RuntimeFailure("build_base_load_failed",
                                  "The bundled lab base could not be loaded into the build daemon.") from exc
-        event({"type":"build_base_loaded", "message":f"Loaded numen-lab:{VERSION} into the build daemon."})
+        event({"type":"build_base_loaded", "message":f"Loaded asset-monitor-lab:{VERSION} into the build daemon."})
         return True
 
     def run(self, run_id, request, cancelled, event, login_input=None):
@@ -460,7 +460,7 @@ class DockerEngine:
             self.ping()
         except docker.errors.DockerException as exc:
             raise RuntimeFailure("engine_unavailable", "Docker Engine is unavailable.") from exc
-        labels = {LABEL:run_id,INSTANCE:self.instance,"org.pruferva.numen.version":VERSION}
+        labels = {LABEL:run_id,INSTANCE:self.instance,"org.pruferva.asset-monitor.version":VERSION}
         job_network = self.client.networks.create("numen-job-" + run_id, internal=True, labels=labels)
         profile = request.profile.model_dump()
         kind = request.kind
@@ -498,7 +498,7 @@ class DockerEngine:
         if kind == "lab":
             # The application installs and updates, so its own bridge reaches the internet. Docker
             # keeps bridges apart, so it cannot reach the application or control networks.
-            lab_egress = self.client.networks.create("numen-lab-" + run_id, labels=labels)
+            lab_egress = self.client.networks.create("asset-monitor-lab-" + run_id, labels=labels)
             lab_image = self.build_lab(run_id, request, cancelled, event, lab_egress)
             app_spec = self.spec(request, lab_egress, labels, application=True)
             app_spec["tmpfs"].pop("/workspace", None)
@@ -540,7 +540,7 @@ class DockerEngine:
             # The daemon is addressed directly; the credential-free proxy never carries its API.
             environment["NO_PROXY"] = ",".join(filter(None, [environment.get("NO_PROXY"), "docker"]))
             event({"type":"build_daemon_started","message":"Private build daemon ready at tcp://docker:2375.",
-                   "daemon_image":self.client.images.get("numen-dind:" + VERSION).id, "daemon_id":daemon.id})
+                   "daemon_image":self.client.images.get("asset-monitor-dind:" + VERSION).id, "daemon_id":daemon.id})
             data_base_loaded = self.load_lab_base(daemon, event, stopping)
             if request.repository is not None:
                 self.seed_repository(request, image, job_network, labels, workspace, environment, event, stopping)
@@ -767,7 +767,7 @@ class DockerEngine:
         volume = self.client.volumes.create("numen-inputs-" + run_id, labels=labels)
         # This fixed trusted stager executes no input. Engine archive ingress writes regular files;
         # subsequent workloads mount the bounded immutable volume read-only.
-        stager = self.client.containers.create("numen-probe:" + VERSION, ["sleep","60"], network_mode="none",
+        stager = self.client.containers.create("asset-monitor-probe:" + VERSION, ["sleep","60"], network_mode="none",
             user="10001:10001", read_only=True, cap_drop=["ALL"], security_opt=["no-new-privileges:true"],
             mem_limit="128m", pids_limit=16, nano_cpus=250000000, labels=labels,
             volumes={volume.name:{"bind":"/staged","mode":"rw"}}, use_config_proxy=False)
@@ -806,12 +806,12 @@ class DockerEngine:
                 info.size,info.mode = len(data),0o644
                 archive.addfile(info,io.BytesIO(data))
         context.seek(0)
-        tag = "numen-lab-job:" + run_id
+        tag = "asset-monitor-lab-job:" + run_id
         # A bundle's base is validated to be either the bundled lab image or an approved repository
         # pinned by digest. The build itself stays offline, so an absent immutable base is fetched
         # first; otherwise only bases that happen to sit in the local store could ever verify.
         for base in bases:
-            if base in ("numen-lab:" + VERSION, "scratch"):
+            if base in ("asset-monitor-lab:" + VERSION, "scratch"):
                 continue
             try:
                 self.client.images.get(base)

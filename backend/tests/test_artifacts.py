@@ -13,7 +13,7 @@ def bundle(version="1.0.0"):
     return {
         "poc.py": b"print('proof')",
         "report.md": b"# Report\nFixture vulnerable behavior",
-        "vulnerable-app/Dockerfile": b"FROM numen-lab:0.1.0\nCOPY fixture /fixture\n",
+        "vulnerable-app/Dockerfile": b"FROM asset-monitor-lab:0.1.0\nCOPY fixture /fixture\n",
         "vulnerable-app/compose.yaml": b"services:\n  app:\n    build: .\n",
         "vulnerable-app/README.md": b"Use the supplied local fixture",
         "vulnerable-app/fixture": b"fixture bytes",
@@ -434,7 +434,7 @@ def test_inherited_interval_tracks_global_and_explicit_stays(system):
 
 
 LAB_BASES = [
-    ("numen-lab:0.1.0", True),
+    ("asset-monitor-lab:0.1.0", True),
     ("scratch", True),
     ("python@sha256:" + "a" * 64, True),
     ("docker.io/library/php@sha256:" + "b" * 64, True),
@@ -473,7 +473,7 @@ def test_completeness_refuses_directives_the_lab_verifier_rejects(line, refused)
 
     files = {
         **bundle(),
-        "vulnerable-app/Dockerfile": f"FROM numen-lab:0.1.0\n{line}\nCOPY fixture /fixture\n".encode(),
+        "vulnerable-app/Dockerfile": f"FROM asset-monitor-lab:0.1.0\n{line}\nCOPY fixture /fixture\n".encode(),
     }
     state = completeness(files)
     assert (state["status"] != "complete") is refused, state["limitations"]
@@ -490,18 +490,18 @@ def test_completeness_accepts_a_whole_application_sized_bundle():
 @pytest.mark.parametrize(
     "dockerfile,complete",
     [
-        (b"FROM numen-lab:0.1.0\nCOPY fixture /fixture\n", True),
-        (b"# comment\n\tFROM numen-lab:0.1.0\r\nCOPY fixture /fixture\n", True),
-        (b"FROM numen-lab:0.1.0\nCOPY . /app/\n", True),
-        (b"FROM numen-lab:0.1.0\nCOPY *.py /app/\n", True),
-        (b"FROM numen-lab:0.1.0\nCOPY vendor/ /app/vendor/\n", False),
-        (b"FROM numen-lab:0.1.0\nCOPY .fixture /app/.fixture\n", True),
-        (b"FROM numen-lab:0.1.0\nCOPY fixture /f\nENTRYPOINT [\"sh\", \"/f\"]\n", True),
-        (b"FROM numen-lab:0.1.0\nRUN composer install --no-dev\nCOPY fixture /f\n", True),
-        (b"FROM numen-lab:0.1.0\nENV A=1 \\\n  B=2\nCOPY fixture /f\n", True),
-        (b"FROM --platform=linux/amd64 numen-lab:0.1.0\nCOPY fixture /f\n", False),
-        (b"FROM numen-lab:0.1.0\nUSER www-data\nCOPY fixture /f\n", True),
-        (b"FROM numen-lab:0.1.0\nCOPY --from=build /x /y\n", False),
+        (b"FROM asset-monitor-lab:0.1.0\nCOPY fixture /fixture\n", True),
+        (b"# comment\n\tFROM asset-monitor-lab:0.1.0\r\nCOPY fixture /fixture\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nCOPY . /app/\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nCOPY *.py /app/\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nCOPY vendor/ /app/vendor/\n", False),
+        (b"FROM asset-monitor-lab:0.1.0\nCOPY .fixture /app/.fixture\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nCOPY fixture /f\nENTRYPOINT [\"sh\", \"/f\"]\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nRUN composer install --no-dev\nCOPY fixture /f\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nENV A=1 \\\n  B=2\nCOPY fixture /f\n", True),
+        (b"FROM --platform=linux/amd64 asset-monitor-lab:0.1.0\nCOPY fixture /f\n", False),
+        (b"FROM asset-monitor-lab:0.1.0\nUSER www-data\nCOPY fixture /f\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nCOPY --from=build /x /y\n", False),
     ],
 )
 def test_completeness_reads_the_dockerfile_shapes_the_verifier_will_see(dockerfile, complete):

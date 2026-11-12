@@ -24,8 +24,8 @@ def image_script(script, files=None, env=None):
 
     client = docker.from_env()
     container = client.containers.create(
-        "numen-pi:0.1.0",
-        ["node", "/opt/numen/numen-pi-proof.mjs"],
+        "asset-monitor-pi:0.1.0",
+        ["node", "/opt/numen/asset-monitor-pi-proof.mjs"],
         working_dir="/opt/numen",
         network_mode="none",
         user="10001:10001",
@@ -47,7 +47,7 @@ def image_script(script, files=None, env=None):
     )
     try:
         archive = io.BytesIO()
-        content = {"numen-pi-proof.mjs": script.encode(), **(files or {})}
+        content = {"asset-monitor-pi-proof.mjs": script.encode(), **(files or {})}
         source_root = Path(os.getenv("NUMEN_PI_SOURCE_ROOT", str(ROOT / "node")))
         for name in ("pi-capabilities.mjs", "pi-commandcode-login.mjs", "pi-tools.ts"):
             if (source_root / name).is_file():
@@ -619,7 +619,7 @@ const {readFile,symlink}=await import('node:fs/promises');
 await symlink('/workspace/inputs','/workspace/evidence');
 const clone=await call('numen_read',{path:'repo/.git/config'});
 await call('numen_write',{path:'outputs/report.md',content:'# Report'});
-await call('numen_write',{path:'dev/Dockerfile',content:'FROM numen-lab:0.1.0'});
+await call('numen_write',{path:'dev/Dockerfile',content:'FROM asset-monitor-lab:0.1.0'});
 console.log(JSON.stringify({
   clone:clone.content[0].text,
   wrote:await readFile('/workspace/outputs/report.md','utf8'),
@@ -636,7 +636,7 @@ console.log(JSON.stringify({
     # ever published.
     observed = image_script(script, env={"DOCKER_HOST": "tcp://docker:2375"})
     assert observed["clone"] == "cloned history"
-    assert observed["wrote"] == "# Report" and observed["scratch"] == "FROM numen-lab:0.1.0"
+    assert observed["wrote"] == "# Report" and observed["scratch"] == "FROM asset-monitor-lab:0.1.0"
     assert observed["denied_inputs"] and observed["denied_inputs_via_link"]
     assert observed["denied_private"] and observed["denied_private_read"]
     assert observed["shell_enabled"]

@@ -48,7 +48,7 @@ def test_agent_source_archive_is_staged_as_read_only_files(engine):
     try:
         volume = engine.materialize_inputs(run_id, job, labels)
         # The trailing echo terminates cat's unterminated line, which the log stream may drop at exit.
-        listing = engine.client.containers.run("numen-probe:0.1.0", ["sh", "-c", "find /inputs -type f | sort; cat /inputs/source/concrete/src/Kernel.php; echo"],
+        listing = engine.client.containers.run("asset-monitor-probe:0.1.0", ["sh", "-c", "find /inputs -type f | sort; cat /inputs/source/concrete/src/Kernel.php; echo"],
                                                volumes={volume.name: {"bind": "/inputs", "mode": "ro"}}, network_mode="none",
                                                user="10001:10001", labels=labels, remove=True)
         assert listing.decode().split() == ["/inputs/source/concrete/src/Kernel.php", "/inputs/source/index.php", "concrete/src/Kernel.php"]
@@ -116,7 +116,7 @@ def test_actual_native_cli_version(engine,agent,version):
 
 def test_lab_build_and_poc_actual_verification(engine):
     files = {
-      "vulnerable-app/Dockerfile":'FROM numen-lab:0.1.0\nWORKDIR /app\nCOPY app.py /app/app.py\nCMD ["python","/app/app.py"]\n',
+      "vulnerable-app/Dockerfile":'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY app.py /app/app.py\nCMD ["python","/app/app.py"]\n',
       "vulnerable-app/app.py":'from http.server import BaseHTTPRequestHandler,HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200);self.end_headers();self.wfile.write(b"fixture-vulnerable-version-1")\nHTTPServer(("0.0.0.0",8080),H).serve_forever()\n',
       "poc.py":'import os,time,urllib.request\nfor n in range(20):\n try:\n  data=urllib.request.urlopen(os.environ["TARGET_URL"],timeout=1).read();assert b"fixture-vulnerable-version-1" in data;print("reproduced fixture version 1");break\n except OSError: time.sleep(.2)\nelse: raise RuntimeError("lab unavailable")\n',
       "report.md":"Fixture version 1; isolated verification only."
@@ -148,7 +148,7 @@ print(json.dumps({"spawned":len(children),"exhausted":exhausted}))
 def test_reconciliation_removes_abandoned_workloads(engine):
     run_id=str(uuid.uuid4())
     network=engine.client.networks.create('numen-abandoned-'+run_id,internal=True,labels={LABEL:run_id,INSTANCE:engine.instance})
-    engine.client.containers.run('numen-probe:0.1.0',['sleep','60'],network=network.name,labels={LABEL:run_id,INSTANCE:engine.instance},detach=True)
+    engine.client.containers.run('asset-monitor-probe:0.1.0',['sleep','60'],network=network.name,labels={LABEL:run_id,INSTANCE:engine.instance},detach=True)
     engine.reconcile()
     assert not engine.client.containers.list(all=True,filters={"label":f"{LABEL}={run_id}"})
     assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
@@ -158,7 +158,7 @@ def test_codex_narrow_seccomp_preserves_native_read_and_write_policies(engine):
     from pathlib import Path
     policy=json.loads((Path(__file__).parents[1]/'seccomp-codex.json').read_text())
     run_id=str(uuid.uuid4())
-    network=engine.client.networks.create('numen-codex-proof-'+run_id,internal=True,labels={LABEL:run_id,INSTANCE:engine.instance})
+    network=engine.client.networks.create('asset-monitor-codex-proof-'+run_id,internal=True,labels={LABEL:run_id,INSTANCE:engine.instance})
     spec=engine.spec(request(''),network,{LABEL:run_id,INSTANCE:engine.instance})
     spec.pop('detach')
     spec['security_opt'].append('seccomp='+json.dumps(policy,separators=(',',':')))
@@ -169,7 +169,7 @@ rw=subprocess.run(['codex','sandbox','-P',':workspace','-C','/workspace','--','p
 print(json.dumps({"read_only_denied":ro.returncode!=0 and not Path('/workspace/denied').exists(),"workspace_write":rw.returncode==0 and Path('/workspace/allowed').read_text()=='x'}))
 '''
     try:
-        output=engine.client.containers.run('numen-codex:0.1.0',['python','-c',script],remove=True,**spec)
+        output=engine.client.containers.run('asset-monitor-codex:0.1.0',['python','-c',script],remove=True,**spec)
         assert json.loads(output)=={"read_only_denied":True,"workspace_write":True}
     finally:
         engine.cleanup(run_id)
@@ -187,7 +187,7 @@ class H(BaseHTTPRequestHandler):
   else:self.send_response(200);self.end_headers();self.wfile.write(b'observed-target')
 HTTPServer(('0.0.0.0',8080),H).serve_forever()
 '''
-    target=engine.client.containers.create('numen-probe:0.1.0',['python','-c',fixture_code],**engine.spec(request(''),outside,labels))
+    target=engine.client.containers.create('asset-monitor-probe:0.1.0',['python','-c',fixture_code],**engine.spec(request(''),outside,labels))
     target.start()
     target.reload()
     ip=target.attrs['NetworkSettings']['Networks'][outside.name]['IPAddress']
@@ -219,7 +219,7 @@ print(json.dumps({'allowed':allowed,'body':json.loads(body),'wrong':wrong,'redir
     spec=engine.spec(request(''),inside,labels)
     spec.pop('detach')
     try:
-        output=engine.client.containers.run('numen-probe:0.1.0',['python','-c',script],remove=True,**spec)
+        output=engine.client.containers.run('asset-monitor-probe:0.1.0',['python','-c',script],remove=True,**spec)
         result=json.loads(output)
         assert result['allowed']==200 and base64.b64decode(result['body']['content_base64'])==b'observed-target'
         assert result['wrong']==result['redirect']==result['scope']==403
@@ -232,7 +232,7 @@ def test_immutable_inputs_and_false_poc_result_are_preserved(engine):
     result=execute(engine,request('import json;from pathlib import Path\ntry:Path("/workspace/inputs/recipe.py").write_text("altered");blocked=False\nexcept OSError:blocked=True\nprint(json.dumps({"immutable":blocked}))'))
     assert result['result']['immutable']
     assert result['execution']['image_digest'].startswith('sha256:')
-    files={'vulnerable-app/Dockerfile':'FROM numen-lab:0.1.0\nCMD ["sleep","30"]\n','poc.py':'import sys;print("observed failure to reproduce");sys.exit(3)','report.md':'Fixture not reproduced.'}
+    files={'vulnerable-app/Dockerfile':'FROM asset-monitor-lab:0.1.0\nCMD ["sleep","30"]\n','poc.py':'import sys;print("observed failure to reproduce");sys.exit(3)','report.md':'Fixture not reproduced.'}
     job=RunRequest(attempt_token=str(uuid.uuid4()),kind='lab',inputs=[{'path':p,'content_base64':base64.b64encode(d.encode()).decode()}for p,d in files.items()],limits={'timeout_seconds':30})
     result=execute(engine,job)['result']
     assert result['verified'] is False and result['status']=='not_reproduced' and result['exit_code']==3
@@ -243,7 +243,7 @@ def test_codex_native_tools_cannot_read_private_auth_cache(engine):
     from pathlib import Path
     policy=json.loads((Path(__file__).parents[1]/'seccomp-codex.json').read_text())
     run_id=str(uuid.uuid4())
-    network=engine.client.networks.create('numen-codex-private-'+run_id,internal=True,labels={LABEL:run_id,INSTANCE:engine.instance})
+    network=engine.client.networks.create('asset-monitor-codex-private-'+run_id,internal=True,labels={LABEL:run_id,INSTANCE:engine.instance})
     spec=engine.spec(request(''),network,{LABEL:run_id,INSTANCE:engine.instance})
     spec.pop('detach')
     spec['security_opt'].append('seccomp='+json.dumps(policy,separators=(',',':')))
@@ -255,7 +255,7 @@ result=subprocess.run(args,capture_output=True)
 print(json.dumps({'denied':result.returncode!=0 and b'Permission denied' in result.stderr,'artifact':Path('/workspace/allowed').read_text()}))
 '''
     try:
-        output=engine.client.containers.run('numen-codex:0.1.0',['python','-c',script],remove=True,**spec)
+        output=engine.client.containers.run('asset-monitor-codex:0.1.0',['python','-c',script],remove=True,**spec)
         assert json.loads(output)=={'denied':True,'artifact':'artifact'}
     finally:
         engine.cleanup(run_id)
@@ -264,7 +264,7 @@ print(json.dumps({'denied':result.returncode!=0 and b'Permission denied' in resu
 def test_native_codex_catalog_does_not_claim_access_without_account(engine):
     run_id=str(uuid.uuid4())
     labels={LABEL:run_id,INSTANCE:engine.instance}
-    network=engine.client.networks.create('numen-codex-noauth-'+run_id,internal=True,labels=labels)
+    network=engine.client.networks.create('asset-monitor-codex-noauth-'+run_id,internal=True,labels=labels)
     spec=engine.spec(request(''),network,labels)
     spec.pop('detach')
     script='''import os,json
@@ -275,7 +275,7 @@ except ValueError:ready=False
 print(json.dumps({'ready':ready}))
 '''
     try:
-        output=engine.client.containers.run('numen-codex:0.1.0',['python','-c',script],remove=True,**spec)
+        output=engine.client.containers.run('asset-monitor-codex:0.1.0',['python','-c',script],remove=True,**spec)
         assert json.loads(output)=={'ready':False}
     finally:
         engine.cleanup(run_id)
@@ -292,7 +292,7 @@ const deep=expand('{'.repeat(2000)+'a,b'+'}'.repeat(2000));
 const depthBound=deep.some(x=>x.includes('a,b')) && JSON.stringify(expand('{a,{b,c}}',{maxDepth:0}))===JSON.stringify(['a','{b,c}']);
 console.log(JSON.stringify({version,normal:expand('a{b,c}d'),numbers:expand('{1..3}'),depthBound,bundleHash:createHash('sha256').update(bundle).digest('hex')}));
 '''
-    output=engine.client.containers.run('numen-pi:0.1.0',['node','--input-type=module','-e',script],network_mode='none',user='10001:10001',remove=True,mem_limit='256m',nano_cpus=1000000000,pids_limit=32)
+    output=engine.client.containers.run('asset-monitor-pi:0.1.0',['node','--input-type=module','-e',script],network_mode='none',user='10001:10001',remove=True,mem_limit='256m',nano_cpus=1000000000,pids_limit=32)
     result=json.loads(output)
     assert result['version']=='5.0.12' and result['normal']==['abd','acd'] and result['numbers']==['1','2','3']
     assert result['depthBound'] and result['bundleHash']=='140daad3badc613549342760f22fade24121fb332cdbead61fa6719479df85f0'
@@ -318,7 +318,7 @@ def test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed(
     token='protected-engine-lifecycle-token'
     headers={'X-Broker-Token':token}
     files={
-        'vulnerable-app/Dockerfile':'FROM numen-lab:0.1.0\nCOPY app.py /app.py\nCMD ["python","/app.py"]\n',
+        'vulnerable-app/Dockerfile':'FROM asset-monitor-lab:0.1.0\nCOPY app.py /app.py\nCMD ["python","/app.py"]\n',
         'vulnerable-app/app.py':'from http.server import BaseHTTPRequestHandler,HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):self.send_response(200);self.end_headers();self.wfile.write(b"observed")\nHTTPServer(("0.0.0.0",8080),H).serve_forever()\n',
         'poc.py':'import os,time,urllib.request\nfor _ in range(30):\n try:\n  assert urllib.request.urlopen(os.environ["TARGET_URL"],timeout=1).read()==b"observed";break\n except OSError:time.sleep(.1)\nelse:raise RuntimeError("lab unavailable")\n',
         'report.md':'Lifecycle verification fixture.'}
@@ -360,7 +360,7 @@ def test_build_run_shares_its_workspace_and_carries_the_offline_lab_base(engine)
     events = []
     try:
         network = engine.client.networks.create("numen-job-" + run_id, internal=True, labels=labels)
-        workspace = engine.prepare_workspace(run_id, "numen-codex:" + VERSION, labels)
+        workspace = engine.prepare_workspace(run_id, "asset-monitor-codex:" + VERSION, labels)
         daemon = engine.start_build_daemon(run_id, job, network, labels, workspace)
         engine.load_lab_base(daemon, events.append)
         assert [e["type"] for e in events] == ["build_base_loaded"], events
@@ -369,13 +369,13 @@ def test_build_run_shares_its_workspace_and_carries_the_offline_lab_base(engine)
         assert "/workspace" not in spec["tmpfs"] and spec["read_only"] and spec["user"] == "10001:10001"
         assert spec["cap_drop"] == ["ALL"] and "no-new-privileges:true" in spec["security_opt"]
         observed = engine.client.containers.run(
-            "numen-codex:" + VERSION,
+            "asset-monitor-codex:" + VERSION,
             ["sh","-c",
              "id -u; git --version >/dev/null && echo git-ok; "
              "test -e /var/run/docker.sock && echo SOCKET || echo no-host-socket; "
              "echo shared > /workspace/share/from-agent.txt; "
              # A bind mount source resolves in the daemon, so this only works because it shares the volume.
-             "docker run --rm -v /workspace/share:/s numen-lab:" + VERSION + " "
+             "docker run --rm -v /workspace/share:/s asset-monitor-lab:" + VERSION + " "
              "sh -c 'cat /s/from-agent.txt; echo written-by-container > /s/from-container.txt'; "
              "cat /workspace/share/from-container.txt"],
             environment={"DOCKER_HOST":"tcp://docker:2375"}, network=network.name,
@@ -403,7 +403,7 @@ def test_build_agent_run_wires_the_daemon_and_workspace_before_the_provider_step
         kinds = [e["type"] for e in events]
         assert "build_daemon_started" in kinds and "build_base_loaded" in kinds, events
         workload = next(c for c in engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})
-                        if c.image.tags and c.image.tags[0].startswith("numen-codex"))
+                        if c.image.tags and c.image.tags[0].startswith("asset-monitor-codex"))
         environment = workload.attrs["Config"]["Env"]
         assert "DOCKER_HOST=tcp://docker:2375" in environment
         # The daemon is reached directly, never through the credential-free provider proxy.
@@ -498,10 +498,10 @@ def test_build_run_outputs_a_whole_application_bundle_past_the_log_bound(engine)
                      profile={"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}})
     labels = {LABEL:run_id, INSTANCE:engine.instance}
     try:
-        workspace = engine.prepare_workspace(run_id, "numen-codex:" + VERSION, labels)
+        workspace = engine.prepare_workspace(run_id, "asset-monitor-codex:" + VERSION, labels)
         # Stand in for the agent: write an application-sized bundle into its workspace.
         engine.client.containers.run(
-            "numen-codex:" + VERSION,
+            "asset-monitor-codex:" + VERSION,
             ["sh","-c","mkdir -p /workspace/outputs/vulnerable-app/app && "
                        "for i in $(seq 1 1200); do echo \"<?php // $i\" > /workspace/outputs/vulnerable-app/app/f$i.php; done && "
                        "dd if=/dev/urandom of=/workspace/outputs/vulnerable-app/vendor.bin bs=1M count=80 2>/dev/null && "

@@ -39,7 +39,7 @@ LAB_DIRECTIVES = frozenset(
     }
 )
 LAB_BASE = re.compile(
-    r"(?:numen-lab:0\.1\.0|scratch|[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?"
+    r"(?:asset-monitor-lab:0\.1\.0|scratch|[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?"
     r"@sha256:[0-9a-f]{64})(?: AS [a-zA-Z][a-zA-Z0-9_-]*)?"
 )
 LAB_DOCKERFILE_BYTES = 262144  # The verifier's own bound on the file it parses.
@@ -240,7 +240,7 @@ def completeness(files):
                     limitations.append("A declared application input is missing from the bundle")
             for image in lock.get("images", []):
                 if not isinstance(image, str) or (
-                    image != "numen-lab:0.1.0" and "@sha256:" not in image
+                    image != "asset-monitor-lab:0.1.0" and "@sha256:" not in image
                 ):
                     limitations.append("Base images must be pinned by digest")
         except (ValueError, TypeError):
