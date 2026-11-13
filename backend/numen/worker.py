@@ -28,13 +28,14 @@ from .workflows import Workflows, all_secrets
 from .domain import enqueue, event
 
 log = logging.getLogger("numen.worker")
-# Agent, lab and interactive login work that can occupy a slot for hours.
+# Agent, lab, Detection rule and interactive login work that can occupy a slot for minutes or hours.
 LONG_KINDS = (
     "account_login",
     "audit_context",
     "commit_analysis",
     "commit_triage",
     "cve_analysis",
+    "detection_rule",
     "finding_artifacts",
     "lab_run",
     "version_recipe",

@@ -493,6 +493,39 @@ def commandcode_login(env, timeout):
     return {"result":{"status":"ready","auth_type":"native_oauth"},"credential":{"auth_json":{"commandcode":entry}},"outputs":[]}
 
 
+def detection_rule(env, timeout):
+    """A07: compile inputs/rule.yar and scan each tree sent (changed, parent, baseline). Only yarac and
+    yara run, and yara reads the scanned files as bytes: nothing is executed, installed or imported."""
+    rule = WORK / "inputs" / "rule.yar"
+    # include reads other files, and the console module prints lines a match would print. yara accepts a
+    # comment before a module name and spells it from \xHH escapes, so those are decoded first.
+    # ponytail: this also refuses a rule that only has the word import before a string starting with
+    # console; a yara-aware tokenizer if real rules hit that.
+    text = rule.read_text(errors="replace")
+    decoded = re.sub(r"\\x([0-9A-Fa-f]{2})", lambda m: chr(int(m[1], 16)), text)
+    if re.search(r'\binclude[ \t]+"', text) or re.search(r'\bimport\b[\s\S]*"console', decoded):
+        return {"compiled": False, "error": "include and the console module are not accepted"}
+    code, _, stderr = run_process(["yarac", "--no-warnings", str(rule), str(WORK / "rules.yarc")], env, timeout=timeout)
+    if code:
+        return {"compiled": False, "error": stderr.strip()[:500]}
+    matches = {}
+    for tree in ("changed", "parent", "baseline"):
+        root = WORK / "inputs" / tree
+        if not root.is_dir():
+            continue
+        code, stdout, stderr = run_process(["yara", "--compiled-rules", "--recursive", "--no-follow-symlinks", "--no-warnings",
+                                            "--threads=4", "--timeout=60", str(WORK / "rules.yarc"), str(root)],
+                                           env, timeout=timeout, max_bytes=64 * 1024 * 1024)
+        # yara reports a file it could not read or that timed out on stderr and still exits 0: that is
+        # never "no match".
+        paths = {line.split(" ", 1)[-1] for line in stdout.splitlines() if line}
+        if code or stderr.strip() or any(not path.startswith(f"{root}/") for path in paths):
+            raise ValueError("Detection rule scan failed")
+        files = sorted(path[len(f"{root}/"):] for path in paths)
+        matches[tree] = {"files": files[:1000], "count": len(files)}
+    return {"compiled": True, "error": None, "matches": matches}
+
+
 def execute(job):
     WORK.mkdir(exist_ok=True)
     (WORK / "inputs").mkdir(exist_ok=True)
@@ -554,6 +587,8 @@ def execute(job):
         if p["auth_type"] != "native_oauth" or not login or (p["agent"] == "pi" and p["provider_id"] != "commandcode"):
             raise ValueError("headless native login unsupported for this agent")
         return login(env, timeout)
+    if kind == "detection_rule":
+        return {"result":detection_rule(env, timeout),"outputs":output_files(int(job["limits"]["output_bytes"]))}
     if kind in {"probe","lab"}:
         script = WORK / "inputs" / ("recipe.py" if kind == "probe" else "poc.py")
         if kind == "lab" and not script.is_file():
@@ -630,7 +665,7 @@ def main():
             "Pi turn did not complete", "Pi agent did not complete its final response", "Codex turn did not complete",
             "Claude turn did not complete", "Claude omitted structured output", "output limit exceeded", "output symlinks are not allowed",
             "output root cannot be a symlink", "output must be a regular file without hard links", "credential material detected in output",
-            "output file is not readable by the workload",
+            "output file is not readable by the workload", "Detection rule scan failed",
             "agent final response was not valid JSON", "agent session ended without a valid result"} or (
             isinstance(exc, ValueError) and str(exc).startswith("interactive agent session")):
             message = str(exc)[:1].upper() + str(exc)[1:] + "."

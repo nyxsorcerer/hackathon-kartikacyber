@@ -22,6 +22,11 @@ ARCHIVE_FILES, ARCHIVE_BYTES = 65536, 512 * 1024 * 1024
 # its build gets 15 minutes and its run (timeout_seconds, which starts after the build) 10.
 LAB_MAXIMA = {"timeout_seconds": 600, "build_seconds": 900, "image_bytes": 4 * 1024**3, "memory_mb": 8192,
               "cpus": 4.0, "pids": 4096, "output_bytes": 64 * 1024 * 1024, "input_bytes": 512 * 1024 * 1024}
+# A Detection rule run (A07) only reads its trees with yara, so it is bounded like a scan; its trees
+# arrive as archive inputs.
+RULE_MAXIMA = {"timeout_seconds": 600, "memory_mb": 1024, "cpus": 2.0, "pids": 64,
+               "output_bytes": 8 * 1024 * 1024, "input_bytes": 256 * 1024 * 1024}
+CEILINGS = {"lab": LAB_MAXIMA, "detection_rule": RULE_MAXIMA}
 PROVIDERS = {"openai": ["api.openai.com", "chatgpt.com", "auth.openai.com"],
              "claude": ["api.anthropic.com", "claude.ai", "platform.claude.com", "console.anthropic.com"],
              "deepseek": ["api.deepseek.com"], "commandcode": ["api.commandcode.ai"]}
@@ -122,7 +127,7 @@ class SessionInput(BaseModel):
 class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     attempt_token: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
-    kind: Literal["agent", "probe", "lab", "capabilities", "account_login"]
+    kind: Literal["agent", "probe", "lab", "detection_rule", "capabilities", "account_login"]
     profile: Profile = Field(default_factory=Profile)
     prompt: str = Field(default="", max_length=262144)
     output_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
@@ -132,7 +137,7 @@ class RunRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_request(self):
-        maxima = LAB_MAXIMA if self.kind == "lab" else MAXIMA
+        maxima = CEILINGS.get(self.kind, MAXIMA)
         if set(self.limits) - set(maxima):
             raise ValueError("unknown execution limit")
         for key, value in self.limits.items():
@@ -158,8 +163,8 @@ class RunRequest(BaseModel):
         for item in self.inputs:
             data = decode_file(item.model_dump(), int(self.bounds["input_bytes"]))
             total += len(data)
-            if item.archive and self.kind not in ("agent", "lab"):
-                raise ValueError("archive inputs are only supported for agent and lab runs")
+            if item.archive and self.kind not in ("agent", "lab", "detection_rule"):
+                raise ValueError("archive inputs are only supported for agent, lab and detection_rule runs")
             expanded = [path for path, _ in archive_files(item.path, data)] if item.archive else []
             for path in [item.path, *expanded]:
                 if path in seen:
@@ -167,8 +172,8 @@ class RunRequest(BaseModel):
                 seen.add(path)
         if total > self.bounds["input_bytes"]:
             raise ValueError("aggregate input byte limit exceeded")
-        if self.kind == "lab" and self.profile.credential:
-            raise ValueError("a Lab run carries no credential")
+        if self.kind in ("lab", "detection_rule") and self.profile.credential:
+            raise ValueError("a Lab or Detection rule run carries no credential")
         if self.kind in ("agent", "capabilities", "account_login"):
             p = self.profile
             if p.provider_id not in PROVIDERS:
@@ -189,7 +194,7 @@ class RunRequest(BaseModel):
 
     @property
     def bounds(self):
-        ceiling = LAB_MAXIMA if self.kind == "lab" else MAXIMA
+        ceiling = CEILINGS.get(self.kind, MAXIMA)
         bounds = {k: self.limits.get(k, v) for k, v in ceiling.items()}
         if self.kind == "agent" and "timeout_seconds" not in self.limits:
             bounds["timeout_seconds"] = None  # Agent runs have no deadline unless one is requested.

@@ -20,13 +20,19 @@ import { z } from "zod";
 import { mutate, request } from "../api";
 import { useResource } from "../hooks";
 import {
+  detectionChecks,
   findingDeletionSchema,
   findingSchema,
   findingSummariesSchema,
   applicationSchema,
   applicationsSchema,
 } from "../types";
-import type { Finding, Application } from "../types";
+import type {
+  Finding,
+  Application,
+  CleanupReport,
+  StaticProof,
+} from "../types";
 import { versionLabels } from "../versions";
 import { JobLaunch, queueJob } from "../components/JobLaunch";
 import { ArtifactBrowser } from "../components/ArtifactPreview";
@@ -601,6 +607,8 @@ function FindingBody({
     applicationSchema,
   );
   const complete = finding.artifact_state.status === "complete";
+  // A Malicious change never runs (ADR-0004): its Proof is static, with no Lab.
+  const malicious = finding.malicious_change;
   const observed = application.data?.version;
   const lab = labState(finding.lab_runs[0]?.status);
   return (
@@ -673,7 +681,7 @@ function FindingBody({
             <span>
               Artifacts <Badge>{finding.artifact_state.status}</Badge>
             </span>
-            <Badge tone={lab.tone}>{lab.label}</Badge>
+            {!malicious && <Badge tone={lab.tone}>{lab.label}</Badge>}
           </>
         }
       />
@@ -688,8 +696,10 @@ function FindingBody({
             </button>
           }
         >
-          Missing: {finding.artifact_state.missing.join(", ")}. Lab verification
-          is available once the bundle is complete.
+          Missing: {finding.artifact_state.missing.join(", ")}.{" "}
+          {malicious
+            ? "The static Proof is complete once its Detection rule validates."
+            : "Lab verification is available once the bundle is complete."}
         </Callout>
       )}
       <Lifecycle finding={finding} refresh={refresh} />
@@ -828,19 +838,34 @@ function FindingBody({
           </ol>
         </Panel>
       ) : null}
+      {finding.static_proof && (
+        <StaticProofPanel proof={finding.static_proof} />
+      )}
+      {finding.cleanup_report && (
+        <CleanupReportPanel
+          report={finding.cleanup_report}
+          proof={finding.static_proof}
+        />
+      )}
       <Panel
         title="Reproducible artifacts"
-        description="Report, Python PoC, and the pinned vulnerable application."
+        description={
+          malicious
+            ? "Report, Detection rule and indicators."
+            : "Report, Python PoC, and the pinned vulnerable application."
+        }
         actions={
           <>
             <button className="secondary" onClick={() => setUpload(true)}>
               <Upload size={15} aria-hidden="true" />
               Upload
             </button>
-            <button className="secondary" onClick={() => setGenerate(true)}>
-              <Sparkles size={15} aria-hidden="true" />
-              Generate
-            </button>
+            {!malicious && (
+              <button className="secondary" onClick={() => setGenerate(true)}>
+                <Sparkles size={15} aria-hidden="true" />
+                Generate
+              </button>
+            )}
           </>
         }
       >
@@ -853,69 +878,75 @@ function FindingBody({
         ) : (
           <Empty
             title="No artifacts yet"
-            description="Upload files or request generation to prepare the report, PoC, and vulnerable application."
-          />
-        )}
-      </Panel>
-      <Panel
-        title="Lab"
-        description="Builds the vulnerable application and runs this Proof in a disposable Lab, only after your Approval."
-        actions={
-          <button
-            className="primary"
-            disabled={!complete}
-            title={complete ? undefined : "Complete the bundle first"}
-            onClick={() => setApprove(true)}
-          >
-            <FlaskConical size={15} aria-hidden="true" />
-            Start Lab
-          </button>
-        }
-      >
-        {finding.lab_runs.length ? (
-          <div className="row-list">
-            {finding.lab_runs.map((run, i) => (
-              <article
-                className="lab-run"
-                key={typeof run.id === "string" ? run.id : i}
-              >
-                <div className="analysis-header">
-                  <Badge>
-                    {typeof run.status === "string" ? run.status : "Recorded"}
-                  </Badge>
-                  {typeof run.pinned_version === "string" && (
-                    <span className="muted">
-                      Pinned version {run.pinned_version}
-                    </span>
-                  )}
-                  <span className="analysis-time">
-                    {typeof run.created_at === "string" && (
-                      <Time value={run.created_at} absolute />
-                    )}
-                  </span>
-                  {typeof run.job_id === "string" && (
-                    <JobLink id={run.job_id} />
-                  )}
-                </div>
-                <Evidence
-                  value={run}
-                  label="Pinned version, prerequisites & captured logs"
-                />
-              </article>
-            ))}
-          </div>
-        ) : (
-          <Empty
-            icon={FlaskConical}
-            title="Not verified"
             description={
-              complete
-                ? "Start Lab to run the Proof against the pinned vulnerable application."
-                : "Complete the required artifacts before a Lab can run the Proof."
+              malicious
+                ? "Analyse the commit again, or upload a report and a Detection rule."
+                : "Upload files or request generation to prepare the report, PoC, and vulnerable application."
             }
           />
         )}
       </Panel>
+      {!malicious && (
+        <Panel
+          title="Lab"
+          description="Builds the vulnerable application and runs this Proof in a disposable Lab, only after your Approval."
+          actions={
+            <button
+              className="primary"
+              disabled={!complete}
+              title={complete ? undefined : "Complete the bundle first"}
+              onClick={() => setApprove(true)}
+            >
+              <FlaskConical size={15} aria-hidden="true" />
+              Start Lab
+            </button>
+          }
+        >
+          {finding.lab_runs.length ? (
+            <div className="row-list">
+              {finding.lab_runs.map((run, i) => (
+                <article
+                  className="lab-run"
+                  key={typeof run.id === "string" ? run.id : i}
+                >
+                  <div className="analysis-header">
+                    <Badge>
+                      {typeof run.status === "string" ? run.status : "Recorded"}
+                    </Badge>
+                    {typeof run.pinned_version === "string" && (
+                      <span className="muted">
+                        Pinned version {run.pinned_version}
+                      </span>
+                    )}
+                    <span className="analysis-time">
+                      {typeof run.created_at === "string" && (
+                        <Time value={run.created_at} absolute />
+                      )}
+                    </span>
+                    {typeof run.job_id === "string" && (
+                      <JobLink id={run.job_id} />
+                    )}
+                  </div>
+                  <Evidence
+                    value={run}
+                    label="Pinned version, prerequisites & captured logs"
+                  />
+                </article>
+              ))}
+            </div>
+          ) : (
+            <Empty
+              icon={FlaskConical}
+              title="Not verified"
+              description={
+                complete
+                  ? "Start Lab to run the Proof against the pinned vulnerable application."
+                  : "Complete the required artifacts before a Lab can run the Proof."
+              }
+            />
+          )}
+        </Panel>
+      )}
       {generate && (
         <JobLaunch
           operation="finding_artifacts"
@@ -1010,6 +1041,198 @@ function Lifecycle({
           </ActionButton>
         ))}
       </div>
+    </Panel>
+  );
+}
+const proofStates = {
+  validated: { label: "Validated", tone: "good" },
+  failed: { label: "Failed", tone: "danger" },
+  pending: { label: "Not validated yet", tone: "warm" },
+};
+const checkTones = { passed: "good", failed: "danger", skipped: "neutral" };
+function ProofState({ proof }: { proof?: StaticProof | null }) {
+  const state = proofStates[proof?.status || "pending"];
+  return <Badge tone={state.tone}>{state.label}</Badge>;
+}
+/** Strings as escaped text, one per line (A15). */
+function TextList({ items }: { items: string[] }) {
+  return items.length ? (
+    <ul className="gap-list">
+      {items.map((item, i) => (
+        <li key={i} className="mono">
+          {item}
+        </li>
+      ))}
+    </ul>
+  ) : (
+    <span className="muted">None</span>
+  );
+}
+/** A Malicious change's static Proof (A07): the Detection rule, its validation checks and the indicators. */
+function StaticProofPanel({ proof }: { proof: StaticProof }) {
+  const indicators = proof.indicators;
+  return (
+    <Panel
+      title="Static Proof"
+      description="The Detection rule and the indicators extracted from the change. The payload is never run."
+      actions={
+        <>
+          <ProofState proof={proof} />
+          {proof.job_id && <JobLink id={proof.job_id} />}
+        </>
+      }
+      padded
+    >
+      {proof.checks.length ? (
+        <DetailGrid
+          items={proof.checks.map((check) => [
+            detectionChecks[check.name] || humanize(check.name),
+            <>
+              <Badge tone={checkTones[check.status]}>{check.status}</Badge>{" "}
+              {check.message}
+              {check.files.length > 0 && <TextList items={check.files} />}
+            </>,
+          ])}
+        />
+      ) : (
+        <p className="muted">The Detection rule has not been validated yet.</p>
+      )}
+      <div className="field-block">
+        <span className="field-label with-copy">
+          Detection rule
+          {proof.rule && (
+            <CopyButton value={proof.rule} label="Copy the Detection rule" />
+          )}
+        </span>
+        {proof.rule ? (
+          <pre className="json-view">{proof.rule}</pre>
+        ) : (
+          <span className="muted">No Detection rule was drafted.</span>
+        )}
+      </div>
+      {indicators && (
+        <>
+          <DetailGrid
+            items={[
+              [
+                "Files",
+                indicators.files.length ? (
+                  <ul className="gap-list">
+                    {indicators.files.map((f, i) => (
+                      <li key={i}>
+                        <span className="mono">{f.path}</span>{" "}
+                        <span className="mono muted">{f.sha256}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <span className="muted">None</span>
+                ),
+              ],
+              ["Hosts", <TextList items={indicators.hosts} />],
+              ["URLs", <TextList items={indicators.urls} />],
+              ["Commands", <TextList items={indicators.commands} />],
+            ]}
+          />
+          {indicators.rejected.length > 0 && (
+            <div className="field-block">
+              <span className="field-label">Rejected indicators</span>
+              <TextList
+                items={indicators.rejected.map(
+                  (r) => `${r.kind} ${r.value}: ${r.reason}`,
+                )}
+              />
+            </div>
+          )}
+        </>
+      )}
+    </Panel>
+  );
+}
+/** A Malicious change's cleanup report (A07). It is shown here and never sent anywhere. */
+function CleanupReportPanel({
+  report,
+  proof,
+}: {
+  report: CleanupReport;
+  proof?: StaticProof | null;
+}) {
+  const indicators = proof?.indicators;
+  return (
+    <Panel
+      title="Cleanup report"
+      description="What to remove and which secrets to rotate. Asset Monitor never sends it."
+      padded
+    >
+      <DetailGrid
+        items={[
+          [
+            "Files the change added",
+            <TextList items={indicators?.files.map((f) => f.path) || []} />,
+          ],
+          [
+            "Indicators the change added",
+            <TextList
+              items={
+                indicators
+                  ? [
+                      ...indicators.hosts,
+                      ...indicators.urls,
+                      ...indicators.commands,
+                    ]
+                  : []
+              }
+            />,
+          ],
+          [
+            "Commits that contained it",
+            <span className="chip-row">
+              {report.commits.map((c) =>
+                c.commit_id ? (
+                  <Link
+                    key={c.revision}
+                    className="mono"
+                    to={`/commits/${c.commit_id}`}
+                  >
+                    {c.revision.slice(0, 7)}
+                  </Link>
+                ) : (
+                  <span key={c.revision} className="mono">
+                    {c.revision.slice(0, 7)}
+                  </span>
+                ),
+              )}
+              {report.commits_truncated && <span>and more</span>}
+            </span>,
+          ],
+          [
+            "Releases",
+            // Containment is approximate (stored commits only), so none found is not none.
+            report.releases?.length ? (
+              <TextList items={report.releases} />
+            ) : (
+              <span className="muted">
+                {report.releases
+                  ? "None found among the stored commits; not ruled out"
+                  : "Unknown"}
+              </span>
+            ),
+          ],
+          ["Secrets to rotate", <TextList items={report.secrets} />],
+          [
+            "Detection rule to run on the server",
+            <span className="with-copy">
+              <ProofState proof={proof} />
+              {proof?.rule && (
+                <CopyButton
+                  value={proof.rule}
+                  label="Copy the Detection rule"
+                />
+              )}
+            </span>,
+          ],
+        ]}
+      />
     </Panel>
   );
 }
@@ -1141,13 +1364,18 @@ function ArtifactUpload({
 }) {
   const [report, setReport] = useState<File>();
   const [poc, setPoc] = useState<File>();
+  const [rule, setRule] = useState<File>();
   const [appFiles, setAppFiles] = useState<{ file: File; path: string }[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   return (
     <Modal
       title="Upload finding artifacts"
-      description="Uploads are passive. A Lab runs only after your Approval."
+      description={
+        finding.malicious_change
+          ? "Uploads are passive. A new Detection rule is validated without running the payload."
+          : "Uploads are passive. A Lab runs only after your Approval."
+      }
       onClose={onClose}
     >
       <form
@@ -1162,6 +1390,7 @@ function ArtifactUpload({
           }
           if (report) append(report, "report.md");
           if (poc) append(poc, "poc.py");
+          if (rule) append(rule, "detection-rule.yar");
           appFiles.forEach((entry) => append(entry.file, entry.path));
           try {
             await request(`/findings/${finding.id}/artifacts`, findingSchema, {
@@ -1188,74 +1417,89 @@ function ArtifactUpload({
             onChange={(e) => setReport(e.target.files?.[0])}
           />
         </label>
-        <label>
-          Python PoC (poc.py)
-          <input
-            type="file"
-            accept=".py,text/plain"
-            onChange={(e) => setPoc(e.target.files?.[0])}
-          />
-        </label>
-        <label>
-          Vulnerable application files
-          <input
-            type="file"
-            multiple
-            onChange={(e) =>
-              setAppFiles(
-                Array.from(e.target.files || []).map((file) => ({
-                  file,
-                  path: `vulnerable-app/${file.name}`,
-                })),
-              )
-            }
-          />
-        </label>
-        <label>
-          Or select the application directory
-          <input
-            type="file"
-            multiple
-            {...{ webkitdirectory: "" }}
-            onChange={(e) =>
-              setAppFiles(
-                Array.from(e.target.files || []).map((file) => {
-                  const relative = file.webkitRelativePath
-                    .split("/")
-                    .slice(1)
-                    .join("/");
-                  return {
-                    file,
-                    path: `vulnerable-app/${relative || file.name}`,
-                  };
-                }),
-              )
-            }
-          />
-        </label>
-        {appFiles.length > 0 && (
-          <div className="upload-paths">
-            <p className="hint">
-              Verify safe paths within vulnerable-app/. Include Dockerfile,
-              compose.yaml, README.md, and application.lock.json.
-            </p>
-            {appFiles.map((entry, i) => (
-              <label key={i}>
-                {entry.file.name}
-                <input
-                  value={entry.path}
-                  required
-                  onChange={(e) =>
-                    setAppFiles((files) =>
-                      files.map((item, index) =>
-                        index === i ? { ...item, path: e.target.value } : item,
-                      ),
-                    )
-                  }
-                />
-              </label>
-            ))}
-          </div>
+        {finding.malicious_change ? (
+          <label>
+            Detection rule (detection-rule.yar)
+            <input
+              type="file"
+              accept=".yar,.yara,text/plain"
+              onChange={(e) => setRule(e.target.files?.[0])}
+            />
+          </label>
+        ) : (
+          <>
+            <label>
+              Python PoC (poc.py)
+              <input
+                type="file"
+                accept=".py,text/plain"
+                onChange={(e) => setPoc(e.target.files?.[0])}
+              />
+            </label>
+            <label>
+              Vulnerable application files
+              <input
+                type="file"
+                multiple
+                onChange={(e) =>
+                  setAppFiles(
+                    Array.from(e.target.files || []).map((file) => ({
+                      file,
+                      path: `vulnerable-app/${file.name}`,
+                    })),
+                  )
+                }
+              />
+            </label>
+            <label>
+              Or select the application directory
+              <input
+                type="file"
+                multiple
+                {...{ webkitdirectory: "" }}
+                onChange={(e) =>
+                  setAppFiles(
+                    Array.from(e.target.files || []).map((file) => {
+                      const relative = file.webkitRelativePath
+                        .split("/")
+                        .slice(1)
+                        .join("/");
+                      return {
+                        file,
+                        path: `vulnerable-app/${relative || file.name}`,
+                      };
+                    }),
+                  )
+                }
+              />
+            </label>
+            {appFiles.length > 0 && (
+              <div className="upload-paths">
+                <p className="hint">
+                  Verify safe paths within vulnerable-app/. Include Dockerfile,
+                  compose.yaml, README.md, and application.lock.json.
+                </p>
+                {appFiles.map((entry, i) => (
+                  <label key={i}>
+                    {entry.file.name}
+                    <input
+                      value={entry.path}
+                      required
+                      onChange={(e) =>
+                        setAppFiles((files) =>
+                          files.map((item, index) =>
+                            index === i
+                              ? { ...item, path: e.target.value }
+                              : item,
+                          ),
+                        )
+                      }
+                    />
+                  </label>
+                ))}
+              </div>
+            )}
+          </>
         )}
         {error && <ErrorNote>{error}</ErrorNote>}
         <div className="form-actions">
@@ -1264,7 +1508,7 @@ function ArtifactUpload({
           </button>
           <button
             className="primary"
-            disabled={busy || (!report && !poc && !appFiles.length)}
+            disabled={busy || (!report && !poc && !rule && !appFiles.length)}
           >
             <Upload size={15} />
             {busy ? "Uploading…" : "Upload revision"}

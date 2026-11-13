@@ -28,7 +28,13 @@ def prepared(system):
 
 def assessment(verdict="Vulnerability fix", ref="f" * 40):
     finding = verdict in ("Vulnerability fix", "Vulnerability introduced")
+    # A Malicious change names what the change added and the secrets its payload reaches (A07).
+    malicious = {
+        "indicators": {"files": ["main.py"], "hosts": [], "urls": [], "commands": ["return str(value)"]},
+        "reachable_secrets": ["The npm publish token in ~/.npmrc"],
+    } if verdict == "Malicious change" else {}
     return {
+        **malicious,
         "title": "Path traversal through template file inclusion",
         "verdict": verdict,
         "confidence": "high",

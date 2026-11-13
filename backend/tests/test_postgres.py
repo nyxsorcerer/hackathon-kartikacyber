@@ -682,6 +682,24 @@ def test_postgres_findings_open_and_link_within_each_application(postgres):
         app.state.factory.kw["bind"].dispose()
 
 
+def test_postgres_cleanup_report_orders_the_containing_commits_by_json_path(postgres, monkeypatch):
+    """The cleanup report's commits are filtered by branch and ordered by committed_at, both JSON
+    paths, on PostgreSQL."""
+    from test_detection_rules import test_the_cleanup_report_lists_the_commits_and_releases_that_contained_the_change as scenario
+
+    original, _ = postgres
+    config = replace(original, secret_key=Fernet.generate_key().decode(), test_mode=True)
+    app = create_app(config=config, admin_password="test-password-long")
+    try:
+        with TestClient(app) as client:
+            session = client.post("/api/auth/login", json={
+                "username": "admin", "password": "test-password-long"}).json()
+            client.headers["X-CSRF-Token"] = session["csrf_token"]
+            scenario((app, client, config), monkeypatch)
+    finally:
+        app.state.factory.kw["bind"].dispose()
+
+
 def test_postgres_skip_locked_claims_and_fenced_recovery(postgres):
     config, factory = postgres
     with factory.begin() as db:

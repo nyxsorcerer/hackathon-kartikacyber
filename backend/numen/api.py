@@ -1195,6 +1195,14 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         db=database_dependency,
     ):
         row = domain.get(db, Finding, ident)
+        if domain.malicious_change(db, row):
+            # The bundle agent would replace the static Proof with a Lab bundle.
+            raise DomainError(
+                "generation_not_available",
+                "A Malicious change Finding is re-drafted by analysing its commit again or by "
+                "uploading a corrected detection-rule.yar",
+                409,
+            )
         return accepted(
             domain.submit_agent(
                 db,

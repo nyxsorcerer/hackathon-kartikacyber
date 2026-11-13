@@ -9,13 +9,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from conftest import FixtureBroker, application, check_now, connection, source_snapshot
+from test_artifacts import upload
 from test_audit_context import add_context, events
 from test_commit_review import assessment, pinned_bundle, prepared
 from test_triage import record, reply, triage
 from test_workflows import cve_raw, seed_cve
 from numen import domain
 from numen.api import create_app
-from numen.models import CVE, Account, Action, Application, ApplicationCVE, Commit, Job, now
+from numen.models import CVE, Account, Action, Application, ApplicationCVE, Commit, Finding, Job, now
 from numen.sources import Sources
 from numen.schemas import SERVED_CONTENT_VERDICTS, VERDICTS
 from numen.security import DomainError
@@ -36,7 +37,8 @@ def analyze(system, ident, result, outputs):
     app, client, config = system
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     broker = FixtureBroker(result, outputs)
-    run_once(config, app.state.factory, broker, exclude=("notification",))  # Alerts stay queued.
+    # Alerts and the Detection rule validations a Malicious change queues stay queued.
+    run_once(config, app.state.factory, broker, exclude=("notification", "detection_rule"))
     return client.get(f"/api/jobs/{queued}").json(), broker
 
 
@@ -88,26 +90,117 @@ def test_fix_and_introduced_verdicts_publish_a_finding_with_the_drafted_bundle(s
     assert client.get(f"/api/findings/{finding['id']}").json()["artifact_state"]["status"] == "draft"
 
 
-def test_malicious_change_opens_a_finding_and_keeps_its_drafts_with_the_analysis(system):
+def test_a_malicious_change_must_return_indicators_and_reachable_secrets():
+    for field in ("indicators", "reachable_secrets"):
+        partial = assessment("Malicious change")
+        del partial[field]
+        with pytest.raises(DomainError) as refused:
+            validate_result("commit_analysis", partial)
+        assert refused.value.code == "invalid_agent_output", field
+    malicious = assessment("Malicious change")
+    for wrong in (
+        {"indicators": {**malicious["indicators"], "hashes": ["0" * 64]}},  # Application code hashes.
+        {"indicators": {k: v for k, v in malicious["indicators"].items() if k != "hosts"}},
+        {"indicators": {**malicious["indicators"], "files": [1]}},
+    ):
+        with pytest.raises(DomainError):
+            validate_result("commit_analysis", {**malicious, **wrong})
+    assert validate_result("commit_analysis", malicious) == malicious
+    # A long obfuscated one-liner or a change adding many files never fails the Verdict; application
+    # code keeps only what it finds in the commit.
+    large = {"indicators": {"files": [f"f{i}.js" for i in range(500)], "hosts": [""], "urls": [],
+                            "commands": ["node -e \"eval(Buffer.from('" + "A" * 8192 + "','base64'))\""]},
+             "reachable_secrets": ["x" * 5000] * 60}
+    assert validate_result("commit_analysis", {**malicious, **large})["indicators"] == large["indicators"]
+    for verdict in set(VERDICTS) - {"Malicious change"}:
+        assert "indicators" not in assessment(verdict)
+        assert validate_result("commit_analysis", assessment(verdict))["verdict"] == verdict
+
+
+def test_malicious_change_publishes_its_static_proof_and_cleanup_report_to_the_finding(system):
     _, client, _ = system
     _, ident, _ = prepared(system)
-    drafts = {
-        "report.md": b"# A postinstall loader",
-        "detection-rule.yar": b"rule loader { strings: $a = \"eval(atob(\" condition: $a }",
-        "cleanup-report.md": b"# Remove the loader and rotate the npm token",
-    }
-    job, _ = analyze(system, ident, assessment("Malicious change"), drafts)
+    rule = b"rule loader { strings: $a = \"str(value)\" condition: $a }"
+    drafts = {"report.md": b"# A postinstall loader", "detection-rule.yar": rule}
+    job, broker = analyze(system, ident, assessment("Malicious change"), drafts)
     assert job["status"] == "succeeded", job
+    assert {"indicators", "reachable_secrets"} <= broker.calls[0]["schema"]["properties"].keys()
     commit = client.get(f"/api/commits/{ident}").json()
     assert (commit["verdict"], commit["review_decision"]) == ("Malicious change", "candidate")
-    (finding,) = client.get("/api/findings").json()["items"]
+    (summary,) = client.get("/api/findings?view=summary").json()["items"]
+    finding = client.get(f"/api/findings/{summary['id']}").json()
     assert [f["id"] for f in commit["findings"]] == [finding["id"]] == [job["result"]["finding_id"]]
     assert (finding["status"], finding["source"], finding["cause"]["verdict"]) == ("open", "commit", "Malicious change")
-    # Its drafts stay with the Analysis until Phase 5: the Finding has no artifact revision.
-    assert finding["artifact_revision"] is None and finding["artifacts"] == []
+    assert finding["malicious_change"] is True
+    # The static Proof is a Draft until application code validates its Detection rule.
+    assert {a["path"] for a in finding["artifacts"]} == {"report.md", "detection-rule.yar", "indicators.json", "manifest.json"}
+    state = {"status": "draft", "missing": [], "limitations": ["The Detection rule has not been validated yet"],
+             "vulnerable_version": None}
+    assert finding["artifact_state"] == summary["artifact_state"] == job["result"]["artifact_state"] == state
+    proof = finding["static_proof"]
+    assert (proof["status"], proof["checks"], proof["rule"]) == ("pending", [], rule.decode())
+    assert (proof["analysis_id"], proof["artifact_revision"]) == (job["result"]["analysis_id"], finding["artifact_revision"])
+    assert proof["files"] == ["detection-rule.yar", "indicators.json", "report.md"]
+    (indicators,) = [a for a in finding["artifacts"] if a["path"] == "indicators.json"]
+    published = json.loads(client.get(f"/api/artifacts/{indicators['id']}/content").content)
+    assert published == proof["indicators"] and published["files"][0]["path"] == "main.py"
+    report = finding["cleanup_report"]
+    assert report["secrets"] == ["The npm publish token in ~/.npmrc"]
+    assert report["commits"] == [{"revision": "a" * 40, "commit_id": ident}] and report["commits_truncated"] is False
+    assert report["releases"] is None  # No GitHub account, so the tags are unknown.
     assert commit["analyses"][0]["result"]["finding_id"] == finding["id"]
-    saved = {a["path"] for a in commit["analyses"][0]["artifacts"]}
-    assert {"detection-rule.yar", "cleanup-report.md", "report.md"} <= saved
+    # Without a drafted Detection rule, the rule check fails and names why.
+    job, _ = analyze(system, ident, assessment("Malicious change"), {"report.md": b"# No rule"})
+    finding = client.get(f"/api/findings/{finding['id']}").json()
+    assert finding["static_proof"]["status"] == "failed" and finding["static_proof"]["rule"] is None
+    assert finding["static_proof"]["checks"] == [{"name": "rule", "status": "failed", "message": "No Detection rule was drafted"}]
+    assert finding["artifact_state"]["status"] == "draft"
+    assert finding["artifact_state"]["limitations"] == ["No Detection rule was drafted"]
+    assert finding["status"] == "open"
+    # A re-drafted rule is a new revision, pending again.
+    redrafted = upload(client, finding["id"], {"detection-rule.yar": rule}).json()
+    assert (redrafted["static_proof"]["status"], redrafted["static_proof"]["checks"]) == ("pending", [])
+    assert redrafted["static_proof"]["artifact_revision"] == redrafted["artifact_revision"] != finding["artifact_revision"]
+    assert redrafted["static_proof"]["indicators"] == finding["static_proof"]["indicators"]
+    assert redrafted["artifact_state"]["limitations"] == ["The Detection rule has not been validated yet"]
+    # A Malicious change opened this Finding, so it stays one: a later Verdict that is not a Malicious
+    # change publishes no Lab bundle over its static Proof.
+    job, _ = analyze(system, ident, assessment("Vulnerability introduced", ref="a" * 40), pinned_bundle("a" * 40))
+    later = client.get(f"/api/findings/{finding['id']}").json()
+    assert later["malicious_change"] is True and later["source_analysis_id"] == job["result"]["analysis_id"]
+    assert (later["static_proof"], later["cleanup_report"]) == (redrafted["static_proof"], redrafted["cleanup_report"])
+    assert later["artifact_revision"] == redrafted["artifact_revision"]
+
+
+def test_a_later_verdict_replaces_the_static_proof_of_a_finding_a_malicious_change_did_not_open(system):
+    _, client, _ = system
+    _, ident, _ = prepared(system)
+    job, _ = analyze(system, ident, assessment("Vulnerability introduced", ref="a" * 40), pinned_bundle("a" * 40))
+    finding_id = job["result"]["finding_id"]
+    analyze(system, ident, assessment("Malicious change"), {"report.md": b"# A loader"})
+    finding = client.get(f"/api/findings/{finding_id}").json()
+    assert finding["malicious_change"] is True and finding["static_proof"]["status"] == "failed"
+    analyze(system, ident, assessment("Vulnerability introduced", ref="a" * 40), pinned_bundle("a" * 40))
+    finding = client.get(f"/api/findings/{finding_id}").json()
+    assert finding["malicious_change"] is False and not {"static_proof", "cleanup_report"} & finding.keys()
+    assert finding["artifact_state"]["status"] == "complete"
+
+
+def test_a_finding_opened_by_a_malicious_change_before_phase_5_starts_a_static_proof_on_upload(system):
+    """A Malicious change Finding without a static Proof (opened before Phase 5, which drafted none)
+    gets one on its first uploaded revision, and its Detection rule is queued for validation."""
+    app, client, _ = system
+    _, ident, _ = prepared(system)
+    job, _ = analyze(system, ident, assessment("Malicious change"), {"report.md": b"# A loader"})
+    finding_id = job["result"]["finding_id"]
+    with app.state.factory.begin() as db:
+        row = db.get(Finding, finding_id)
+        row.data = {k: v for k, v in row.data.items() if k not in ("static_proof", "cleanup_report")}
+    rule = b"rule loader { strings: $a = \"str(value)\" condition: $a }"
+    uploaded = upload(client, finding_id, {"detection-rule.yar": rule}).json()
+    proof = uploaded["static_proof"]
+    assert (proof["status"], proof["rule"], proof["artifact_revision"]) == ("pending", rule.decode(), uploaded["artifact_revision"])
+    assert proof["job_id"] and uploaded["artifact_state"]["limitations"] == ["The Detection rule has not been validated yet"]
 
 
 def test_served_content_analysis_rejects_vulnerability_fix():

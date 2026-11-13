@@ -15,7 +15,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from sqlalchemy import select
 from yaml import YAMLError
-from . import artifacts, cves, dependencies, domain, prompts
+from . import artifacts, cves, dependencies, detection, domain, prompts
 from . import fingerprints as fingerprinting
 from .models import (
     Account,
@@ -96,9 +96,22 @@ SCHEMAS = {
             "open_questions": {"type": "array"},
             "before_after": {"type": "string"},
             "affected_behavior": {"type": "string"},
+            # A Malicious change's indicators and the secrets its payload reaches (A07). Application
+            # code checks them against the commit and hashes the files itself. They have no count or
+            # length bounds, so a long payload line or a large change never fails the Verdict.
+            "indicators": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["files", "hosts", "urls", "commands"],
+                "properties": {
+                    key: {"type": "array", "items": {"type": "string"}} for key in ("files", "hosts", "urls", "commands")
+                },
+            },
+            "reachable_secrets": {"type": "array", "items": {"type": "string"}},
         },
         "allOf": [
             {"if": {"properties": {"verdict": {"enum": list(FINDING_VERDICTS)}}}, "then": {"required": ["vulnerable_ref"], "properties": {"vulnerable_ref": {"type": "string", "minLength": 1}, "evidence": {"minItems": 1}}}},
+            {"if": {"properties": {"verdict": {"const": "Malicious change"}}}, "then": {"required": ["indicators", "reachable_secrets"]}},
         ],
     },
     "cve_analysis": {
@@ -612,7 +625,7 @@ class Workflows:
         )
         if (
             owner
-            and job.kind != "lab_run"
+            and job.kind not in ("lab_run", "detection_rule")
             and job.input.get("source_generation") != owner.source_generation
         ):
             raise DomainError(
@@ -1370,6 +1383,21 @@ class Workflows:
                 # revision that fails validation, is not published. The error stays on the Analysis.
                 revision_error = exc
                 result = {**result, "bundle_error": exc.as_dict()}
+        if verdict == "Malicious change":
+            # Application code checks the drafted indicators and computes the cleanup report's
+            # commits and releases from repository data (A07), before holding the fence.
+            indicators = detection.check_indicators(commit, source_files, result["indicators"])
+            commits, truncated = detection.containing_commits(db, repository, commit)
+            releases = None  # Unknown: a WordPress plugin, or the tags could not be read.
+            if repository.source_kind == "github":
+                revisions = {row["revision"] for row in commits}
+                try:
+                    releases = [name for name, sha in self.source_client(db).github_tags(repository) if sha in revisions]
+                except DomainError:
+                    pass
+            static = {"report.md": outputs["report.md"], "indicators.json": json.dumps(indicators, indent=2).encode()}
+            if "detection-rule.yar" in outputs:
+                static["detection-rule.yar"] = outputs["detection-rule.yar"]
         self.context.fence(db)
         db.refresh(commit, with_for_update=True)
         analysis = Analysis(
@@ -1415,12 +1443,27 @@ class Workflows:
             findings[target.id] = {"finding_id": finding.id}
             if finding.status not in ("open", "confirmed"):
                 continue  # A closed Finding keeps the evidence and bundle it was closed with.
-            finding.data = {**finding.data, "source_analysis_id": analysis.id, "evidence": result["evidence"]}
-            # Nothing was run, so an incomplete drafted bundle is still published, as a draft. A
-            # Malicious change's drafts stay with the Analysis until Phase 5.
-            if verdict in FINDING_VERDICTS and not revision_error:
+            # A later Verdict replaces an earlier Malicious change's static Proof and cleanup report,
+            # unless a Malicious change opened the Finding: it stays one and keeps its static Proof.
+            malicious = domain.malicious_change(db, finding)
+            kept = {k: v for k, v in finding.data.items() if malicious or k not in ("static_proof", "cleanup_report")}
+            finding.data = {**kept, "source_analysis_id": analysis.id, "evidence": result["evidence"]}
+            # Nothing was run, so an incomplete drafted bundle is still published, as a draft.
+            if verdict in FINDING_VERDICTS and not revision_error and not malicious:
                 findings[target.id] = self.publish_finding_bundle(
                     db, job, target, finding, vulnerable_ref, outputs, {}, require_complete=False
+                )
+            elif verdict == "Malicious change":
+                # The static Proof stays a Draft until its Detection rule validates. Publishing
+                # flushes this data before set_finding_artifacts refreshes the Finding.
+                finding.data = {
+                    **finding.data,
+                    "static_proof": {"analysis_id": analysis.id, "indicators": indicators},
+                    "cleanup_report": {"analysis_id": analysis.id, "commits": commits, "commits_truncated": truncated,
+                                       "releases": releases, "secrets": [s for s in result["reachable_secrets"] if s.strip()]},
+                }
+                findings[target.id] = self.publish_finding_bundle(
+                    db, job, target, finding, commit.revision, static, {}, require_complete=False
                 )
         own = findings.get(application.id, {"finding_id": None})
         analysis.result = {**result, "finding_id": own["finding_id"]}
@@ -2227,7 +2270,15 @@ class Workflows:
 
     def finding_artifacts(self, db, job, application):
         finding = domain.get(db, Finding, job.input["finding_id"])
-        cve = domain.get(db, CVE, finding.cve_id) if finding.cve_id else None
+        if domain.malicious_change(db, finding):  # A later Verdict may have made it one.
+            # The bundle agent would replace the static Proof with a Lab bundle.
+            raise DomainError(
+                "generation_not_available",
+                "A Malicious change Finding is re-drafted by analysing its commit again or by "
+                "uploading a corrected detection-rule.yar",
+                409,
+            )
+        cve =domain.get(db, CVE, finding.cve_id) if finding.cve_id else None
         analysis_id = finding.data.get("source_analysis_id")
         analysis = domain.get(db, Analysis, analysis_id) if analysis_id else None
         if analysis and not domain.analysis_reaches(db, analysis, application.id):
@@ -2410,6 +2461,60 @@ class Workflows:
                 all_secrets(db, self.vault),
             )
         return {"lab_run_id": row.id, **row.data}
+
+    def detection_rule(self, db, job, application):
+        """Validates a static Proof revision's Detection rule (A07) in the runner, where yara only
+        reads the trees: it must match a file the commit added or changed, and no file in its parent
+        tree or, for a commit after the Baseline, the Baseline tree. A pass confirms the Finding; a
+        failure leaves its artifacts Draft, names the failed check and keeps the lifecycle state."""
+        finding = domain.get(db, Finding, job.input["finding_id"])
+        revision = job.input["artifact_revision"]
+        drafted = artifacts.resource_files(db, self.config.artifact_root, "finding", finding.id, revision)
+        _, failed = detection.rule_text(drafted)
+        if failed:
+            raise DomainError("invalid_rule", failed["message"], 422)
+        commit = domain.get(db, Commit, finding.data.get("source_commit_id") or "")
+        repository = db.get(Repository, commit.repository_id)
+        # Trees come from stored snapshots, or else the read-only GitHub tarball or SVN export.
+        _, tree = self.snapshot(db, repository, commit.revision)
+        parents = commit.data.get("parent_revisions")
+        if repository.source_kind != "github":
+            parents = [str(int(commit.revision) - 1)] if int(commit.revision) > 1 else []
+        elif parents is None:
+            parents = self.source_client(db).commit_parents(repository, commit.revision)
+        parent = parents[0] if parents else None  # A root commit's parent tree is empty.
+        baseline = repository.baseline_revision
+        skipped = (
+            "A Backfill commit is checked against its parent tree only" if commit.data.get("backfill")
+            else "The repository has no Baseline" if not baseline
+            else "The Baseline is the parent tree" if baseline == parent
+            else None
+        )
+        trees = {
+            "changed": {path: tree[path] for path in detection.changed_files(commit, tree).values()},
+            "parent": self.snapshot(db, repository, parent)[1] if parent else {},
+            "baseline": {} if skipped else self.snapshot(db, repository, baseline)[1],
+        }
+        files = {"rule.yar": drafted["detection-rule.yar"]}
+        for name, found in trees.items():
+            files.update({f"{name}/{path}": data for path, data in found.items() if path != "manifest.json"})
+        result, _, _ = self.run(db, job, "detection_rule", files=files)
+        scanned = {path.split("/", 1)[0] for path in files} & set(detection.TREES)
+        checks = detection.checks(result, scanned, skipped)
+        status = "failed" if any(check["status"] == "failed" for check in checks) else "validated"
+        self.context.fence(db)
+        db.refresh(finding, with_for_update=True)
+        proof = finding.data.get("static_proof") or {}
+        # A result for a superseded revision is kept on its job only.
+        current = finding.artifact_revision == revision and proof.get("artifact_revision") == revision
+        if current:
+            if status == "validated":  # Before the data is written: transition refreshes the row.
+                domain.transition_finding(db, finding, "confirmed", {
+                    "by": "detection_rule", "artifact_revision": revision, "job_id": job.id})
+            finding.data = {**finding.data, "static_proof": {**proof, "status": status, "checks": checks, "job_id": job.id}}
+            finding.updated_at = now()
+        return {"finding_id": finding.id, "artifact_revision": revision, "status": status, "checks": checks,
+                "current": current}
 
     def account_capabilities(self, db, job, application):
         if domain.get(db, Account, job.input["account_id"]).provider in ("github", "nvd", "jev"):

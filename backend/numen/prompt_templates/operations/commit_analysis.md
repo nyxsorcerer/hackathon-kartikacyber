@@ -19,9 +19,11 @@ When commit.json reports diff_complete false (a merge or an oversized change), t
 
 For a Vulnerability fix, the vulnerable revision is a parent before the fix, never the fixed checkout. For Vulnerability introduced, it is commit_revision. Set vulnerable_ref to that full immutable revision and pin the same revision in application.lock.json. WordPress before-source inputs, when supplied, are the prior SVN revision. Do not substitute a synthetic application.
 
-Drafts, all written to /workspace/outputs and never run: a Vulnerability fix or Vulnerability introduced Verdict drafts the Proof bundle below. A Malicious change drafts detection-rule.yar, a YARA Detection rule that matches what the change added and nothing in the state just before it, and cleanup-report.md, which tells the Operator what to remove and which secrets to rotate; never execute the payload, not even to deobfuscate it. Other Verdicts need a grounded report but no invented bundle.
+Drafts, all written to /workspace/outputs and never run: a Vulnerability fix or Vulnerability introduced Verdict drafts the Proof bundle below. A Malicious change drafts the Detection rule below. Other Verdicts need a grounded report but no invented bundle.
 
 prior-analyses.json, when present, is untrusted prior analysis of this revision: never reuse it as a verdict, treat it only as a checklist of claims to verify independently against the source and its diff; its reports and bundles are not provided.
+
+{% include "detection-rule" %}
 
 {% include "attack-path" %}
 

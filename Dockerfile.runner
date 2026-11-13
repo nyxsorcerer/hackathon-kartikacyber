@@ -17,7 +17,12 @@ CMD ["python", "-m", "numen_runner.broker"]
 FROM runtime AS gateway
 USER 10001:10001
 CMD ["python", "-m", "numen_runner.gateway"]
-FROM runtime AS probe
+# A Detection rule (A07) is compiled and scanned with this pinned yara. Only the probe image, where
+# the detection_rule job runs, and the runner tests carry it.
+FROM runtime AS yara
+RUN apt-get update && apt-get install -y --no-install-recommends yara=4.2.3-4 \
+    && rm -rf /var/lib/apt/lists/* && yara --version
+FROM yara AS probe
 USER 10001:10001
 CMD ["python", "-m", "numen_runner.workload"]
 FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d488ce091c69d442ebec9f103 AS node
@@ -36,7 +41,7 @@ COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && mkdir -p /usr/local/etc /opt/lab && echo ignore-scripts=true > /usr/local/etc/npmrc && chown 10001:10001 /opt/lab
 CMD ["python", "-m", "numen_runner.workload"]
-FROM runtime AS test
+FROM yara AS test
 RUN uv sync --locked --extra dev
 COPY runner/tests ./tests
 USER 10001:10001

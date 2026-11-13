@@ -58,6 +58,33 @@ def test_the_bundle_section_describes_the_offline_node_lab():
         assert stale not in bundle, stale
 
 
+def test_the_detection_rule_section_describes_validation_and_the_cleanup_report():
+    analysis = default("commit_analysis")
+    assert "A Malicious change drafts the Detection rule below" in analysis
+    section = analysis.split("## Detection rule", 1)[1].split("## Attack path", 1)[0]
+    for part in (
+        "detection-rule.yar",
+        "matches nothing in the parent",
+        "after the Baseline",
+        "yara",
+        "no network",
+        "include",
+        "console module",
+        "64 KiB",
+        "exactly as commit.json lists them",
+        "exactly as the diff's added lines show them",
+        "reachable_secrets",
+        "never their values",
+        "Never execute, install, import or render the payload",
+    ):
+        assert part in section, part
+    # The prose cleanup report is no longer drafted: application code builds it from the result.
+    assert "cleanup-report.md" not in analysis
+    assert "Detection rule" in prompts.DESCRIPTIONS["detection-rule"]
+    for operation in ("cve_analysis", "finding_artifacts", "commit_triage"):
+        assert "## Detection rule" not in default(operation), operation
+
+
 def test_templates_list_their_sections_and_the_operations_using_them(system):
     _, client, _ = system
     body = client.get("/api/prompts").json()
@@ -67,7 +94,8 @@ def test_templates_list_their_sections_and_the_operations_using_them(system):
     assert items["attack-path"]["kind"] == "section"
     assert items["attack-path"]["used_by"] == ["commit_analysis", "cve_analysis", "finding_artifacts"]
     assert items["commit_analysis"]["kind"] == "operation"
-    assert items["commit_analysis"]["includes"] == ["attack-path", "bundle", "rules"]
+    assert items["commit_analysis"]["includes"] == ["attack-path", "bundle", "detection-rule", "rules"]
+    assert items["detection-rule"]["used_by"] == ["commit_analysis"]
     assert items["audit-context"]["used_by"] == ["cve_analysis", "finding_artifacts"]
     assert not any(item["customized"] for item in items.values())
     # Sections come first, then operations.

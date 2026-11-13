@@ -558,3 +558,47 @@ it("offers no Retry for a failed Lab: a new Lab needs a new Approval", async () 
     within(labRow).queryByRole("button", { name: "Retry" }),
   ).not.toBeInTheDocument();
 });
+
+it("summarises a detection_rule job by its result", async () => {
+  const passed = (name: string) => ({ name, status: "passed", message: "" });
+  for (const [result, summary, tone] of [
+    [
+      { current: true, checks: ["rule", "changed", "parent"].map(passed) },
+      "Detection rule succeeded: Detection rule validated",
+      "good",
+    ],
+    [
+      {
+        current: true,
+        checks: [
+          passed("rule"),
+          passed("changed"),
+          { name: "parent", status: "failed", message: "", files: ["a.js"] },
+          { name: "baseline", status: "failed", message: "" },
+        ],
+      },
+      "Detection rule succeeded: Detection rule failed: Matches nothing in the parent tree",
+      "warm",
+    ],
+    [
+      { current: false, checks: [passed("rule")] },
+      "Detection rule succeeded: Validated an earlier revision",
+      "good",
+    ],
+  ] as const) {
+    serveJobs([
+      {
+        ...triage,
+        id: "job-rule",
+        kind: "detection_rule",
+        subject: null,
+        result: { finding_id: "finding-1", artifact_revision: "r1", ...result },
+      },
+    ]);
+    renderJob("job-rule");
+    const outcome = await screen.findByRole("region", { name: "Job outcome" });
+    expect(outcome).toHaveTextContent(summary);
+    expect(outcome).toHaveClass(tone);
+    cleanup();
+  }
+});

@@ -356,6 +356,55 @@ export const cveSchema = z.object({
     .optional(),
 });
 export type CVE = z.infer<typeof cveSchema>;
+/** A07's Detection rule validation checks, in the order application code runs them. */
+export const detectionChecks: Record<string, string> = {
+  rule: "Rule compiles",
+  changed: "Matches a file the commit changed",
+  parent: "Matches nothing in the parent tree",
+  baseline: "Matches nothing in the Baseline",
+};
+/** A Malicious change's static Proof: its Detection rule, checked indicators and validation. */
+export const staticProofSchema = z.object({
+  analysis_id: z.string().optional(),
+  artifact_revision: z.string().optional(),
+  rule: z.string().nullable().default(null),
+  status: z.enum(["pending", "validated", "failed"]).default("pending"),
+  checks: z
+    .array(
+      z.object({
+        name: z.string(),
+        status: z.enum(["passed", "failed", "skipped"]),
+        message: z.string(),
+        files: z.array(z.string()).default([]),
+        count: z.number().optional(),
+      }),
+    )
+    .default([]),
+  indicators: z
+    .object({
+      files: z.array(z.object({ path: z.string(), sha256: z.string() })),
+      hosts: z.array(z.string()),
+      urls: z.array(z.string()),
+      commands: z.array(z.string()),
+      rejected: z.array(
+        z.object({ kind: z.string(), value: z.string(), reason: z.string() }),
+      ),
+    })
+    .optional(),
+  job_id: z.string().nullable().optional(),
+});
+export type StaticProof = z.infer<typeof staticProofSchema>;
+/** What a Malicious change's cleanup report adds to its indicators; application code computes it. */
+export const cleanupReportSchema = z.object({
+  commits: z.array(
+    z.object({ revision: z.string(), commit_id: z.string().nullable() }),
+  ),
+  commits_truncated: z.boolean().default(false),
+  // null: unknown, such as a WordPress plugin or tags that could not be read.
+  releases: z.array(z.string()).nullable(),
+  secrets: z.array(z.string()),
+});
+export type CleanupReport = z.infer<typeof cleanupReportSchema>;
 export const findingSchema = z.object({
   id: z.string(),
   application_id: z.string(),
@@ -386,6 +435,10 @@ export const findingSchema = z.object({
   }),
   artifacts: z.array(artifactSchema),
   lab_runs: z.array(unknownRecord),
+  /** A Malicious change never runs: no Lab and no Lab bundle generation (ADR-0004). */
+  malicious_change: z.boolean().default(false),
+  static_proof: staticProofSchema.nullable().optional(),
+  cleanup_report: cleanupReportSchema.nullable().optional(),
   created_at: z.string(),
   updated_at: z.string(),
 });

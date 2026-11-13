@@ -5,7 +5,12 @@ import tarfile
 import time
 import httpx
 from .artifacts import MAX_INPUTS, MAX_SET, MAX_SOURCE_FILES, MAX_SUBMISSION
+from .detection import TREES
 from .security import DomainError
+
+
+# The kinds whose inputs under these prefixes each travel as one archive.
+ARCHIVES = {"agent": ("source",), "detection_rule": TREES}
 
 
 def source_archive(files):
@@ -63,21 +68,19 @@ class Broker:
         policy=None,
         limits=None,
     ):
-        files, source = dict(files or {}), {}
-        # Agent source evidence travels as one compressed archive the runner expands read-only.
-        for path in list(files):
-            if kind == "agent" and path.startswith("source/"):
-                source[path.removeprefix("source/")] = files.pop(path)
-        # A lab bundle is a whole application, so all of it travels the same way.
-        prefix = "source"
+        files, trees = dict(files or {}), {}
+        # Bulk inputs travel as compressed archives the runner expands read-only: an agent's source
+        # evidence, each tree a Detection rule is scanned against, and a lab bundle, which is a
+        # whole application.
         if kind == "lab":
-            prefix, source, files = "bundle", files, {}
-        archive = source_archive(source) if source else b""
+            trees, files = {"bundle": files}, {}
+        for name in ARCHIVES.get(kind, ()):
+            trees[name] = {p.removeprefix(name + "/"): files.pop(p) for p in list(files) if p.startswith(name + "/")}
+        packed = {name: source_archive(tree) for name, tree in trees.items() if tree}
         if (
-            len(files) + bool(source) > MAX_INPUTS
-            or len(source) > MAX_SOURCE_FILES
-            or sum(len(content) for content in source.values()) > MAX_SET
-            or len(archive) + sum(len(content) for content in files.values()) > MAX_SUBMISSION
+            len(files) + len(packed) > MAX_INPUTS
+            or any(len(t) > MAX_SOURCE_FILES or sum(map(len, t.values())) > MAX_SET for t in trees.values())
+            or sum(map(len, packed.values())) + sum(map(len, files.values())) > MAX_SUBMISSION
         ):
             raise DomainError(
                 "runtime_input_limit",
@@ -88,14 +91,10 @@ class Broker:
             {"path": path, "content_base64": base64.b64encode(content).decode()}
             for path, content in files.items()
         ]
-        if source:
-            inputs.append(
-                {
-                    "path": prefix,
-                    "content_base64": base64.b64encode(archive).decode(),
-                    "archive": True,
-                }
-            )
+        inputs += [
+            {"path": name, "content_base64": base64.b64encode(archive).decode(), "archive": True}
+            for name, archive in packed.items()
+        ]
         defaults = {
             "timeout_seconds": 600,
             "memory_mb": 1024,
@@ -111,6 +110,8 @@ class Broker:
             defaults.update({"timeout_seconds": 600, "build_seconds": 900, "image_bytes": 4 * 1024**3,
                              "memory_mb": 6144, "cpus": 2, "pids": 4096,
                              "output_bytes": 64 * 1024 * 1024, "input_bytes": MAX_SUBMISSION})
+        if kind == "detection_rule":  # Within the runner's RULE_MAXIMA.
+            defaults.update({"pids": 64, "input_bytes": MAX_SUBMISSION})
         return self.request(
             "POST",
             "/internal/runs",

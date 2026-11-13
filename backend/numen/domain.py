@@ -5,7 +5,7 @@ from datetime import timedelta
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
-from . import artifacts, cves
+from . import artifacts, cves, detection
 from .models import (
     Account,
     Action,
@@ -953,13 +953,31 @@ def set_finding_artifacts(db, row, revision, files):
     # Publishing flushes the artifact metadata first. Refresh and lock before
     # adding the summary: generation may have loaded this finding before an edit.
     db.refresh(row, with_for_update=True)
-    state = artifacts.completeness(files)
     row.artifact_revision = revision
+    if "static_proof" in row.data or (row.source == "commit" and malicious_change(db, row)):
+        # A Malicious change's static Proof: each new revision is a Draft until its Detection rule
+        # validates (A07). A commit's Malicious change Finding without one, such as one opened
+        # before Phase 5, starts it here. Served content's static Proof is Phase 9's.
+        rule, failed = detection.rule_text(files)
+        proof = {**row.data.get("static_proof", {}), "artifact_revision": revision, "files": sorted(files), "rule": rule,
+                 "status": "failed" if failed else "pending", "checks": [failed] if failed else [], "job_id": None}
+        if not failed:
+            # Application code validates every revision's rule in the runner, where yara only reads.
+            proof["job_id"] = enqueue(
+                db, "detection_rule", db.get(Application, row.application_id),
+                {"finding_id": row.id, "artifact_revision": revision},
+                idempotency_key=f"detection-rule:{row.id}:{revision}",
+            ).id
+        row.data = {**row.data, "static_proof": proof}
+        return detection.static_state(proof)
+    state = artifacts.completeness(files)
     row.data = {**row.data, "_artifact_state": {"revision": revision, "rules": artifacts.RULES, "state": state}}
     return state
 
 
 def finding_artifact_state(db, row, root):
+    if "static_proof" in row.data:
+        return detection.static_state(row.data["static_proof"])
     if not row.artifact_revision:
         return artifacts.completeness({})
     cached = row.data.get("_artifact_state")
@@ -1029,6 +1047,7 @@ def finding_json(db, row, root):
         **finding_fields(row),
         **finding_data(row),
         "artifact_state": finding_artifact_state(db, row, root),
+        "malicious_change": malicious_change(db, row),
         "artifact_revision": row.artifact_revision,
         "artifacts": artifact_rows(db, "finding", row.id, row.artifact_revision),
         "lab_runs": [

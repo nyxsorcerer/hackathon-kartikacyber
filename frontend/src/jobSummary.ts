@@ -1,4 +1,4 @@
-import { operationNames } from "./types";
+import { detectionChecks, operationNames } from "./types";
 import type { Job, JobSubject } from "./types";
 import { describeError, humanize, sentence } from "./components/ui";
 
@@ -248,6 +248,21 @@ function successSummary(job: Job): {
             facts,
             tone: "warm",
           };
+    }
+    case "detection_rule": {
+      if (field(r, "current") === false)
+        return { summary: "Validated an earlier revision", facts };
+      const failed = text(
+        list(r, "checks").find((c) => field(c, "status") === "failed"),
+        "name",
+      );
+      return failed
+        ? {
+            summary: `Detection rule failed: ${detectionChecks[failed] || humanize(failed)}`,
+            facts,
+            tone: "warm",
+          }
+        : { summary: "Detection rule validated", facts };
     }
     case "notification": {
       const status = text(r, "status");

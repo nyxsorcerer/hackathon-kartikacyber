@@ -38,6 +38,7 @@ DESCRIPTIONS = {
     "rules": "Evidence and output rules every operation starts with.",
     "attack-path": "Tracing attacker, source, sink and boundary, and what a reproduction must prove.",
     "bundle": "The finding bundle contract the lab verifier enforces.",
+    "detection-rule": "A Malicious change's Detection rule, indicators and secrets to rotate, and how they are checked.",
     "source-pin": "What the source_pin fact says about the revision to bundle.",
     "audit-context": "What a supplied audit context is and how far to trust it.",
     "audit": "Rules shared by the three audit phases.",
