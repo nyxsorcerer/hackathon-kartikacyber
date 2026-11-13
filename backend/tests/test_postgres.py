@@ -400,6 +400,126 @@ def test_postgres_migration_keeps_links_and_adds_derivation_state(schema_url):
     engine.dispose()
 
 
+def test_postgres_migration_adds_triage_transcripts(schema_url):
+    migrate(schema_url, "7d5e6f8091a5")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO jobs (id, kind, status, input, input_hash, progress, created_at, attempts)"
+            " VALUES ('j1', 'commit_triage', 'succeeded', '{}', 'h', '{}', now(), 1)"
+        ))
+    migrate(schema_url, "8e6f7a92b1c6")
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO transcripts (id, job_id, kind, subject_id, data, created_at)"
+            " VALUES ('t1', 'j1', 'triage', 'c1', '{\"status\": \"failed\", \"reply\": \"not JSON\"}', now())"
+        ))
+        assert db.execute(text("SELECT data FROM transcripts")).scalar() == {"status": "failed", "reply": "not JSON"}
+    alembic(schema_url, "downgrade", "7d5e6f8091a5")
+    with engine.begin() as db:
+        assert db.execute(text("SELECT kind FROM jobs")).scalar() == "commit_triage"
+        assert db.execute(text("SELECT to_regclass('transcripts')")).scalar() is None
+    engine.dispose()
+
+
+def test_postgres_migration_maps_categories_to_verdicts(schema_url):
+    verdicts = {
+        "Likely vulnerability fix": "Vulnerability fix",
+        "Potentially introduced vulnerability": "Vulnerability introduced",
+        "Security hardening": "Security hardening",
+        "Unrelated change": "Unrelated",
+        "Insufficient context": "Insufficient context",
+    }
+    migrate(schema_url, "8e6f7a92b1c6")
+    engine = create_engine(schema_url)
+    results = {}
+    saved = {"updated_at": "2026-10-01T00:00:00+00:00", "default_digest": "numen"}
+    templates = {
+        "commit_triage": {**saved, "source": "Classify the change kind and its confidence."},
+        "commit_analysis": {**saved, "source": "Report category and finding_decision."},
+        "bundle": {**saved, "source": 'Bundle rules.\n{% include "build-sandbox" %}'},
+        "audit-context": {**saved, "source": "Trust the audit context a little."},
+    }
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_generation, monitor_interval_seconds, monitor_enabled, archived, config, cve_cursor)"
+            " VALUES ('a1', 'Site', 'https://example.com', 'plugin', 'Demo', 1, 300, true, false, '{}', '{}')"
+        ))
+        db.execute(text(
+            "INSERT INTO repositories (id, source_kind, source_url, source_generation, watched_branches, created_at)"
+            " VALUES ('r1', 'github', 'https://github.com/demo/plugin', 1, '{}', now())"
+        ))
+        for ident in ("c1", "c2"):
+            db.execute(text(
+                "INSERT INTO commits (id, repository_id, source_generation, revision, data, triage_status,"
+                " review_decision) VALUES (:id, 'r1', 1, :id, '{}', 'disabled', 'pending')"
+            ), {"id": ident})
+        # Each category once, oldest first, all about c1; the newest one is Insufficient context.
+        for n, category in enumerate(verdicts):
+            result = {
+                "category": category, "title": f"Analysis {n}", "finding_decision": "needs_more_evidence",
+                "confidence": {"level": "medium", "basis": "Pinned source"}, "summary": "Recorded",
+            }
+            results[f"x{n}"] = result
+            row = {"id": f"x{n}", "result": json.dumps(result), "age": f"{10 - n} minutes"}
+            db.execute(text(
+                "INSERT INTO jobs (id, kind, status, input, input_hash, progress, result, created_at, attempts)"
+                " VALUES (:id, 'commit_analysis', 'succeeded', '{}', 'h', '{}', CAST(:result AS json), now(), 1)"
+            ), row)
+            db.execute(text(
+                "INSERT INTO analyses (id, application_id, kind, subject_id, job_id, input_hash, profile,"
+                " result, created_at) VALUES (:id, 'a1', 'commit_analysis', 'c1', :id, 'h', '{}', CAST(:result AS json),"
+                " now() - CAST(:age AS interval))"
+            ), row)
+        # Other operations keep their confidence object.
+        db.execute(text(
+            "INSERT INTO jobs (id, kind, status, input, input_hash, progress, result, created_at, attempts)"
+            " VALUES ('cve', 'cve_analysis', 'succeeded', '{}', 'h', '{}', CAST(:result AS json), now(), 1)"
+        ), {"result": json.dumps({"confidence": {"level": "high"}})})
+        # Saved templates this revision breaks are reset; the others stay.
+        db.execute(text("INSERT INTO settings (id, data, revision) VALUES ('prompts', CAST(:data AS json), 3)"),
+                   {"data": json.dumps({"templates": templates})})
+    migrate(schema_url, "9f7a8ba3c2d7")
+    with engine.begin() as db:
+        for table in ("analyses", "jobs"):
+            rows = dict(db.execute(text(
+                f"SELECT id, result FROM {table} WHERE kind = 'commit_analysis'")).all())
+            assert rows == {
+                ident: {
+                    **{k: v for k, v in old.items() if k not in ("category", "confidence")},
+                    "verdict": verdicts[old["category"]],
+                    "confidence": "unknown",
+                    "numen_confidence": old["confidence"],
+                }
+                for ident, old in results.items()
+            }, table
+        assert db.execute(text("SELECT result FROM jobs WHERE id = 'cve'")).scalar() == {"confidence": {"level": "high"}}
+        assert dict(db.execute(text("SELECT id, verdict FROM commits")).all()) == {
+            "c1": "Insufficient context", "c2": None}
+        assert db.execute(text("SELECT analysis_state FROM commits WHERE id = 'c2'")).scalar() is None
+        data, revision = db.execute(text("SELECT data, revision FROM settings WHERE id = 'prompts'")).one()
+        assert (data, revision) == ({"templates": {"audit-context": templates["audit-context"]}}, 4)
+        reset = dict(db.execute(text("SELECT resource_id, data FROM actions WHERE resource_type = 'prompt'")).all())
+        assert {name: (row["action"], row["previous"]) for name, row in reset.items()} == {
+            name: ("reset", templates[name]["source"]) for name in ("commit_triage", "commit_analysis", "bundle")}
+    drift = alembic(schema_url, "check", check=False)
+    assert drift.returncode == 0, drift.stdout + drift.stderr
+    alembic(schema_url, "downgrade", "8e6f7a92b1c6")
+    with engine.begin() as db:
+        for table in ("analyses", "jobs"):
+            rows = dict(db.execute(text(
+                f"SELECT id, result FROM {table} WHERE kind = 'commit_analysis'")).all())
+            assert rows == results, table
+        columns = {c for (c,) in db.execute(text(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'commits'"
+            " AND table_schema = current_schema()"))}
+        assert not {"verdict", "analysis_state"} & columns and "review_decision" in columns
+        assert db.execute(text("SELECT data FROM settings WHERE id = 'prompts'")).scalar() == {"templates": templates}
+        assert db.execute(text("SELECT count(*) FROM actions")).scalar() == 0
+    engine.dispose()
+
+
 def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(postgres, monkeypatch):
     import httpx
     from numen.models import Commit
@@ -445,6 +565,32 @@ def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(p
             finding = client.get(f"/api/findings/{job['result']['finding_id']}").json()
             assert finding["source_commit_id"] == ident
             assert finding["artifact_state"]["status"] == "complete"
+    finally:
+        app.state.factory.kw["bind"].dispose()
+
+
+def test_postgres_automatic_analysis_caps_count_todays_automatic_jobs(postgres):
+    from test_analysis import CAPS, automatic_jobs, cap_events, flag, started, state
+    from test_commit_review import prepared
+
+    original, _ = postgres
+    config = replace(original, secret_key=Fernet.generate_key().decode(), test_mode=True)
+    app = create_app(config=config, admin_password="test-password-long")
+    try:
+        with TestClient(app) as client:
+            session = client.post("/api/auth/login", json={
+                "username": "admin", "password": "test-password-long"}).json()
+            client.headers["X-CSRF-Token"] = session["csrf_token"]
+            monitored, _, _ = prepared((app, client, config))
+            started(app, monitored["id"], CAPS["application"] - 1)
+            started(app, monitored["id"], 5, shared=True)  # Counted only against the account.
+            last, over = flag(app, monitored["id"], "b" * 40, "c" * 40)
+            assert state(client, last)["status"] == "queued"
+            assert (state(client, over)["status"], state(client, over)["cap"]) == ("waiting_for_cap", "application")
+            with app.state.factory.begin() as db:
+                schedule(db)  # Re-checked under FOR UPDATE SKIP LOCKED: still waiting, no second event.
+            assert state(client, over)["status"] == "waiting_for_cap" and len(cap_events(app)) == 1
+            assert len(automatic_jobs(app)) == CAPS["application"] + 5
     finally:
         app.state.factory.kw["bind"].dispose()
 

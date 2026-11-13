@@ -323,7 +323,10 @@ function ApplicationEditor({
                   onChange={(e) => setInherit(e.target.checked)}
                 />
                 Use the global default (
-                {globalSeconds ? formatInterval(globalSeconds) : "not configured"})
+                {globalSeconds
+                  ? formatInterval(globalSeconds)
+                  : "not configured"}
+                )
               </label>
             </div>
             <div className="field-stack">
@@ -365,17 +368,27 @@ function ApplicationEditor({
                 <option value="jev">Jev — typed security classification</option>
                 <option value="pi">Pi</option>
                 <option value="claude">Claude Code</option>
-                <option value="codex">Codex CLI</option>
+                {/* Saved before Triage on Codex was refused; it cannot be saved again. */}
+                {triage === "codex" && (
+                  <option value="codex" disabled>
+                    Codex CLI — not supported for Triage
+                  </option>
+                )}
               </select>
             </label>
-            {["pi", "claude", "codex"].includes(triage) &&
-              !triageConfigured && (
-                <p className="hint warning full">
-                  The selected triage runtime needs a matching ready Commit
-                  triage profile. Configure an application override below or the
-                  global default.
-                </p>
-              )}
+            {triage === "codex" && (
+              <p className="hint warning full">
+                Triage on Codex is refused: Codex cannot run without tools.
+                Choose another Triage mode to save this application.
+              </p>
+            )}
+            {["pi", "claude"].includes(triage) && !triageConfigured && (
+              <p className="hint warning full">
+                The selected triage runtime needs a matching ready Commit triage
+                profile. Configure an application override below or the global
+                default.
+              </p>
+            )}
             {triage === "jev" && (
               <label>
                 Jev account

@@ -104,7 +104,7 @@ def connection(app, agents=None):
         db.add(account)
         db.flush()
         profile = {
-            "agent": "codex",
+            "agent": "pi",
             "connection_id": account.id,
             "model_id": "test-model",
             "reasoning_effort": "high",
@@ -112,16 +112,13 @@ def connection(app, agents=None):
         setting = db.get(Setting, "global")
         setting.data = {
             **setting.data,
+            # Codex is refused for Triage, Analysis and CVE analysis, so they run on Pi.
             "default_profiles": {
-                op: profile
-                for op in (
-                    "commit_analysis",
-                    "commit_triage",
-                    "version_recipe",
-                    "audit_context",
-                    "cve_analysis",
-                    "finding_artifacts",
-                )
+                **{
+                    op: {**profile, "agent": "codex"}
+                    for op in ("version_recipe", "audit_context", "finding_artifacts")
+                },
+                **{op: profile for op in ("commit_triage", "commit_analysis", "cve_analysis")},
             },
         }
     return profile
@@ -181,8 +178,6 @@ class FixtureBroker:
         files=None,
         policy=None,
         limits=None,
-        build=False,
-        repository=None,
     ):
         call = {
             "token": token,
@@ -193,8 +188,6 @@ class FixtureBroker:
             "files": files or {},
             "policy": policy,
             "limits": limits,
-            "build": build,
-            "repository": repository,
         }
         self.calls.append(call)
         result, outputs = self.handler(call) if self.handler else (self.result, self.outputs)

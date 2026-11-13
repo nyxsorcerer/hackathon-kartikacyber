@@ -161,6 +161,10 @@ class Commit(Base):
     triage_status: Mapped[str] = mapped_column(String, default="disabled")
     triage_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     review_decision: Mapped[str] = mapped_column(String, default="pending")
+    # The newest Analysis's Verdict, and where the latest Analysis job stands (queued, completed,
+    # failed or timed_out).
+    verdict: Mapped[str | None] = mapped_column(String, nullable=True)
+    analysis_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class Snapshot(Base):
@@ -313,6 +317,19 @@ class JobEvent(Base):
     __tablename__ = "job_events"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"))
+    data: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class Transcript(Base):
+    """The stored record of one agent run (its prompt, reply and metadata) with secrets removed.
+    `subject_id` is what the run judged, such as the commit a Triage run belongs to."""
+
+    __tablename__ = "transcripts"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"))
+    kind: Mapped[str] = mapped_column(String)
+    subject_id: Mapped[str] = mapped_column(String)
     data: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 

@@ -12,6 +12,9 @@ from numen.models import Action, Artifact, Commit, Job, Notification, Applicatio
 from numen.worker import run_once
 
 
+TRIAGED = {"reply": json.dumps({"decision": "security_candidate", "title": "Potential path traversal", "reason": "A trust boundary changed"})}
+
+
 def prepared(system):
     app, client, _ = system
     profile = connection(app)
@@ -23,20 +26,18 @@ def prepared(system):
     return monitored, ident, profile
 
 
-def assessment(category="Likely vulnerability fix", decision="finding", ref="f" * 40):
+def assessment(verdict="Vulnerability fix", ref="f" * 40):
+    finding = verdict in ("Vulnerability fix", "Vulnerability introduced")
     return {
         "title": "Path traversal through template file inclusion",
-        "category": category,
+        "verdict": verdict,
+        "confidence": "high",
         "summary": "The before/after source identifies the input trust boundary",
         "evidence": [{"path": "main.py", "lines": [1, 2], "revision": ref}],
-        "confidence": {"level": "high", "basis": "Pinned source and reproduction"},
         "open_questions": [],
         "before_after": "The commit rejects previously accepted traversal sequences",
         "affected_behavior": "Template file selection",
-        "finding_decision": decision,
-        "finding_reason": "The pinned parent accepts a traversal payload" if decision == "finding" else "No reachable vulnerability was established",
-        "vulnerable_ref": ref if decision == "finding" else None,
-        "reproduction": {"status": "reproduced" if decision == "finding" else "not_run", "summary": "Observed in a controlled lab" if decision == "finding" else "No supported reproduction"},
+        "vulnerable_ref": ref if finding else None,
     }
 
 
@@ -46,51 +47,49 @@ def pinned_bundle(ref="f" * 40):
     return files
 
 
-@pytest.mark.parametrize("decision,kind,expected", [
-    ("security_candidate", "vulnerability_fix", "candidate"),
-    ("unrelated", "unrelated", "dismissed"),
-    ("insufficient_context", "insufficient_context", "pending"),
+@pytest.mark.parametrize("decision,expected", [
+    ("security_candidate", "candidate"),
+    ("unrelated", "dismissed"),
+    ("insufficient_context", "pending"),
 ])
-def test_triage_records_security_title_and_routes_review_decision(system, decision, kind, expected):
+def test_triage_records_security_title_and_routes_review_decision(system, decision, expected):
     app, client, config = system
-    monitored, ident, profile = prepared(system)
+    monitored, ident, _ = prepared(system)
     with app.state.factory.begin() as db:
         row = db.get(Application, monitored["id"])
-        job = domain.submit_agent(db, "commit_triage", row, {"commit_id": ident, "source_ref": "a" * 40}, profile)
+        job = domain.submit_agent(db, "commit_triage", row, {"commit_id": ident, "source_ref": "a" * 40})
         job_id = job.id
-    result = {"decision": decision, "change_kind": kind, "title": "Potential path traversal in template selection", "reason": "A source trust boundary was assessed", "confidence": {"level": "medium"}}
-    run_once(config, app.state.factory, FixtureBroker(result))
+    result = {"decision": decision, "title": "Potential path traversal in template selection", "reason": "A source trust boundary was assessed"}
+    run_once(config, app.state.factory, FixtureBroker({"reply": json.dumps(result)}))
     job = client.get(f"/api/jobs/{job_id}").json()
     assert job["status"] == "succeeded", job
     row = client.get(f"/api/commits/{ident}").json()
     assert row["review_decision"] == expected
     assert row["triage_result"]["title"] == result["title"]
-    assert row["triage_result"]["change_kind"] == kind
+    assert row["triage_result"]["decision"] == decision
 
 
 def test_late_manual_review_is_not_overwritten_by_triage(system):
     app, client, config = system
-    monitored, ident, profile = prepared(system)
+    monitored, ident, _ = prepared(system)
     with app.state.factory.begin() as db:
-        domain.submit_agent(db, "commit_triage", db.get(Application, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40}, profile)
+        domain.submit_agent(db, "commit_triage", db.get(Application, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40})
     client.post(f"/api/commits/{ident}/review", json={"decision": "dismissed"})
-    run_once(config, app.state.factory, FixtureBroker({"decision": "security_candidate", "change_kind": "vulnerability_introduction", "title": "Potential path traversal", "reason": "A trust boundary changed", "confidence": {"level": "high"}}))
+    run_once(config, app.state.factory, FixtureBroker(TRIAGED))
     row = client.get(f"/api/commits/{ident}").json()
     assert row["triage_result"]["decision"] == "security_candidate"
     assert row["review_decision"] == "dismissed"
 
 
-@pytest.mark.parametrize("category,ref", [("Likely vulnerability fix", "f" * 40), ("Potentially introduced vulnerability", "a" * 40)])
-def test_supported_commit_finding_builds_and_publishes_a_linked_immutable_bundle(system, category, ref):
+@pytest.mark.parametrize("verdict,ref", [("Vulnerability fix", "f" * 40), ("Vulnerability introduced", "a" * 40)])
+def test_supported_commit_finding_publishes_a_linked_immutable_bundle(system, verdict, ref):
     app, client, config = system
     _, ident, _ = prepared(system)
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    broker = FixtureBroker(assessment(category, ref=ref), pinned_bundle(ref))
+    broker = FixtureBroker(assessment(verdict, ref=ref), pinned_bundle(ref))
     run_once(config, app.state.factory, broker)
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == "succeeded", job
-    assert broker.calls[0]["build"] is True
-    assert "private Docker daemon" in broker.calls[0]["prompt"]
     assert job["result"]["commit_id"] == ident
     finding = client.get(f"/api/findings/{job['result']['finding_id']}").json()
     assert finding["source_commit_id"] == ident
@@ -105,7 +104,7 @@ def test_supported_commit_finding_builds_and_publishes_a_linked_immutable_bundle
         assert {"report.md", "poc.py", "vulnerable-app/Dockerfile", "manifest.json"} <= set(archive.namelist())
     client.patch(f"/api/findings/{finding['id']}", json={"title": "Operator-reviewed title", "status": "fixed"})
     again = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    run_once(config, app.state.factory, FixtureBroker(assessment(category, ref=ref), {**pinned_bundle(ref), "report.md": b"# Updated review"}))
+    run_once(config, app.state.factory, FixtureBroker(assessment(verdict, ref=ref), {**pinned_bundle(ref), "report.md": b"# Updated review"}))
     assert client.get(f"/api/jobs/{again}").json()["result"]["finding_id"] == finding["id"]
     current = client.get(f"/api/findings/{finding['id']}").json()
     assert current["title"] == "Operator-reviewed title" and current["status"] == "fixed"
@@ -114,36 +113,23 @@ def test_supported_commit_finding_builds_and_publishes_a_linked_immutable_bundle
         assert archive.read("report.md") == pinned_bundle()["report.md"]
 
 
-@pytest.mark.parametrize("category,decision,review", [
-    ("Security hardening", "not_a_finding", "dismissed"),
-    ("Unrelated change", "not_a_finding", "dismissed"),
-    ("Insufficient context", "needs_more_evidence", "pending"),
+@pytest.mark.parametrize("verdict,review", [
+    ("Security hardening", "dismissed"),
+    ("Unrelated", "dismissed"),
+    ("Insufficient context", "pending"),
 ])
-def test_nonfinding_commit_analysis_retains_report_without_creating_findings(system, category, decision, review):
+def test_nonfinding_commit_analysis_retains_report_without_creating_findings(system, verdict, review):
     app, client, config = system
     _, ident, _ = prepared(system)
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    broker = FixtureBroker(assessment(category, decision), {"report.md": b"# Assessment"})
+    broker = FixtureBroker(assessment(verdict), {"report.md": b"# Assessment"})
     run_once(config, app.state.factory, broker)
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == "succeeded", job
-    assert broker.calls[0]["build"] is True
     row = client.get(f"/api/commits/{ident}").json()
     assert row["review_decision"] == review
-    assert row["analyses"][0]["result"]["finding_decision"] == decision
+    assert row["verdict"] == row["analyses"][0]["result"]["verdict"] == verdict
     assert client.get("/api/findings").json()["items"] == []
-
-
-def test_commit_finding_incomplete_bundle_fails_with_linked_draft_retained(system):
-    app, client, config = system
-    _, ident, _ = prepared(system)
-    queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    run_once(config, app.state.factory, FixtureBroker(assessment(), {"report.md": b"# Retained evidence"}))
-    job = client.get(f"/api/jobs/{queued}").json()
-    assert job["status"] == "failed" and job["error"]["code"] == "incomplete_bundle"
-    finding = client.get(f"/api/findings/{job['result']['finding_id']}").json()
-    assert finding["artifact_state"]["status"] == "draft"
-    assert client.get(f"/api/commits/{ident}").json()["analyses"][0]["id"] == job["result"]["analysis_id"]
 
 
 def test_commit_finding_cannot_publish_an_unrelated_vulnerable_revision(system):
@@ -252,11 +238,11 @@ def test_batch_candidates_each_record_a_notification(system):
 
 def test_late_batch_review_is_not_overwritten_by_triage(system):
     app, client, config = system
-    monitored, ident, profile = prepared(system)
+    monitored, ident, _ = prepared(system)
     with app.state.factory.begin() as db:
-        domain.submit_agent(db, "commit_triage", db.get(Application, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40}, profile)
+        domain.submit_agent(db, "commit_triage", db.get(Application, monitored["id"]), {"commit_id": ident, "source_ref": "a" * 40})
     client.post("/api/commits/review", json={"ids": [ident], "decision": "dismissed"})
-    run_once(config, app.state.factory, FixtureBroker({"decision": "security_candidate", "change_kind": "vulnerability_introduction", "title": "Potential path traversal", "reason": "A trust boundary changed", "confidence": {"level": "high"}}))
+    run_once(config, app.state.factory, FixtureBroker(TRIAGED))
     assert client.get(f"/api/commits/{ident}").json()["review_decision"] == "dismissed"
 
 
@@ -313,22 +299,25 @@ def test_confirmed_commits_link_their_findings_without_a_candidate_notification(
     assert client.get("/api/dashboard").json()["security_reviews"] == 0
 
 
-def test_analysis_gets_the_full_repository_and_prior_verdicts_only_as_a_checklist(system):
+def test_analysis_reads_the_pinned_snapshot_without_a_repository_or_build(system):
     app, client, config = system
     monitored, ident, _ = prepared(system)
-    first = FixtureBroker(assessment("Security hardening", "not_a_finding"), {"report.md": b"# Assessment"})
+    first = FixtureBroker(assessment("Security hardening"), {"report.md": b"# Assessment"})
     client.post(f"/api/commits/{ident}/analyses", json={})
     run_once(config, app.state.factory, first)
     call = first.calls[0]
-    assert call["build"] is True
-    assert call["repository"] == {"url": "https://github.com/demo/plugin", "ref": "a" * 40}
+    # The runner contract has no build or repository field; the source is the pinned snapshot.
+    assert set(call) == {"token", "kind", "profile", "prompt", "schema", "files", "policy", "limits"}
+    assert call["kind"] == "agent" and any(path.startswith("source/") for path in call["files"])
+    assert "diff_review" not in call["schema"]["properties"]
     assert "prior-analyses.json" not in call["files"]
-    assert "/workspace/repo" in call["prompt"] and "never reuse it as a verdict" in call["prompt"]
-    # The sandbox is described up front rather than discovered by trial.
-    assert "How the build sandbox works" in call["prompt"]
-    assert "never directly between two containers" in call["prompt"]
-    assert "asset-monitor-lab:0.1.0 is Debian bookworm with Python 3.12, curl, git, unzip" in call["prompt"]
-    second = FixtureBroker(assessment("Security hardening", "not_a_finding"), {"report.md": b"# Assessment"})
+    prompt = call["prompt"]
+    assert "never reuse it as a verdict" in prompt
+    assert "inputs/source is a read-only checkout of the pinned revision" in prompt
+    assert "Build and run nothing" in prompt and "draft" in prompt
+    for gone in ("/workspace/repo", "DOCKER_HOST", "private daemon", "Build sandbox", "docker build", "lab run"):
+        assert gone not in prompt, gone
+    second = FixtureBroker(assessment("Security hardening"), {"report.md": b"# Assessment"})
     client.post(f"/api/commits/{ident}/analyses", json={})
     run_once(config, app.state.factory, second)
     files = second.calls[0]["files"]
@@ -336,19 +325,9 @@ def test_analysis_gets_the_full_repository_and_prior_verdicts_only_as_a_checklis
     assert "analyses" not in commit and "findings" not in commit and commit["revision"] == "a" * 40
     prior = json.loads(files["prior-analyses.json"])
     assert prior["notice"].startswith("Untrusted prior analysis of this revision. Do not reuse it as a verdict")
-    assert prior["analyses"][0]["claims"]["category"] == "Security hardening"
+    assert "lab run" not in prior["notice"]
+    assert prior["analyses"][0]["claims"]["verdict"] == "Security hardening"
     assert "finding_id" not in prior["analyses"][0]["claims"]
-
-
-def test_only_a_canonical_github_source_is_mirrored():
-    from types import SimpleNamespace
-
-    from numen.workflows import source_repository
-
-    github = SimpleNamespace(source_kind="github", source_url="https://github.com/demo/plugin/")
-    assert source_repository(github, "b" * 40) == {"url": "https://github.com/demo/plugin", "ref": "b" * 40}
-    assert source_repository(github, "main") is None
-    assert source_repository(SimpleNamespace(source_kind="wordpress", source_url="https://plugins.svn.wordpress.org/x"), "1234") is None
 
 
 def test_a_false_positive_finding_can_be_deleted_with_its_artifacts(system):
@@ -388,7 +367,7 @@ def test_a_false_positive_finding_can_be_deleted_with_its_artifacts(system):
 def test_the_analysis_prompt_requires_a_traced_attack_path_delivered_through_its_source(system):
     app, client, config = system
     _, ident, _ = prepared(system)
-    broker = FixtureBroker(assessment("Security hardening", "not_a_finding"), {"report.md": b"# Assessment"})
+    broker = FixtureBroker(assessment("Security hardening"), {"report.md": b"# Assessment"})
     client.post(f"/api/commits/{ident}/analyses", json={})
     run_once(config, app.state.factory, broker)
     prompt = broker.calls[0]["prompt"]
@@ -399,63 +378,45 @@ def test_the_analysis_prompt_requires_a_traced_attack_path_delivered_through_its
         "never the payload: do not write the malicious value into the database",
         "Report reproduction as reproduced only when the payload entered through the source",
         "an attacker without the impacted privilege reaches through the traced source-to-sink path",
-        "report diff_review with the exact range you diffed",
     ):
         assert rule in prompt, rule
 
 
-class RepositoryBroker(FixtureBroker):
-    """A run whose runtime reports that the full repository was prepared."""
-
-    def submit(self, token, kind, *args, **kwargs):
-        submitted = super().submit(token, kind, *args, **kwargs)
-        if kwargs.get("repository"):
-            self.states[token]["events"] = [{"type": "repository_ready", "message": "ready"}]
-        return submitted
-
-
-@pytest.mark.parametrize("broker_class,review", [
-    (FixtureBroker, None),  # an incomplete upstream diff and no review
-    (FixtureBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}),  # a review without the repository
-    (RepositoryBroker, None),  # the repository without a review
-    (RepositoryBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}),  # even a whole-change review
-])
-def test_an_incomplete_diff_never_yields_unrelated(system, broker_class, review):
+def test_an_incomplete_diff_never_yields_unrelated(system):
     app, client, config = system
     _, ident, _ = prepared(system)
     with app.state.factory.begin() as db:
         commit = db.get(Commit, ident)
         commit.data = {**commit.data, "diff_complete": False}
-    result = {**assessment("Unrelated change", "not_a_finding"), **({"diff_review": review} if review else {})}
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    run_once(config, app.state.factory, broker_class(result, {"report.md": b"# Merge review"}))
+    run_once(config, app.state.factory, FixtureBroker(assessment("Unrelated"), {"report.md": b"# Merge review"}))
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == "succeeded", job
-    assert (job["result"]["category"], job["result"]["finding_decision"]) == ("Insufficient context", "needs_more_evidence")
+    assert job["result"]["verdict"] == "Insufficient context"
     commit = client.get(f"/api/commits/{ident}").json()
-    assert commit["review_decision"] == "pending"
-    assert commit["analyses"][0]["result"]["category"] == "Insufficient context"
+    assert (commit["verdict"], commit["review_decision"]) == ("Insufficient context", "pending")
+    assert commit["analyses"][0]["result"]["verdict"] == "Insufficient context"
 
 
-@pytest.mark.parametrize("broker_class,review,succeeds", [
-    (FixtureBroker, None, False),
-    (RepositoryBroker, {"range": "f" * 40 + ".." + "a" * 40, "files": 3}, True),
-])
-def test_an_incomplete_diff_is_ruled_not_a_finding_only_after_reviewing_the_whole_change(system, broker_class, review, succeeds):
+def test_an_incomplete_diff_never_stands_as_security_hardening(system):
+    """No whole-change review is possible from the snapshot, so a Security hardening Verdict on an
+    incomplete diff becomes Insufficient context, and a claimed review is refused."""
     app, client, config = system
     _, ident, _ = prepared(system)
     with app.state.factory.begin() as db:
         commit = db.get(Commit, ident)
         commit.data = {**commit.data, "diff_complete": False}
-    result = {**assessment("Security hardening", "not_a_finding"), **({"diff_review": review} if review else {})}
+    claimed = {**assessment("Security hardening"), "diff_review": {"range": "f" * 40 + ".." + "a" * 40}}
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    run_once(config, app.state.factory, broker_class(result, {"report.md": b"# Merge review"}))
+    run_once(config, app.state.factory, FixtureBroker(claimed, {"report.md": b"# Merge review"}))
     job = client.get(f"/api/jobs/{queued}").json()
-    if succeeds:
-        assert job["status"] == "succeeded", job
-        assert client.get(f"/api/commits/{ident}").json()["review_decision"] == "dismissed"
-    else:
-        assert job["status"] == "failed" and job["error"]["code"] == "insufficient_diff"
+    assert job["status"] == "failed" and job["error"]["code"] == "invalid_agent_output", job
+    queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
+    run_once(config, app.state.factory, FixtureBroker(assessment("Security hardening"), {"report.md": b"# Merge review"}))
+    job = client.get(f"/api/jobs/{queued}").json()
+    assert job["status"] == "succeeded", job
+    assert job["result"]["verdict"] == "Insufficient context"
+    assert client.get(f"/api/commits/{ident}").json()["review_decision"] == "pending"
 
 
 def analysis_jobs(app, ident=None):
@@ -499,7 +460,7 @@ def test_batch_analysis_queues_one_job_per_revision_and_skips_active_or_earlier_
 
 @pytest.mark.parametrize("extra,status", [
     ({"ids": ["missing"]}, 404),
-    ({"profile": {"agent": "codex", "connection_id": "missing", "model_id": "test-model"}}, 404),
+    ({"profile": {"agent": "pi", "connection_id": "missing", "model_id": "test-model"}}, 404),
     ({"ids": [f"c{i}" for i in range(50)]}, 422),  # 51 revisions, one more than a batch may queue
 ])
 def test_batch_analysis_that_cannot_queue_every_revision_queues_nothing(system, extra, status):

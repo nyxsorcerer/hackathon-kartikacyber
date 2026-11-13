@@ -1,6 +1,7 @@
 """Intake (A02): token, ETag, Baseline and Backfill, Pre-filter, capped diffs, Release branches
 and intervals."""
 
+import json
 import shutil
 import subprocess
 from datetime import timedelta
@@ -16,13 +17,7 @@ from numen.prefilter import prefilter
 from numen.sources import Sources, release_branch_candidates
 from numen.worker import run_once
 
-UNRELATED = {
-    "decision": "unrelated",
-    "change_kind": "unrelated",
-    "title": "Documentation wording",
-    "reason": "No security bearing",
-    "confidence": {"level": "high"},
-}
+UNRELATED = {"reply": json.dumps({"decision": "unrelated", "title": "Documentation wording", "reason": "No security bearing"})}
 
 
 def detail(sha, files=None):
@@ -59,7 +54,7 @@ def test_added_repository_baselines_at_head_and_triages_only_new_or_backfilled_c
     app, client, config = system
     connection(app)
     github_account(app)
-    p = application(client, config={"triage_mode": "codex"})
+    p = application(client, config={"triage_mode": "pi"})
     # The newest page stands for a history of 10,000 commits.
     history = [f"{index:040x}" for index in range(10000, 0, -1)]
     requests = []
@@ -187,14 +182,14 @@ def test_github_repository_without_token_is_not_polled_and_shows_error(system, m
 
 def test_incomplete_diff_triage_is_never_unrelated(system):
     app, client, config = system
-    profile = connection(app)
+    connection(app)
     p = application(client)
     ident = source_snapshot(app, p["id"])
     with app.state.factory.begin() as db:
         commit = db.get(Commit, ident)
         commit.data = {**commit.data, "diff_complete": False}
         job = domain.submit_agent(db, "commit_triage", db.get(Application, p["id"]),
-                                  {"commit_id": ident, "source_ref": "a" * 40}, profile)
+                                  {"commit_id": ident, "source_ref": "a" * 40})
         job_id = job.id
     run_once(config, app.state.factory, FixtureBroker(UNRELATED))
     assert client.get(f"/api/jobs/{job_id}").json()["status"] == "succeeded"

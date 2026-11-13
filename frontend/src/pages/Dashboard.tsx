@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import {
   ArrowRight,
+  FileSearch,
   GitCommitHorizontal,
   Plus,
   Radar,
@@ -267,6 +268,51 @@ export function Dashboard() {
                   )}
               </Panel>
             </div>
+            <Panel
+              title="Review queue"
+              description="Changes Analysis could not decide, waiting for your review decision"
+            >
+              {data.review_queue.length ? (
+                <>
+                  <div className="row-list">
+                    {data.review_queue.map((item) => (
+                      <Link
+                        key={item.id}
+                        to={`/commits/${item.id}`}
+                        className="list-row"
+                      >
+                        <span className="list-row-main">
+                          <strong>{item.title}</strong>
+                          <span className="mono">
+                            {item.revision.slice(0, 10)}
+                          </span>
+                        </span>
+                        <span className="list-row-end">
+                          <small>
+                            <Time
+                              value={item.committed_at}
+                              fallback="Undated"
+                            />
+                          </small>
+                        </span>
+                      </Link>
+                    ))}
+                  </div>
+                  {data.review_queue_count > data.review_queue.length && (
+                    <p className="hint panel-body">
+                      Showing the newest {data.review_queue.length} of{" "}
+                      {data.review_queue_count}.
+                    </p>
+                  )}
+                </>
+              ) : (
+                <Empty
+                  icon={FileSearch}
+                  title="The Review queue is empty"
+                  description="Changes with an Insufficient context Verdict wait here for your judgement."
+                />
+              )}
+            </Panel>
             <Panel
               title="Recent activity"
               description="Events recorded by background operations"

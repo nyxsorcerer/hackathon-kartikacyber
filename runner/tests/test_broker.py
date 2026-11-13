@@ -65,7 +65,7 @@ def test_rotated_cache_survives_broker_output_validation_failure(tmp_path):
             return {"result":{"unexpected":"invalid application output"},"outputs":[],"credential":{"auth_json":{"tokens":{"access_token":"rotated-private-value","refresh_token":"rotated-private-refresh"}}}}
     app=create_app("protected-test-token",tmp_path,engine=NativeEngine())
     headers={"X-Broker-Token":"protected-test-token"}
-    body={"attempt_token":"native-bad-output","kind":"agent","profile":{"agent":"codex","auth_type":"native_oauth","operation":"commit_analysis","model_id":"m","credential":{"auth_json":{"tokens":{"access_token":"original-private-value","refresh_token":"original-private-refresh"}}}},"output_schema":{"type":"object","required":["required_field"]}}
+    body={"attempt_token":"native-bad-output","kind":"agent","profile":{"agent":"codex","auth_type":"native_oauth","operation":"audit_context","model_id":"m","credential":{"auth_json":{"tokens":{"access_token":"original-private-value","refresh_token":"original-private-refresh"}}}},"output_schema":{"type":"object","required":["required_field"]}}
     with TestClient(app) as client:
         run=client.post('/internal/runs',headers=headers,json=body).json()['run_id']
         for _ in range(100):
@@ -77,6 +77,30 @@ def test_rotated_cache_survives_broker_output_validation_failure(tmp_path):
         assert state['status']=='failed' and state['credential_updated']
         assert 'rotated-private-value' not in response.text
         assert client.get('/internal/runs/'+run+'/credential',headers=headers).json()['credential']['auth_json']['tokens']['access_token']=='rotated-private-value'
+
+
+def test_triage_reply_passes_through_without_the_triage_schema(tmp_path):
+    import time
+    replies=iter([{"reply":"Not JSON: application code judges this"}, {"decision":"unrelated"}])
+    class TriageEngine(OfflineEngine):
+        def run(self,*_args):
+            return {"result":next(replies),"outputs":[]}
+    app=create_app("protected-test-token",tmp_path,engine=TriageEngine())
+    headers={"X-Broker-Token":"protected-test-token"}
+    schema={"type":"object","required":["decision"],"additionalProperties":False,"properties":{"decision":{"type":"string"}}}
+    profile={"agent":"pi","provider_id":"deepseek","operation":"commit_triage","model_id":"m","credential":{"api_key":"k"}}
+    with TestClient(app) as client:
+        states=[]
+        for token in ("triage-reply","triage-object"):
+            run=client.post('/internal/runs',headers=headers,json={"attempt_token":token,"kind":"agent","profile":profile,"output_schema":schema}).json()['run_id']
+            for _ in range(100):
+                state=client.get('/internal/runs/'+run,headers=headers).json()
+                if state['status'] in {'succeeded','failed'}:
+                    break
+                time.sleep(.01)
+            states.append(state)
+    assert (states[0]['status'],states[0]['result'])==('succeeded',{"reply":"Not JSON: application code judges this"})
+    assert states[1]['status']=='failed'  # Anything but {reply} is a broken workload, even if it fits the schema.
 
 
 LOGIN_RUN = {"attempt_token":"login","kind":"account_login","profile":{"agent":"claude","provider_id":"claude","auth_type":"native_oauth"}}

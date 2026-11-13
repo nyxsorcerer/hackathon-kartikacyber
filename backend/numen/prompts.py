@@ -31,7 +31,6 @@ OPERATIONS = (
 )
 VARIABLES = {
     "operation": "The operation's name, such as commit_analysis.",
-    "build": "True when the run has a build sandbox: a shell, git and a private Docker daemon.",
     "required_files": "The files a finding bundle must include.",
     "facts": "This run's facts, such as facts.commit_revision. Numen also appends them after the prompt.",
 }
@@ -40,20 +39,17 @@ DESCRIPTIONS = {
     "attack-path": "Tracing attacker, source, sink and boundary, and what a reproduction must prove.",
     "bundle": "The finding bundle contract the lab verifier enforces.",
     "source-pin": "What the source_pin fact says about the revision to bundle.",
-    "build-sandbox": "What a build run provides and how to iterate in it.",
     "audit-context": "What a supplied audit context is and how far to trust it.",
     "audit": "Rules shared by the three audit phases.",
-    "commit_triage": "Classifies whether a commit is security relevant.",
-    "commit_analysis": "Investigates one commit, reproducing a finding in the build sandbox.",
-    "cve_analysis": "Builds an n-day finding bundle for a CVE.",
+    "commit_triage": "Triage: decides, with no tools, whether a commit deserves Analysis.",
+    "commit_analysis": "Analyses one commit read-only, returns its Verdict and drafts its Proof bundle or Detection rule.",
+    "cve_analysis": "Drafts an n-day finding bundle for a CVE, read-only.",
     "finding_artifacts": "Regenerates the bundle of an existing finding.",
     "version_recipe": "Writes the script that detects a target's version.",
     "audit_orientation": "Selects the significant functions an audit examines.",
     "audit_function": "Analyzes one selected function.",
     "audit_synthesis": "Combines the function analyses into the audit report.",
 }
-# Operations whose jobs run with a build sandbox, so a preview renders them that way.
-BUILD_OPERATIONS = ("commit_analysis", "cve_analysis")
 SOURCE_LIMIT = 100_000
 # The runner accepts a prompt of 262144 characters, facts included.
 RENDERED_LIMIT = 150_000
@@ -105,10 +101,9 @@ def overrides(db):
     return {name: entry["source"] for name, entry in saved(db).items() if name in defaults()}
 
 
-def context(operation, facts=None, build=False):
+def context(operation, facts=None):
     return {
         "operation": operation,
-        "build": build,
         "required_files": list(artifacts.REQUIRED),
         "facts": facts or {},
     }
@@ -130,13 +125,14 @@ def render(operation, values, sources):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def prompt(db, operation, facts, build=False):
+def prompt(db, operation, facts):
     """The operation's prompt with this run's facts, and the customized templates it used."""
     custom = overrides(db)
     sources = {**defaults(), **custom}
-    text = render(operation, context(operation, facts, build), sources)
+    text = render(operation, context(operation, facts), sources)
     used = sorted(closure(operation, sources) & set(custom))
-    return text + "\n\nFacts:\n" + json.dumps(facts, sort_keys=True, default=str), used
+    # Unescaped, so a non-ASCII diff counts one character each against the runner's prompt bound.
+    return text + "\n\nFacts:\n" + json.dumps(facts, sort_keys=True, default=str, ensure_ascii=False), used
 
 
 def check(name, source, sources):
@@ -167,13 +163,12 @@ def check(name, source, sources):
     candidate = {**sources, name: source}
     for operation in OPERATIONS:
         if name in closure(operation, candidate):
-            for build in (False, True):
-                if len(render(operation, context(operation, build=build), candidate)) > RENDERED_LIMIT:
-                    raise DomainError(
-                        "prompt_too_large",
-                        f"The {operation} prompt would exceed {RENDERED_LIMIT} characters",
-                        422,
-                    )
+            if len(render(operation, context(operation), candidate)) > RENDERED_LIMIT:
+                raise DomainError(
+                    "prompt_too_large",
+                    f"The {operation} prompt would exceed {RENDERED_LIMIT} characters",
+                    422,
+                )
 
 
 def item(name, entries, sources):
@@ -228,7 +223,7 @@ def store(db, name, source):
     return previous, item(name, entries, {**defaults(), **overrides(db)})
 
 
-def preview(db, operation, name=None, source=None, build=None):
+def preview(db, operation, name=None, source=None):
     """Renders `operation` as a job would, with an unsaved draft of `name` when given."""
     if operation not in OPERATIONS:
         raise DomainError("not_found", "There is no agent operation with that name", 404)
@@ -238,10 +233,8 @@ def preview(db, operation, name=None, source=None, build=None):
             raise DomainError("not_found", "There is no prompt template with that name", 404)
         check(name, source, sources)
         sources[name] = source
-    build = operation in BUILD_OPERATIONS if build is None else build
-    text = render(operation, context(operation, build=build), sources)
+    text = render(operation, context(operation), sources)
     return {
         "prompt": text + "\n\nFacts:\n(Numen appends this run's facts as JSON)",
         "templates": sorted(closure(operation, sources)),
-        "build": build,
     }

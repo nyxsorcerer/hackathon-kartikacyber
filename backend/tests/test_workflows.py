@@ -156,7 +156,7 @@ def test_profile_runtime_effort_and_frozen_retry(system):
     profile = connection(
         app,
         {
-            "codex": [
+            "pi": [
                 {
                     "id": "test-model",
                     "name": "Test",
@@ -164,12 +164,12 @@ def test_profile_runtime_effort_and_frozen_retry(system):
                     "default_effort": "high",
                 }
             ],
-            "pi": [
+            "codex": [
                 {
                     "id": "test-model",
                     "name": "Test",
-                    "reasoning_efforts": [],
-                    "default_effort": None,
+                    "reasoning_efforts": ["xhigh"],
+                    "default_effort": "xhigh",
                 }
             ],
         },
@@ -183,7 +183,8 @@ def test_profile_runtime_effort_and_frozen_retry(system):
         ).status_code
         == 422
     )
-    assert client.post(endpoint, json={"profile": {**profile, "agent": "pi"}}).status_code == 422
+    # Efforts come from the selected runtime's catalog: xhigh is only in Codex's.
+    assert client.post(endpoint, json={"profile": {**profile, "reasoning_effort": "xhigh"}}).status_code == 422
     queued = client.post(endpoint, json={}, headers={"Idempotency-Key": "analysis-once"}).json()[
         "job_id"
     ]
@@ -191,7 +192,7 @@ def test_profile_runtime_effort_and_frozen_retry(system):
         "job_id"
     ]
     assert queued == same
-    broker = FixtureBroker(result={"category": "invented category"})
+    broker = FixtureBroker(result={"verdict": "invented verdict"})
     run_once(config, app.state.factory, broker)
     failed = client.get(f"/api/jobs/{queued}").json()
     assert failed["status"] == "failed" and failed["error"]["code"] == "invalid_agent_output"
@@ -200,7 +201,7 @@ def test_profile_runtime_effort_and_frozen_retry(system):
     assert client.get(f"/api/jobs/{retry}").json()["profile"] == failed["profile"]
 
 
-def test_explicit_commit_analysis_retains_report_and_category(system):
+def test_explicit_commit_analysis_retains_report_and_verdict(system):
     app, client, config = system
     profile = connection(app)
     p = application(client)
@@ -217,15 +218,12 @@ def test_explicit_commit_analysis_retains_report_and_category(system):
         "job_id"
     ]
     result = {
-        "category": "Likely vulnerability fix",
+        "verdict": "Insufficient context",
         "title": "Potential input validation weakness",
-        "finding_decision": "needs_more_evidence",
-        "finding_reason": "Before/after evidence does not yet establish an exploit",
         "vulnerable_ref": None,
-        "reproduction": {"status": "not_run", "summary": "Source comparison only"},
         "summary": "Input conversion prevents misuse",
         "evidence": [{"path": "main.py", "lines": [1, 2]}],
-        "confidence": {"level": "medium", "basis": "Before/after source"},
+        "confidence": "medium",
         "open_questions": [],
         "before_after": "Added conversion",
         "affected_behavior": "Input parsing",
@@ -235,7 +233,7 @@ def test_explicit_commit_analysis_retains_report_and_category(system):
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == "succeeded", job
     analysis = client.get(f"/api/commits/{commit_id}").json()["analyses"][0]
-    assert analysis["result"]["category"] == result["category"]
+    assert analysis["result"]["verdict"] == result["verdict"]
     assert analysis["profile"] == profile
     report = next(a for a in analysis["artifacts"] if a["path"] == "report.md")
     assert b"Pinned source" in client.get(f"/api/artifacts/{report['id']}/content").content
@@ -1395,7 +1393,7 @@ def test_first_baseline_imports_no_history_and_queues_no_ai_jobs(system, monkeyp
     app, client, config = system
     connection(app)
     github_account(app)
-    p = application(client, config={"triage_mode": "codex"})
+    p = application(client, config={"triage_mode": "pi"})
     head = "a" * 40
     original = Sources.__init__
 
@@ -1418,7 +1416,7 @@ def test_first_baseline_imports_no_history_and_queues_no_ai_jobs(system, monkeyp
 def test_genuine_head_advance_automatic_triage_runs_broker(system, monkeypatch):
     app, client, config = system
     connection(app)
-    p = application(client, config={"triage_mode": "codex"})
+    p = application(client, config={"triage_mode": "pi"})
     source_snapshot(app, p["id"], "a" * 40)
     head = "b" * 40
     monkeypatch.setattr(Sources, "github_commits", lambda *_: (head, [source_record(head)], None))
@@ -1429,11 +1427,11 @@ def test_genuine_head_advance_automatic_triage_runs_broker(system, monkeypatch):
     )
     broker = FixtureBroker(
         {
-            "decision": "security_candidate",
-            "change_kind": "vulnerability_fix",
-            "title": "Potential input trust boundary vulnerability",
-            "reason": "Input trust boundary changed",
-            "confidence": {"level": "medium", "basis": "Complete diff"},
+            "reply": json.dumps({
+                "decision": "security_candidate",
+                "title": "Potential input trust boundary vulnerability",
+                "reason": "Input trust boundary changed",
+            })
         }
     )
     run_once(config, app.state.factory, broker)
@@ -1446,7 +1444,9 @@ def test_genuine_head_advance_automatic_triage_runs_broker(system, monkeypatch):
     )
     assert revised["triage_result"]["revision"] == head
     assert revised["review_decision"] == "candidate"
-    assert all(job["kind"] != "commit_analysis" for job in client.get("/api/jobs").json()["items"])
+    # The flag queues one automatic Analysis, not run here: no snapshot of the head is stored.
+    (analysis,) = [job for job in client.get("/api/jobs").json()["items"] if job["kind"] == "commit_analysis"]
+    assert analysis["status"] == "queued" and analysis["subject"]["ref"] == head[:10]
 
 
 def test_historical_pinned_commit_job_remains_valid_after_current_head_advances(system):
@@ -1485,15 +1485,12 @@ def test_historical_pinned_commit_job_remains_valid_after_current_head_advances(
             {"audit-context-building.md": b"# Historical context pinned to revision A"},
         )
     result = {
-        "category": "Likely vulnerability fix",
+        "verdict": "Insufficient context",
         "title": "Potential input validation weakness",
-        "finding_decision": "needs_more_evidence",
-        "finding_reason": "Before/after evidence does not yet establish an exploit",
         "vulnerable_ref": None,
-        "reproduction": {"status": "not_run", "summary": "Source comparison only"},
         "summary": "Input conversion",
         "evidence": [{"path": "main.py", "lines": [1, 2]}],
-        "confidence": {"level": "medium", "basis": "Pinned complete source"},
+        "confidence": "medium",
         "open_questions": [],
         "before_after": "Added conversion",
         "affected_behavior": "Input parsing",

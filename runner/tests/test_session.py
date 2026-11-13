@@ -13,13 +13,15 @@ SCHEMA = {"type": "object", "required": ["category"], "properties": {"category":
 def test_interactive_argv_drops_print_mode_and_keeps_policy(tmp_path):
     schema = tmp_path / "schema.json"
     schema.write_text('{"type":"object"}')
-    claude = session.agent_argv(agent_argv({"agent": "claude", "model_id": "m", "auth_type": "api_key", "operation": "commit_triage"},
-                                           str(schema), session=True), "claude")
-    assert not {"--print", "--output-format", "--json-schema", "--no-session-persistence"} & set(claude)
+    claude = session.agent_argv(agent_argv({"agent": "claude", "model_id": "m", "auth_type": "api_key", "operation": "commit_analysis"},
+                                           str(schema)), "claude")
+    assert not {"--print", "--output-format", "--json-schema", "--no-session-persistence", "--allowedTools"} & set(claude)
     assert '{"type":"object"}' not in claude
     assert claude[claude.index("--tools") + 1] == "Read,Grep,Glob,Write,Edit"  # writes its result file
-    assert {"--permission-mode", "--restricted", "--strict-mcp-config", "--bare"} <= set(claude)
-    codex = session.agent_argv(agent_argv({"agent": "codex", "model_id": "m", "operation": "commit_triage"}, session=True), "codex")
+    # The session keeps the print run's permission rules: writes are approved under outputs/ only.
+    assert json.loads(claude[claude.index("--settings") + 1]) == {"permissions": {"allow": ["Edit(//workspace/outputs/**)"]}}
+    assert {"--permission-mode", "--restricted", "--strict-mcp-config"} <= set(claude) and "--bare" not in claude
+    codex = session.agent_argv(agent_argv({"agent": "codex", "model_id": "m", "operation": "audit_context"}), "codex")
     assert not {"exec", "--json", "--output-schema", "--output-last-message", "-", "never"} & set(codex)
     assert 'permissions.numen.extends=":workspace"' in codex and 'approval_policy="never"' in codex
     pi = session.agent_argv(agent_argv({"agent": "pi", "model_id": "m", "provider_id": "deepseek", "operation": "cve_analysis"}), "pi")

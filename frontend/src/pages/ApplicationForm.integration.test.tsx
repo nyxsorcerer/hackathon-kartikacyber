@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
@@ -68,6 +68,12 @@ it("saves an Application without repositories and retains field values after ser
   await user.type(screen.getByLabelText("Product name"), "Example plugin");
   // Repositories are linked from the Application's page, not this form.
   expect(screen.queryByLabelText("Source type")).not.toBeInTheDocument();
+  // Triage on Codex is refused: it has no flag that removes its shell.
+  expect(
+    within(screen.getByLabelText("Triage mode")).queryByRole("option", {
+      name: "Codex CLI",
+    }),
+  ).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Save application" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
     "Asset URL is not permitted",
@@ -175,4 +181,53 @@ it("enters the interval in minutes, hours or days and keeps it after a field err
     await screen.findByRole("heading", { name: "Saved application" }),
   ).toBeInTheDocument();
   expect(submissions[1]).toMatchObject({ monitor_interval_seconds: 300 });
+});
+it("names a stored Codex Triage mode and asks for another one", async () => {
+  const application = {
+    id: "app-1",
+    asset_name: "Customer portal",
+    asset_url: "https://portal.example.test",
+    product_kind: "cms",
+    product_name: "Example CMS",
+    monitor_interval_seconds: 3600,
+    monitor_enabled: true,
+    archived: false,
+    source_generation: 1,
+    last_check_at: null,
+    next_check_at: null,
+    repositories: [],
+    version: null,
+    config: { triage_mode: "codex" },
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const body =
+        url === "/api/applications/app-1"
+          ? application
+          : url === "/api/settings"
+            ? { monitor_interval_seconds: 3600, default_profiles: {} }
+            : { items: [], next_cursor: null };
+      return new Response(JSON.stringify(body));
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={["/applications/app-1/edit"]}>
+      <Routes>
+        <Route path="/applications/:id/edit" element={<ApplicationForm />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  const mode = await screen.findByLabelText("Triage mode");
+  expect(mode).toHaveValue("codex");
+  expect(
+    within(mode).getByRole("option", { name: /Codex CLI/ }),
+  ).toBeDisabled();
+  expect(
+    screen.getByText(/Choose another Triage mode to save/),
+  ).toBeInTheDocument();
+  await userEvent.setup().selectOptions(mode, "jev");
+  expect(
+    screen.queryByText(/Choose another Triage mode to save/),
+  ).not.toBeInTheDocument();
 });

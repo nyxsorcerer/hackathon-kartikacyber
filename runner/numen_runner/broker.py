@@ -165,7 +165,11 @@ def create_app(token=None, state_path=None, engine=None, execute=True, reconcile
             if len(json.dumps(result).encode()) + sum(o["size"] for o in outputs) > request.bounds["output_bytes"]:
                 from .engine import RuntimeFailure
                 raise RuntimeFailure("output_limit", "Result and artifacts exceed the configured output byte limit.")
-            if request.kind not in {"capabilities", "account_login"}:
+            if request.kind == "agent" and request.profile.operation == "commit_triage":
+                # Triage returns its raw reply: application code validates it against the Triage schema.
+                if not (isinstance(result, dict) and set(result) == {"reply"} and isinstance(result["reply"], str)):
+                    raise ValueError("Triage result is not its reply text")
+            elif request.kind not in {"capabilities", "account_login"}:
                 Draft202012Validator(request.output_schema).validate(result)
             completion = {"status": "succeeded", "result": result, "outputs": outputs,
                           "execution": envelope.get("execution"), "credential_updated": bool(credential)}

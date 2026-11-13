@@ -43,38 +43,28 @@ def test_internal_failures_report_their_cause(tmp_path,monkeypatch,capsys,error,
     assert failure=={"code":"workload_failed","message":message}
 
 
-@pytest.mark.parametrize("loaded", [True, False])
-def test_build_prompt_states_the_base_outcome_and_builds_in_both_branches(loaded, monkeypatch, tmp_path):
-    """The conditional once concatenated a literal onto a call and raised TypeError at run time."""
-    from numen_runner import workload
-
-    job = {
-        "kind": "agent", "prompt": "Perform Numen operation cve_analysis.", "build": True,
-        "lab_base_loaded": loaded, "output_schema": {"type": "object"}, "inputs": [],
-        "inputs_materialized": True,
-        "limits": {"timeout_seconds": 10800, "memory_mb": 1024, "cpus": 1, "pids": 128,
-                   "output_bytes": 1024, "input_bytes": 1024},
-        "profile": {"agent": "pi", "provider_id": "openai", "auth_type": "api_key",
-                    "model_id": "m", "operation": "cve_analysis", "credential": {"api_key": "k"},
-                    "enabled_plugins": [], "reasoning_effort": None},
-    }
-    seen = {}
-
-    monkeypatch.setattr(workload, "setup_auth", lambda *_: None)
-    monkeypatch.setattr(workload, "capabilities", lambda *_a, **_k: {
-        "status": "ready", "models": [{"id": "m", "reasoning_efforts": []}]})
-    monkeypatch.setattr(workload, "output_files", lambda *_a, **_k: [])
-    monkeypatch.setattr(workload, "agent_result", lambda *_a, **_k: {"ok": True})
-
-    def capture(argv, env, prompt=None, timeout=None, events=None):
-        seen["prompt"] = prompt
-        return 0, "{}", b""
-
-    monkeypatch.setattr(workload, "run_process", capture)
+def test_triage_returns_the_raw_reply_without_schema_validation(tmp_path, monkeypatch):
+    """Triage is one tool-less call: its reply text is the result, and application code validates it."""
     monkeypatch.setattr(workload, "WORK", tmp_path)
-    workload.execute(job)
-    prompt = seen["prompt"]
-    assert "DOCKER_HOST" in prompt and "/workspace/share" in prompt
-    assert ("is already loaded" in prompt) is loaded
-    assert ("NOT available" in prompt) is (not loaded)
-    assert "10800 seconds" in prompt
+    monkeypatch.setattr(workload, "setup_auth", lambda p, env: None)
+    monkeypatch.setattr(workload, "capabilities", lambda p, env, timeout: {
+        "status": "ready", "models": [{"id": "m", "reasoning_efforts": []}]})
+    replies, calls = ["Not JSON, and no schema check here.", "Leaked synthetic-key-not-real"], []
+
+    def run(argv, env, data=None, timeout=1800, max_bytes=0, events=None):
+        calls.append((argv, data, timeout))
+        return 0, json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": replies[len(calls) - 1]}), ""
+
+    monkeypatch.setattr(workload, "run_process", run)
+    job = {"kind": "agent", "inputs": [], "prompt": "Triage this change.",
+           "limits": {"input_bytes": 1024, "output_bytes": 1024, "timeout_seconds": 120},
+           "output_schema": {"type": "object", "required": ["decision"]},
+           "profile": {"agent": "claude", "provider_id": "claude", "auth_type": "api_key", "model_id": "m",
+                       "operation": "commit_triage", "credential": {"api_key": "synthetic-key-not-real"}}}
+    assert workload.execute(job) == {"result": {"reply": replies[0]}, "outputs": []}
+    (argv, prompt, timeout), = calls
+    assert argv[argv.index("--tools") + 1] == "" and timeout == 120
+    assert prompt.endswith("You have no tools. Reply with only one JSON object matching the schema.")
+    assert "result_json" not in prompt and '"required": ["decision"]' in prompt
+    with pytest.raises(ValueError, match="credential material detected"):
+        workload.execute(job)

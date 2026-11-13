@@ -1571,6 +1571,25 @@ td:first-child {
   align-items: center;
   gap: 10px 14px;
 }
+/* Pre-filter flags beside a Triage result, and the rules with their paths */
+.prefilter-flags {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.prefilter-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.prefilter-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 10px;
+}
 .analysis-entry {
   display: flex;
   flex-direction: column;
@@ -1582,19 +1601,6 @@ td:first-child {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px 10px;
-}
-.analysis-category {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 16px;
-}
-.analysis-category::before {
-  content: "";
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--tone);
 }
 .analysis-summary {
   max-width: 80ch;

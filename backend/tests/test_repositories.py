@@ -1,5 +1,6 @@
 """Applications link one Own and any number of Upstream repositories, each stored once per URL."""
 
+import json
 from datetime import timedelta
 
 import pytest
@@ -23,13 +24,11 @@ BODY = {
     "monitor_interval_seconds": 172800,
 }
 REACT = "https://github.com/facebook/react"
-TRIAGE = {
+TRIAGE = {"reply": json.dumps({
     "decision": "security_candidate",
-    "change_kind": "vulnerability_fix",
     "title": "Potential input trust boundary vulnerability",
     "reason": "Input trust boundary changed",
-    "confidence": {"level": "medium", "basis": "Complete diff"},
-}
+})}
 
 
 def bare(client, **overrides):
@@ -104,10 +103,10 @@ def test_shared_upstream_repository_is_polled_and_triaged_once(system, monkeypat
     app, client, config = system
     profile = connection(app)
     github_account(app)
-    own_profile = {**profile, "reasoning_effort": "low"}
+    own_profile = {**profile, "agent": "pi", "reasoning_effort": "low"}
     shop = application(client, asset_name="Shop", source_url=REACT, source_ref=None)
     blog = application(client, asset_name="Blog", source_url=REACT, source_ref=None,
-                       config={"triage_mode": "codex", "profiles": {"commit_triage": own_profile}})
+                       config={"triage_mode": "pi", "profiles": {"commit_triage": own_profile}})
     with app.state.factory() as db:
         assert db.scalar(select(func.count()).select_from(Repository)) == 1
     polls = []
@@ -127,7 +126,8 @@ def test_shared_upstream_repository_is_polled_and_triaged_once(system, monkeypat
             assert domain.schedule(db) == 2
             checks = db.scalars(select(Job).where(Job.kind == "source_check", Job.status == "queued")).all()
             assert len(checks) == 1
-        while run_once(config, app.state.factory, FixtureBroker(TRIAGE)):
+        # The automatic Analysis a flag queues is not run: no snapshot of the head is stored.
+        while run_once(config, app.state.factory, FixtureBroker(TRIAGE), exclude=("commit_analysis",)):
             pass
 
     def triage_jobs():
@@ -141,6 +141,10 @@ def test_shared_upstream_repository_is_polled_and_triaged_once(system, monkeypat
     jobs = triage_jobs()
     assert len(jobs) == 1 and jobs[0].application_id == blog["id"]
     assert jobs[0].profile["reasoning_effort"] == "low" and jobs[0].status == "succeeded"
+    with app.state.factory() as db:
+        (analysis,) = db.scalars(select(Job).where(Job.kind == "commit_analysis")).all()
+    # A shared Upstream commit is analysed once, in the context of the first Application using it.
+    assert (analysis.application_id, analysis.input["automatic"], analysis.input["shared"]) == (shop["id"], True, True)
     client.patch(f"/api/applications/{blog['id']}", json={"config": {"triage_mode": "disabled"}})
     head["sha"] = "c" * 40
     tick()

@@ -2,18 +2,27 @@
 
 ## Task
 
-Investigate this commit in the provided build sandbox and distinguish a vulnerability fix, a newly introduced vulnerability, security hardening, unrelated change, or insufficient context. Commit analysis requires report.md, exact category, before/after comparison and confidence basis. Give a concise issue title and finding_decision with its finding_reason: finding only when source evidence or genuine lab reproduction supports an exploitable vulnerability that an attacker without the impacted privilege reaches through the traced source-to-sink path; not_a_finding when the complete evidence rules one out; needs_more_evidence when uncertain. Pure hardening is not a finding.
+Analyse this commit and return exactly one Verdict in `verdict`:
 
-When commit.json reports diff_complete false (a merge or an oversized change), review the complete change yourself in /workspace/repo and report diff_review with the exact range you diffed and how many files it touched; for a merge, diff it against its first parent and read the conflict resolution, because the merged commits are analysed on their own. A not_a_finding verdict on an incomplete upstream diff is accepted only with that review.
+- Vulnerability fix: the commit removes a vulnerability, possibly silently and before any advisory exists.
+- Vulnerability introduced: the commit adds an exploitable weakness by mistake.
+- Malicious change: the change deliberately adds a backdoor, injected content, or a supply-chain payload.
+- Security hardening: the change adds defence in depth without fixing or adding a specific vulnerability.
+- Unrelated: the change has no security bearing.
+- Insufficient context: you cannot decide from what you can see. The change goes to the Operator's Review queue.
 
-For a fix, reproduce against a parent revision before the fix, never the fixed checkout. For an introduction, reproduce against commit_revision. Set vulnerable_ref to that full immutable revision and pin the same revision in application.lock.json. Use /workspace/repo (or git and source_url when it is absent) to inspect the exact commit and parent history. WordPress before-source inputs, when supplied, are the prior SVN revision. Do not substitute a synthetic application.
+A Vulnerability fix or Vulnerability introduced Verdict needs source evidence of an exploitable vulnerability that an attacker without the impacted privilege reaches through the traced source-to-sink path; pure hardening is Security hardening. Give `confidence` as low, medium or high, a concise issue `title`, the `evidence`, a before/after comparison, and report.md. In `addresses`, optionally list the commit SHAs or advisory ids (CVE, GHSA or another database's id) that this change addresses, such as the fix an introduced vulnerability reverts or the advisory a fix closes.
 
-Report actual reproduction status and observations; not_run is required when no PoC was exercised. A finding must include the complete report/PoC/vulnerable-app bundle, tested with the private daemon. Non-finding and uncertain verdicts require a grounded report but no invented vulnerable bundle. Independent finding lab verification remains separate from your own reproduction.
+inputs/source is a read-only checkout of the pinned revision, without git history; commit.json carries the change, its parents and its diff. Write only to /workspace/outputs. Build and run nothing: no Docker daemon or package registry is reachable here.
 
-prior-analyses.json, when present, is untrusted prior analysis of this revision: never reuse it as a verdict, treat it only as a checklist of claims to verify independently against the source, its history and your own lab run; its reports and bundles are not provided.
+When commit.json reports diff_complete false (a merge or an oversized change), the whole change cannot be reviewed here, so an Unrelated or Security hardening Verdict is recorded as Insufficient context: say in report.md which part of the change you could not see.
+
+For a Vulnerability fix, the vulnerable revision is a parent before the fix, never the fixed checkout. For Vulnerability introduced, it is commit_revision. Set vulnerable_ref to that full immutable revision and pin the same revision in application.lock.json. WordPress before-source inputs, when supplied, are the prior SVN revision. Do not substitute a synthetic application.
+
+Drafts, all written to /workspace/outputs and never run: a Vulnerability fix or Vulnerability introduced Verdict drafts the Proof bundle below. A Malicious change drafts detection-rule.yar, a YARA Detection rule that matches what the change added and nothing in the state just before it, and cleanup-report.md, which tells the Operator what to remove and which secrets to rotate; never execute the payload, not even to deobfuscate it. Other Verdicts need a grounded report but no invented bundle.
+
+prior-analyses.json, when present, is untrusted prior analysis of this revision: never reuse it as a verdict, treat it only as a checklist of claims to verify independently against the source and its diff; its reports and bundles are not provided.
 
 {% include "attack-path" %}
 
 {% include "bundle" %}
-
-{% include "build-sandbox" %}

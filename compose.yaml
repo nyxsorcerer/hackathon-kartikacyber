@@ -142,12 +142,6 @@ services:
     build: {context: ., dockerfile: Dockerfile.runner, target: codex}
     command: [codex, --version]
     network_mode: none
-  dind-image:
-    image: asset-monitor-dind:0.1.0
-    profiles: [images]
-    build: {context: ., dockerfile: Dockerfile.runner, target: dind}
-    entrypoint: [docker, --version]
-    network_mode: none
   probe-image:
     image: asset-monitor-probe:0.1.0
     profiles: [images]

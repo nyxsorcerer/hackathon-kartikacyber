@@ -171,7 +171,6 @@ function TemplateEditor({
   const [previewIn, setPreviewIn] = useState(targets[0] || "");
   const [preview, setPreview] = useState<{
     prompt: string;
-    build: boolean;
     of: string;
   }>();
   const related =
@@ -349,9 +348,9 @@ function TemplateEditor({
             </li>
           ))}
           <li>
-            <code>{"{% if build %}…{% endif %}"}</code> keeps text only when the
-            condition holds; <code>{"{# note #}"}</code> is a comment jobs never
-            see.
+            <code>{"{% if facts.audit_context %}…{% endif %}"}</code> keeps text
+            only when the condition holds; <code>{"{# note #}"}</code> is a
+            comment jobs never see.
           </li>
         </ul>
       </details>
@@ -393,10 +392,7 @@ function TemplateEditor({
         {preview ? (
           <>
             <p className="hint">
-              {wordCount(preview.prompt).toLocaleString()} words ·{" "}
-              {preview.build
-                ? "rendered as a build run"
-                : "rendered without a build sandbox"}
+              {wordCount(preview.prompt).toLocaleString()} words
               {preview.of !== `${previewIn}\n${draft}` &&
                 " · out of date, refresh to include your latest edits"}
             </p>

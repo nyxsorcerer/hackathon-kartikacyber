@@ -46,11 +46,11 @@ const records = ["alpha", "beta"].map((id) => ({
       id === "alpha"
         ? "Potential path traversal through template selection"
         : "Potential authorization bypass in partner login",
-    change_kind:
-      id === "alpha" ? "vulnerability_fix" : "vulnerability_introduction",
     reason: "A trust boundary changed",
-    confidence: { level: "medium" },
   },
+  verdict: null,
+  analysis_state: null,
+  prefilter: [],
   analyses: [],
 }));
 function fixture() {
@@ -114,9 +114,10 @@ it("starts with application selection and reviews only the chosen application's 
   ).not.toBeInTheDocument();
 });
 
-it("presents finding and hardening verdicts separately and selects one report at a time", async () => {
+it("presents each Verdict with its confidence and selects one report at a time", async () => {
   const commit = {
     ...records[0],
+    verdict: "Security hardening",
     analyses: [
       {
         id: "hardening",
@@ -124,17 +125,12 @@ it("presents finding and hardening verdicts separately and selects one report at
         created_at: "2026-10-06T00:00:00Z",
         result: {
           title: "Restrict template names to the registered allowlist",
-          category: "Security hardening",
+          verdict: "Security hardening",
+          confidence: "high",
           summary: "Defensive restriction without an established exploit",
-          finding_decision: "not_a_finding",
-          finding_reason: "No reachable vulnerable behavior was demonstrated",
           before_after: "Free-form names are now restricted",
           affected_behavior: "Template selection",
-          confidence: { level: "high" },
-          reproduction: {
-            status: "not_run",
-            summary: "No vulnerability to reproduce",
-          },
+          evidence: [],
         },
         artifacts: [
           {
@@ -149,19 +145,17 @@ it("presents finding and hardening verdicts separately and selects one report at
         id: "finding-run",
         job_id: "job-finding",
         created_at: "2026-10-05T00:00:00Z",
+        // Carried over from Numen: its confidence is unknown.
         result: {
           title: "Path traversal through template file inclusion",
-          category: "Likely vulnerability fix",
+          verdict: "Vulnerability fix",
+          confidence: "unknown",
+          numen_confidence: { level: "high" },
           summary: "The parent revision accepts traversal sequences",
           finding_decision: "finding",
-          finding_reason: "The PoC reproduces the include in the parent",
           finding_id: "finding-1",
           vulnerable_ref: "f".repeat(40),
-          confidence: { level: "high" },
-          reproduction: {
-            status: "reproduced",
-            summary: "Reproduced against the pinned vulnerable parent",
-          },
+          addresses: ["GHSA-abcd-efgh-ijkl"],
         },
         artifacts: [
           {
@@ -215,16 +209,24 @@ it("presents finding and hardening verdicts separately and selects one report at
   expect(
     screen.queryByRole("heading", { name: "Vulnerability report" }),
   ).not.toBeInTheDocument();
-  expect(
-    within(screen.getByRole("region", { name: "Analysis summary" })).getByText(
-      "Not a finding",
-    ),
-  ).toBeInTheDocument();
+  const summary = () =>
+    screen.getByRole("region", { name: "Analysis summary" });
+  expect(within(summary()).getByText("Security hardening")).toBeInTheDocument();
+  expect(within(summary()).getByText("High confidence")).toBeInTheDocument();
+  expect(within(summary()).queryByText("Finding decision")).toBeNull();
   await userEvent
     .setup()
     .selectOptions(screen.getByLabelText("Analysis run"), "finding-run");
   expect(
     await screen.findByRole("heading", { name: "Vulnerability report" }),
+  ).toBeInTheDocument();
+  expect(within(summary()).getByText("Vulnerability fix")).toBeInTheDocument();
+  expect(within(summary()).getByText("Unknown confidence")).toBeInTheDocument();
+  expect(
+    within(summary()).getByText("GHSA-abcd-efgh-ijkl"),
+  ).toBeInTheDocument();
+  expect(
+    within(summary()).getByText(/Drafts are not reproduced/),
   ).toBeInTheDocument();
   expect(
     screen.getByRole("link", { name: "View finding artifacts" }),
@@ -530,4 +532,247 @@ it("queues a detailed analysis for each selected revision and reports skipped on
   expect(
     screen.getByRole("checkbox", { name: "Select Change one" }),
   ).not.toBeChecked();
+});
+
+/** Serves one application queue and the page of each commit in it. */
+function serveQueue(queue: Record<string, unknown>[]) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const commit = queue.find((c) => url === `/api/commits/${String(c.id)}`);
+      const body =
+        commit ||
+        (url === "/api/applications/alpha"
+          ? applications[0]
+          : {
+              items: url.includes("/applications") ? applications : queue,
+              next_cursor: null,
+            });
+      return new Response(JSON.stringify(body));
+    }),
+  );
+}
+function change(name: string, fields: Record<string, unknown> = {}) {
+  return {
+    ...records[0],
+    id: `commit-${name}`,
+    message: `Change ${name}`,
+    triage_result: null,
+    review_decision: "pending",
+    ...fields,
+  };
+}
+function row(name: string) {
+  return screen
+    .getByRole("checkbox", { name: `Select Change ${name}` })
+    .closest("tr")!;
+}
+
+it("shows each Verdict with its confidence, migrated ones as unknown, and filters by Verdict", async () => {
+  serveQueue([
+    change("fix", {
+      verdict: "Vulnerability fix",
+      analyses: [
+        {
+          id: "migrated",
+          result: {
+            verdict: "Vulnerability fix",
+            confidence: "unknown",
+            numen_confidence: { level: "high" },
+          },
+        },
+      ],
+    }),
+    change("noise", {
+      verdict: "Unrelated",
+      analyses: [
+        { id: "a2", result: { verdict: "Unrelated", confidence: "high" } },
+      ],
+    }),
+    change("new"),
+  ]);
+  renderQueue("/reviews?application=alpha&decision=all");
+  await screen.findByRole("checkbox", { name: "Select Change fix" });
+  expect(within(row("fix")).getByText("Vulnerability fix")).toBeInTheDocument();
+  expect(
+    within(row("fix")).getByText("Unknown confidence"),
+  ).toBeInTheDocument();
+  expect(within(row("noise")).getByText("Unrelated")).toBeInTheDocument();
+  expect(within(row("noise")).getByText("High confidence")).toBeInTheDocument();
+  expect(within(row("new")).getByText("Not analysed")).toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.selectOptions(screen.getByLabelText("Verdict"), "Unrelated");
+  expect(row("noise")).toBeInTheDocument();
+  expect(
+    screen.queryByRole("checkbox", { name: "Select Change fix" }),
+  ).not.toBeInTheDocument();
+  await user.selectOptions(screen.getByLabelText("Verdict"), "none");
+  expect(row("new")).toBeInTheDocument();
+  expect(
+    screen.queryByRole("checkbox", { name: "Select Change noise" }),
+  ).not.toBeInTheDocument();
+});
+
+it("filters to the Review queue: Insufficient context Verdicts still pending", async () => {
+  serveQueue([
+    change("open", { verdict: "Insufficient context" }),
+    change("judged", {
+      verdict: "Insufficient context",
+      review_decision: "dismissed",
+    }),
+    change("fix", { verdict: "Vulnerability fix" }),
+  ]);
+  renderQueue("/reviews?application=alpha");
+  const user = userEvent.setup();
+  await user.selectOptions(await screen.findByLabelText("Show"), "review");
+  expect(
+    await screen.findByRole("checkbox", { name: "Select Change open" }),
+  ).toBeInTheDocument();
+  for (const name of ["judged", "fix"])
+    expect(
+      screen.queryByRole("checkbox", { name: `Select Change ${name}` }),
+    ).not.toBeInTheDocument();
+});
+
+it("lists a Pre-filter hit that Triage rejected with both results", async () => {
+  serveQueue([
+    change("ci", {
+      triage_result: {
+        decision: "unrelated",
+        title: "Bump the release workflow",
+        reason: "Version bump only",
+      },
+      review_decision: "dismissed",
+      prefilter: [
+        { rule: "ci_workflow", paths: [".github/workflows/release.yml"] },
+      ],
+    }),
+  ]);
+  render(
+    <MemoryRouter initialEntries={["/reviews?application=alpha&decision=all"]}>
+      <Routes>
+        <Route path="/reviews" element={<Reviews />} />
+        <Route path="/commits/:id" element={<CommitDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  const link = await screen.findByRole("link", {
+    name: "Bump the release workflow",
+  });
+  const cells = within(link.closest("tr")!);
+  expect(cells.getByText("Unrelated")).toBeInTheDocument();
+  expect(
+    within(cells.getByRole("list", { name: "Pre-filter flags" })).getByText(
+      "CI workflow",
+    ),
+  ).toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.click(link);
+  await user.click(await screen.findByRole("tab", { name: "Triage" }));
+  const pre = screen.getByRole("list", { name: "Pre-filter rules" });
+  expect(within(pre).getByText("CI workflow")).toBeInTheDocument();
+  expect(
+    within(pre).getByText(".github/workflows/release.yml"),
+  ).toBeInTheDocument();
+});
+
+it("shows a failed or blocked Triage with its reason, never as unrelated", async () => {
+  serveQueue([
+    change("failed", {
+      triage_status: "failed",
+      triage_result: {
+        error: "invalid_agent_output",
+        reason: "The reply did not match the Triage schema",
+        attempt: 1,
+        retry_job_id: "job-retry",
+      },
+    }),
+    change("blocked", {
+      triage_status: "blocked",
+      triage_result: {
+        error: "api_key_required",
+        reason:
+          "Automated runs use only Provider accounts that hold an API key",
+      },
+    }),
+  ]);
+  renderQueue("/reviews?application=alpha&decision=all");
+  await screen.findByRole("checkbox", { name: "Select Change failed" });
+  expect(within(row("failed")).getByText("Triage failed")).toBeInTheDocument();
+  expect(
+    within(row("failed")).getByText(
+      "The reply did not match the Triage schema",
+    ),
+  ).toBeInTheDocument();
+  expect(
+    within(row("blocked")).getByText("Triage blocked"),
+  ).toBeInTheDocument();
+  expect(
+    within(row("blocked")).getByText(
+      "Automated runs use only Provider accounts that hold an API key",
+    ),
+  ).toBeInTheDocument();
+  for (const name of ["failed", "blocked"])
+    expect(within(row(name)).queryByText(/unrelated/i)).not.toBeInTheDocument();
+});
+
+it("shows an Analysis that is queued, waits for a cap, timed out, or was blocked", async () => {
+  serveQueue([
+    change("queued", {
+      analysis_state: { status: "queued", job_id: "job-queued" },
+    }),
+    change("waiting", {
+      analysis_state: {
+        status: "waiting_for_cap",
+        since: "2026-10-06T10:00:00Z",
+        cap: "account",
+      },
+    }),
+    change("late", {
+      verdict: "Security hardening",
+      analyses: [
+        {
+          id: "old",
+          result: { verdict: "Security hardening", confidence: "low" },
+        },
+      ],
+      analysis_state: {
+        status: "timed_out",
+        job_id: "job-late",
+        error: { code: "timeout", message: "Workload deadline exceeded" },
+      },
+    }),
+    change("blocked", {
+      analysis_state: {
+        status: "blocked",
+        error: {
+          code: "api_key_required",
+          message:
+            "Automated runs use only Provider accounts that hold an API key",
+        },
+      },
+    }),
+  ]);
+  renderQueue("/reviews?application=alpha&decision=all");
+  await screen.findByRole("checkbox", { name: "Select Change queued" });
+  expect(within(row("queued")).getByText("Queued")).toBeInTheDocument();
+  expect(
+    within(row("waiting")).getByText("Waiting for cap"),
+  ).toBeInTheDocument();
+  expect(
+    within(row("waiting")).getByText("Daily Provider account cap reached"),
+  ).toBeInTheDocument();
+  // An expired deadline keeps the earlier Verdict and never reads as Unrelated.
+  expect(
+    within(row("late")).getByText("Timed out after 30 minutes"),
+  ).toBeInTheDocument();
+  expect(
+    within(row("late")).getByText("Security hardening"),
+  ).toBeInTheDocument();
+  expect(within(row("blocked")).getByText("Blocked")).toBeInTheDocument();
+  expect(
+    within(row("blocked")).getByText(
+      "Automated runs use only Provider accounts that hold an API key",
+    ),
+  ).toBeInTheDocument();
 });

@@ -28,7 +28,7 @@ from .models import (
     now,
     utc,
 )
-from .schemas import AUDIT_MAX_FUNCTIONS, OPERATIONS, Profile
+from .schemas import AUDIT_MAX_FUNCTIONS, CODEX_REFUSED, OPERATIONS, Profile
 from .security import DomainError, fingerprint
 from .sources import github_token_required
 
@@ -169,6 +169,8 @@ def resolve_profile(db, application, operation, submitted=None):
             422,
         )
     profile = Profile.model_validate(value).model_dump()
+    if profile["agent"] == "codex" and operation in CODEX_REFUSED:
+        raise DomainError(*CODEX_REFUSED[operation], 422)
     account = get(db, Account, profile["connection_id"])
     supported = public_account(account)["supported_agents"]
     if profile["agent"] not in supported:
@@ -197,6 +199,21 @@ def resolve_profile(db, application, operation, submitted=None):
         )
     if effort is None and model.get("default_effort"):
         profile["reasoning_effort"] = model["default_effort"]
+    return profile
+
+
+def automated_profile(db, application, operation):
+    """The saved or default profile of a run nobody started by hand. Automated runs use only
+    Provider accounts that hold an API key (A13); subscription sign-ins stay for manual runs."""
+    profile = resolve_profile(db, application, operation)
+    account = db.get(Account, profile["connection_id"])
+    if account.auth_type != "api_key":
+        raise DomainError(
+            "api_key_required",
+            f"Automated runs use only Provider accounts that hold an API key; {account.label} uses a "
+            "subscription sign-in. Start this run by hand or select an API-key account.",
+            422,
+        )
     return profile
 
 
@@ -351,6 +368,67 @@ def triage_application(db, repository):
     return None
 
 
+# Automatic Analyses per UTC day (A04). Manual Analyses are neither capped nor counted.
+ANALYSIS_CAPS = {"application": 10, "account": 30}
+
+
+def start_analysis(db, commit):
+    """Starts the automatic Analysis of a change Triage flagged, once per commit, so a shared
+    Upstream commit is analysed once. It counts against the Application's and the Provider
+    account's caps for the UTC day, a shared Upstream commit only against the account's. Over a
+    cap the change waits, and schedule() starts it once the caps reset at 00:00 UTC."""
+    key = f"analysis:{commit.id}"
+    if db.scalar(select(Job.id).where(Job.idempotency_key == key)):
+        return None
+    rows = linked_applications(db, db.get(Repository, commit.repository_id))
+    users = [a for a, link in rows if in_use(a, link)]
+    if not users:
+        return None
+    application, shared = users[0], len(users) > 1  # users[0] is commit_application()
+    try:
+        profile = automated_profile(db, application, "commit_analysis")
+    except DomainError as exc:
+        commit.analysis_state = {"status": "blocked", "error": exc.as_dict()}
+        return None
+    current = now()
+    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Job rows are durable, so the counts survive restarts and reset at midnight on their own.
+    # ponytail: unlocked counts; concurrent flags can overrun a cap by the number of Triage
+    # workers. Lock the account row here if exact caps ever matter.
+    today =select(func.count(Job.id)).where(
+        Job.kind == "commit_analysis",
+        Job.created_at >= midnight,
+        Job.input["automatic"].as_boolean().is_(True),
+    )
+    used = {
+        "application": 0 if shared else db.scalar(today.where(
+            Job.application_id == application.id, Job.input["shared"].as_boolean().is_(False)
+        )),
+        "account": db.scalar(today.where(Job.profile["connection_id"].as_string() == profile["connection_id"])),
+    }
+    cap = next((scope for scope, limit in ANALYSIS_CAPS.items() if used[scope] >= limit), None)
+    if cap:
+        previous = commit.analysis_state or {}
+        since = previous.get("since") if previous.get("status") == "waiting_for_cap" else current.isoformat()
+        commit.analysis_state = {"status": "waiting_for_cap", "since": since, "cap": cap}
+        # One event per scope and day, which Phase 3 turns into an Alert.
+        resource = application.id if cap == "application" else profile["connection_id"]
+        day = midnight.date().isoformat()
+        if not db.scalar(select(Action.id).where(
+            Action.resource_type == cap,
+            Action.resource_id == resource,
+            Action.data["action"].as_string() == "analysis_cap_reached",
+            Action.data["day"].as_string() == day,
+        ).limit(1)):
+            db.add(Action(resource_type=cap, resource_id=resource,
+                          data={"action": "analysis_cap_reached", "day": day, "limit": ANALYSIS_CAPS[cap]}))
+        return None
+    inputs = job_input(db, application, commit_id=commit.id, source_ref=commit.revision, automatic=True, shared=shared)
+    job = enqueue(db, "commit_analysis", application, inputs, profile, key)
+    commit.analysis_state = {"status": "queued", "job_id": job.id}
+    return job
+
+
 def job_input(db, application, **data):
     repository = source_repository(db, application)
     return {
@@ -474,7 +552,7 @@ def refresh_cve_policy(db, application, cve, link):
                         "Complete a source check before generating grounded evidence",
                         422,
                     )
-                queue_cve(db, application, cve, link, key=key)
+                queue_cve(db, application, cve, link, automated_profile(db, application, "cve_analysis"), key)
                 link.data = {**link.data, "analysis_blocked": None}
             except DomainError as exc:
                 link.data = {**link.data, "analysis_blocked": exc.as_dict()}
@@ -662,6 +740,8 @@ def commit_json(db, row, findings=None):
         "triage_status": row.triage_status,
         "triage_result": row.triage_result,
         "review_decision": row.review_decision,
+        "verdict": row.verdict,
+        "analysis_state": row.analysis_state,
         "analyses": [analysis_json(db, a) for a in analyses],
         "findings": findings.get(row.id, []),
     }
@@ -827,6 +907,12 @@ APPLICATION_SUBJECTS = {
 }
 
 
+def commit_label(commit):
+    """A commit's readable name: its Triage title, else the first line of its message."""
+    triage = commit.triage_result if isinstance(commit.triage_result, dict) else {}
+    return (triage.get("title") or (commit.data.get("message") or commit.revision).split("\n")[0])[:240]
+
+
 def job_subject(db, row, application):
     """What a job acts on, as a readable label, short reference, and dashboard link."""
     data = row.input if isinstance(row.input, dict) else {}
@@ -835,11 +921,9 @@ def job_subject(db, row, application):
         commit = db.get(Commit, data["commit_id"])
         if not commit:
             return {"type": "commit", "label": "Removed commit", "ref": None, "link": None}
-        triage = commit.triage_result if isinstance(commit.triage_result, dict) else {}
-        message = (commit.data.get("message") or commit.revision).split("\n")[0]
         return {
             "type": "commit",
-            "label": (triage.get("title") or message)[:240],
+            "label": commit_label(commit),
             "ref": commit.revision[:10],
             "link": f"/commits/{commit.id}",
         }
@@ -1004,4 +1088,18 @@ def schedule(db):
                 application,
                 job_input(db, application, recipe_id=application.config["active_recipe_id"]),
             )
+    start_waiting(db)
     return len(due)
+
+
+def start_waiting(db):
+    """Starts the changes waiting for a cap, oldest first. start_analysis re-checks the caps, so
+    they start once the caps reset at 00:00 UTC, and only as many as the caps allow. A Triage
+    flag runs this before its own change, so a new change never takes a freed slot first."""
+    waiting = db.scalars(
+        select(Commit)
+        .where(Commit.analysis_state["status"].as_string() == "waiting_for_cap")
+        .with_for_update(skip_locked=True)
+    )
+    for commit in sorted(waiting, key=lambda c: c.analysis_state["since"]):
+        start_analysis(db, commit)

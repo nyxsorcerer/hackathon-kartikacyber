@@ -223,21 +223,27 @@ def test_cve_analysis_pins_newest_affected_release_not_the_fixed_checkout(system
     assert pin["version"] == "1.9.0" and "1.9.0" in pin["message"]
 
 
-def test_cve_analysis_requests_a_build_run_and_other_operations_do_not(system):
+def test_cve_analysis_is_read_only(system):
     app, client, config = system
     _, _, result = queue_cve_analysis(system)
     broker = FixtureBroker(result, bundle())
     run_once(config, app.state.factory, broker)
     submitted = broker.calls[0]
-    assert submitted["build"] is True and submitted["limits"] is None  # Broker defaults raise the ceiling.
-    assert "private Docker daemon" in submitted["prompt"]
+    # No build or repository reaches the runner, and CVE analysis has Analysis's 30-minute deadline.
+    assert set(submitted) == {"token", "kind", "profile", "prompt", "schema", "files", "policy", "limits"}
+    assert submitted["limits"] == {"timeout_seconds": 1800}
+    prompt = submitted["prompt"]
+    assert "inputs/source is a read-only checkout of the pinned revision" in prompt and "Build and run nothing" in prompt
+    assert "a Lab verifies it after the Operator's Approval" in prompt
+    for gone in ("DOCKER_HOST", "private Docker daemon", "Build sandbox", "/workspace/repo"):
+        assert gone not in prompt, gone
     generation = client.post(
         f"/api/findings/{client.get('/api/findings').json()['items'][0]['id']}/artifact-generations",
         json={},
     ).json()["job_id"]
     second = FixtureBroker({"summary": "Partial"}, {"report.md": b"# Partial"})
     run_once(config, app.state.factory, second)
-    assert second.calls[0]["build"] is False
+    assert "Build sandbox" not in second.calls[0]["prompt"]
     assert client.get(f"/api/jobs/{generation}").json()["status"] == "failed"
 
 

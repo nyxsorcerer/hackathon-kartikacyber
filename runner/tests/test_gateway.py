@@ -20,3 +20,18 @@ def test_scope_and_methods_denied_before_network():
         fetcher.fetch("https://target.example", "POST")
     with pytest.raises(ValueError):
         origin("https://user:password@target.example")
+
+
+def test_only_a_run_hosting_a_herdr_session_may_reach_herdr_dev():
+    """Analysis in a Herdr session gets its provider's hosts plus herdr.dev; Triage never hosts a session."""
+    from numen_runner.contracts import PROVIDERS, RunRequest
+    from numen_runner.engine import DockerEngine, gateway_config
+    engine = DockerEngine(client=object())
+    engine.agent_backend = "herdr"
+    profile = {"agent": "pi", "provider_id": "deepseek", "model_id": "m", "credential": {"api_key": "k"}}
+    for operation, extra in (("commit_triage", []), ("commit_analysis", ["herdr.dev"])):
+        request = RunRequest(attempt_token="t", kind="agent", profile={**profile, "operation": operation})
+        hosts = gateway_config(request, request.profile.model_dump(), engine.hosts_session(request))
+        assert hosts == {"provider_hosts": PROVIDERS["deepseek"] + extra}, operation
+    engine.agent_backend = "native"  # Print mode: no session, so no herdr.dev for Analysis either.
+    assert not engine.hosts_session(request)

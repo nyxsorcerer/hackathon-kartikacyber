@@ -1,9 +1,10 @@
 import { Link } from "react-router-dom";
 import { Download } from "lucide-react";
 import { useResource } from "../hooks";
-import { jobSchema, findingDecisionLabels } from "../types";
+import { jobSchema } from "../types";
 import type { Analysis } from "../types";
 import { versionLabels } from "../versions";
+import { confidenceText } from "../jobSummary";
 import { ArtifactBrowser } from "./ArtifactPreview";
 import {
   Badge,
@@ -12,6 +13,7 @@ import {
   describeError,
   DetailGrid,
   Evidence,
+  humanize,
   JobLink,
   Markdown,
   Time,
@@ -51,21 +53,8 @@ export function AnalysisResult({
   const questions = strings(result?.open_questions);
   const artifactsId =
     kind === "cve" ? "cve-analysis-artifacts" : "commit-analysis-artifacts";
-  const reproduction = result?.reproduction;
-  const reproductionStatus =
-    typeof reproduction === "object" &&
-    reproduction !== null &&
-    "status" in reproduction &&
-    typeof reproduction.status === "string"
-      ? reproduction.status
-      : "not_run";
-  const reproductionSummary =
-    typeof reproduction === "object" &&
-    reproduction !== null &&
-    "summary" in reproduction &&
-    typeof reproduction.summary === "string"
-      ? reproduction.summary
-      : undefined;
+  const confidence = confidenceText(result?.confidence);
+  const addresses = result?.addresses || [];
   return (
     <>
       <section
@@ -96,9 +85,10 @@ export function AnalysisResult({
             </div>
           )}
         </DataState>
-        {kind === "commit" && result?.category && (
+        {kind === "commit" && result?.verdict && (
           <div className="chip-row">
-            <Badge>{result.category}</Badge>
+            <Badge>{result.verdict}</Badge>
+            {confidence && <Badge tone="neutral">{humanize(confidence)}</Badge>}
           </div>
         )}
         {job.data?.error != null && (
@@ -117,19 +107,6 @@ export function AnalysisResult({
             kind === "commit"
               ? [
                   [
-                    "Finding decision",
-                    <Badge
-                      tone={
-                        result?.finding_decision === "finding"
-                          ? "warm"
-                          : "neutral"
-                      }
-                    >
-                      {findingDecisionLabels[result?.finding_decision || ""] ||
-                        "Not assessed"}
-                    </Badge>,
-                  ],
-                  [
                     "Vulnerable revision",
                     result?.vulnerable_ref ? (
                       <code>{result.vulnerable_ref}</code>
@@ -138,10 +115,17 @@ export function AnalysisResult({
                     ),
                   ],
                   [
-                    "Agent reproduction",
-                    reproductionStatus.replaceAll("_", " "),
+                    "Addresses",
+                    addresses.length ? (
+                      <span className="finding-links">
+                        {addresses.map((address) => (
+                          <code key={address}>{address}</code>
+                        ))}
+                      </span>
+                    ) : (
+                      "None reported"
+                    ),
                   ],
-                  ["Confidence", confidenceLabel(result?.confidence)],
                 ]
               : [
                   ["Affected versions", versions(result?.affected_versions)],
@@ -158,15 +142,10 @@ export function AnalysisResult({
                 ]
           }
         />
-        {kind === "commit" && result?.finding_reason && (
-          <p className="readable-copy">
-            <strong>Finding basis:</strong> {result.finding_reason}
-          </p>
-        )}
-        {kind === "commit" && reproductionSummary && (
+        {kind === "commit" && artifacts.length > 0 && (
           <p className="hint">
-            {reproductionSummary}. Independent lab verification is tracked on
-            the linked finding.
+            Drafts are not reproduced: Analysis builds and runs nothing. A Lab
+            verifies a drafted Proof bundle only after your Approval.
           </p>
         )}
         {analysis.profile && (
@@ -281,7 +260,7 @@ export function AnalysisResult({
         )}
       </section>
       <div className="analysis-source-evidence">
-        {result?.confidence !== undefined && (
+        {typeof result?.confidence === "object" && (
           <Evidence label="Confidence evidence" value={result.confidence} />
         )}
         {result?.evidence !== undefined && (

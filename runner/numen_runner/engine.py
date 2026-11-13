@@ -1,4 +1,3 @@
-import hashlib
 import io
 import json
 import re
@@ -11,11 +10,12 @@ from pathlib import Path
 
 import docker
 import requests
-from .contracts import BUILD_HOSTS, PROVIDERS, collect_outputs, input_files
+from .contracts import HERDR_HOSTS, PROVIDERS, input_files
 
 LABEL = "org.pruferva.asset-monitor.run"
 BUNDLE_PREFIX = "bundle/"
 INSTANCE = "org.pruferva.asset-monitor.instance"
+GIT_CACHE = "org.pruferva.asset-monitor.cache=git"
 VERSION = "0.1.0"
 
 # Fixed Engine exec transports join the running workload's mount namespace.
@@ -54,34 +54,6 @@ finally:
     os.close(fd)
 os.rename(temp,'/home/job/login-code')
 """
-
-
-# Mirror once, then fetch; the lock makes concurrent build runs take turns on the mirror.
-SEED_REPOSITORY = """set -eu
-mirror="/workspace/$KEY.git"
-exec 9>/workspace/.lock
-flock 9
-if [ -d "$mirror" ]; then
-  git -C "$mirror" fetch --prune --quiet origin
-else
-  rm -rf "$mirror.partial"
-  git clone --mirror --quiet "$URL" "$mirror.partial"
-  mv "$mirror.partial" "$mirror"
-fi
-flock -u 9
-git clone --quiet "$mirror" /target/repo
-git -C /target/repo remote set-url origin "$URL"
-git -C /target/repo -c advice.detachedHead=false checkout --quiet --detach "$REF"
-"""
-# A build daemon reports a rejected build in its own log, which the operator cannot see. A match
-# reports its event type only; the daemon's own log text is driven by the agent and never leaves
-# it. The one exception is the image Docker refused to pull, kept only as a well-formed reference.
-IMAGE_REFUSED = re.compile(rb"pull access denied for ([a-z0-9][a-z0-9._/:@-]{0,199})")
-BUILD_SIGNALS = (
-    (b"denied: requested access to the resource is denied", "build_rejected_image"),
-    (b"creating mount source path", "build_rejected_mount"),
-    (b"no space left on device", "build_rejected_disk"),
-)
 
 
 class RuntimeFailure(Exception):
@@ -151,6 +123,19 @@ def validate_dockerfile(data):
     return bases
 
 
+# Workloads reach providers only through the run's credential-free gateway.
+PROXY_ENVIRONMENT = {"HTTP_PROXY":"http://gateway:8082","HTTPS_PROXY":"http://gateway:8082","ALL_PROXY":"http://gateway:8082",
+                     "NO_PROXY":"gateway,localhost,127.0.0.1","NODE_OPTIONS":"--require=/opt/numen/proxy-preload.cjs",
+                     "NODE_USE_ENV_PROXY":"1"}
+
+
+def gateway_config(request, profile, interactive):
+    """The gateway's CONNECT allowlist: the provider's own hosts, plus herdr.dev for a run that
+    hosts a Herdr session, because Herdr fetches its agent-detection manifests from there."""
+    hosts = [] if request.kind == "probe" else PROVIDERS.get(profile["provider_id"], [])
+    return {"provider_hosts": hosts + (HERDR_HOSTS if interactive else [])}
+
+
 class DockerEngine:
     def __init__(self, client=None):
         self.client = client or docker.from_env(timeout=30)
@@ -162,6 +147,11 @@ class DockerEngine:
 
     def ping(self):
         return self.client.ping()
+
+    def hosts_session(self, request):
+        """Whether the run hosts a Herdr session. Triage is a one-shot call with no tools, never a
+        session, so it never reaches herdr.dev."""
+        return request.kind == "agent" and self.agent_backend == "herdr" and request.profile.operation != "commit_triage"
 
     def cleanup(self, run_id):
         self.sessions.pop(run_id, None)
@@ -195,6 +185,12 @@ class DockerEngine:
         for run_id in ids:
             if run_id:
                 self.cleanup(run_id)
+        # Build runs before ADR-0005 shared git mirrors in a volume that outlived them; nothing mounts it now.
+        for volume in self.client.volumes.list(filters={"label":[GIT_CACHE,f"{INSTANCE}={self.instance}"]}):
+            try:
+                volume.remove(force=True)
+            except docker.errors.APIError:
+                pass  # Never block readiness on it; the next broker start tries again.
 
     def spec(self, request, network, labels, application=False):
         b = request.bounds
@@ -213,47 +209,11 @@ class DockerEngine:
             spec.update({"read_only":False, "cap_drop":[], "user":None})
             spec["tmpfs"] = {"/tmp":"rw,nosuid,nodev,size=1073741824"}
             spec["ulimits"] = [docker.types.Ulimit(name="nofile",soft=4096,hard=4096)]
-        if request.build:
-            # A checkout with history and installed dependencies does not fit a memory-backed
-            # workspace, and dependency installers exceed the analysis file/process budget.
-            spec["tmpfs"].pop("/workspace")
-            spec["tmpfs"]["/home/job"] = "rw,nosuid,nodev,size=1073741824,uid=10001,gid=10001,mode=0700"
-            spec["tmpfs"]["/tmp"] = "rw,nosuid,nodev,size=1073741824,uid=10001,gid=10001,mode=1777"
-            spec["ulimits"] = [docker.types.Ulimit(name="nofile",soft=4096,hard=4096)]
         return spec
-
-    def stopping(self, cancelled, deadline):
-        if cancelled():
-            raise RuntimeFailure("cancelled", "Workload stopped. No validated partial output was retained.")
-        if deadline is not None and time.monotonic() > deadline:
-            raise RuntimeFailure("timeout", "Workload exceeded the configured execution deadline.")
-
-    def prepare_workspace(self, run_id, image, labels):
-        """A build run's workspace is a volume shared with its daemon, so its ownership cannot be
-        left to whichever container mounts it first: the workload's own image seeds it, which needs
-        neither root nor any capability. share/ is world-writable because containers the daemon
-        starts cannot map back to the workload's user and could otherwise never write to a bind
-        mount of their own build directory."""
-        volume = self.client.volumes.create("numen-workspace-" + run_id, labels=labels)
-        stager = self.client.containers.create(
-            image, ["sh","-c","mkdir -p /workspace/share && chmod 0777 /workspace/share"],
-            network_mode="none", user="10001:10001", read_only=True, cap_drop=["ALL"],
-            security_opt=["no-new-privileges:true"], mem_limit="128m", pids_limit=16,
-            nano_cpus=250000000, labels=labels, volumes={volume.name:{"bind":"/workspace","mode":"rw"}},
-            use_config_proxy=False)
-        try:
-            stager.start()
-            if stager.wait(timeout=60).get("StatusCode"):
-                raise RuntimeFailure("workspace_ingress_failed", "Build workspace preparation failed.")
-        except (docker.errors.DockerException, requests.exceptions.RequestException) as exc:
-            raise RuntimeFailure("workspace_ingress_failed", "Build workspace preparation failed.") from exc
-        finally:
-            stager.remove(force=True)
-        return volume
 
     def prepare_session_home(self, run_id, image, labels):
         # Native conversation files must survive workload exit/cancellation until the broker
-        # has read and redacted them. This private volume is never shared with a build daemon.
+        # has read and redacted them. Only this run's own containers mount this private volume.
         volume = self.client.volumes.create("numen-session-" + run_id, labels=labels)
         stager = self.client.containers.create(
             image, ["chmod", "0700", "/home/job"], network_mode="none", user="10001:10001",
@@ -268,191 +228,6 @@ class DockerEngine:
             stager.remove(force=True)
         return volume
 
-    def start_build_daemon(self, run_id, request, job_network, labels, workspace, stopping=lambda: None):
-        """A per-run rootless Docker daemon the agent drives; the host Engine socket is never shared.
-
-        The workspace is mounted at the same path it has in the workload, because a bind mount's
-        source resolves in the daemon's filesystem and not in the client's.
-        """
-        egress = self.client.networks.create("numen-build-" + run_id, labels=labels)
-        b = request.bounds
-        try:
-            self.client.images.get("asset-monitor-dind:" + VERSION)
-        except docker.errors.DockerException as exc:
-            raise RuntimeFailure("build_image_unavailable",
-                                 f"asset-monitor-dind:{VERSION} is not built; build the images profile first.") from exc
-        daemon = self.client.containers.create(
-            "asset-monitor-dind:" + VERSION, command=["--host=tcp://0.0.0.0:2375"],
-            # ponytail: privileged is what nested containers actually need on Engine 20.10 without
-            # cgroup delegation; the rootless image still runs its daemon unprivileged inside.
-            privileged=True, environment={"DOCKER_TLS_CERTDIR":""}, network=egress.name,
-            volumes={workspace.name:{"bind":"/workspace","mode":"rw"}},
-            # A build run therefore reserves two containers' budgets, which the broker's concurrency
-            # bound should account for. Its anonymous image store is removed with the container.
-            mem_limit=f"{int(b['memory_mb'])}m", memswap_limit=f"{int(b['memory_mb'])}m",
-            pids_limit=int(b["pids"]), nano_cpus=int(b["cpus"]*1e9), labels=labels, detach=True,
-            log_config=docker.types.LogConfig(type="json-file",config={"max-size":"16m","max-file":"1"}),
-            use_config_proxy=False)
-        job_network.connect(daemon, aliases=["docker"])
-        daemon.start()
-        deadline = time.monotonic() + 180
-        while time.monotonic() < deadline:
-            stopping()
-            daemon.reload()
-            if daemon.status in {"exited","dead"}:
-                raise RuntimeFailure("build_daemon_failed", "The private build daemon stopped before it was ready.")
-            if b"API listen on [::]:2375" in daemon.logs(stdout=False, stderr=True, tail=200):
-                return daemon
-            time.sleep(0.5)
-        raise RuntimeFailure("build_daemon_failed", "The private build daemon did not become ready.")
-
-    def require_build_disk(self, image, labels):
-        """A build run installs and builds a whole application, and every concurrent run's daemon
-        stores its images on the same Docker disk. Refuse to start one on a nearly full disk, where
-        it would only fail later on "No space left on device"."""
-        minimum = float(os.getenv("NUMEN_BUILD_MIN_FREE_GB", "10"))
-        try:
-            report = self.client.containers.run(
-                image, ["df", "-Pk", "/"], network_mode="none", user="10001:10001", read_only=True,
-                cap_drop=["ALL"], security_opt=["no-new-privileges:true"], mem_limit="64m",
-                pids_limit=16, labels=labels, remove=True, use_config_proxy=False)
-            free = int(report.decode().strip().splitlines()[-1].split()[3]) / 1024 / 1024
-        except (docker.errors.DockerException, ValueError, IndexError):
-            return None  # The check is advisory; an unreadable report never blocks a run.
-        if free < minimum:
-            raise RuntimeFailure("build_disk_low",
-                                 f"The Docker host has {free:.1f} GB of free disk; a build run needs at least {minimum:.0f} GB. "
-                                 "Remove unused images (make prune) or enlarge the Docker disk, then retry.")
-        return free
-
-    def repository_cache(self):
-        """The mirror store build runs share. It outlives runs, so it carries no run label and
-        cleanup never removes it; only Numen's seeding step ever mounts it writable."""
-        name = "numen-git-cache-" + self.instance
-        try:
-            return self.client.volumes.get(name)
-        except docker.errors.NotFound:
-            return self.client.volumes.create(name, labels={INSTANCE: self.instance, "org.pruferva.asset-monitor.cache": "git"})
-
-    def seed_repository(self, request, image, network, labels, workspace, environment, event, stopping):
-        """Clone the Application's repository, with every branch, tag and its full history, into
-        /workspace/repo before the agent starts, so the agent never has to clone it again.
-
-        A shared mirror is created once and then only fetched, under a lock so concurrent runs
-        take turns. The step runs Numen's fixed commands through the run's own egress gateway;
-        the agent's container never mounts the mirror, so no run can alter what later runs get.
-        A failure is reported and the run continues: the agent can still clone it itself.
-        """
-        repository = request.repository
-        cache = self.repository_cache()
-        spec = self.spec(request, network, labels)
-        spec["volumes"] = {
-            # The workload image owns /workspace, so the mirror volume is first created owned by
-            # the workload user instead of root.
-            cache.name: {"bind": "/workspace", "mode": "rw"},
-            workspace.name: {"bind": "/target", "mode": "rw"},
-        }
-        proxy = {key: value for key, value in environment.items() if key.endswith(("_PROXY", "_proxy"))}
-        proxy.update({key.lower(): value for key, value in proxy.items()})
-        seeder = self.client.containers.create(
-            image,
-            ["sh", "-c", SEED_REPOSITORY],
-            environment={**environment, **proxy, "URL": repository.url, "REF": repository.ref,
-                         "KEY": hashlib.sha256(repository.url.encode()).hexdigest()[:24],
-                         "GIT_TERMINAL_PROMPT": "0"},
-            **spec)
-        started = time.monotonic()
-        try:
-            seeder.start()
-            while True:
-                stopping()
-                seeder.reload()
-                if seeder.status in {"exited", "dead"}:
-                    break
-                if time.monotonic() - started > 1800:
-                    seeder.kill()
-                    break
-                time.sleep(1)
-            code = seeder.attrs["State"].get("ExitCode")
-            detail = seeder.logs(stdout=True, stderr=True, tail=5).decode(errors="replace").strip()
-        finally:
-            seeder.remove(force=True)
-        if code == 0:
-            event({"type": "repository_ready",
-                   "message": f"Full history of {repository.url} at /workspace/repo, checked out at {repository.ref}.",
-                   "seconds": round(time.monotonic() - started)})
-            return True
-        event({"type": "repository_unavailable",
-               "message": "The repository could not be prepared; the agent can still clone it.",
-               "detail": detail[-500:]})
-        return False
-
-    def harvest_outputs(self, request, workspace, labels):
-        """Collect a disk-backed workspace's outputs directly from its volume.
-
-        A bundle carrying a real application cannot travel through the container log, which Docker
-        rotates at its size bound, so it would arrive truncated rather than refused.
-        """
-        harvester = self.client.containers.create(
-            "asset-monitor-probe:" + VERSION, ["sleep","300"], network_mode="none", user="10001:10001",
-            read_only=True, cap_drop=["ALL"], security_opt=["no-new-privileges:true"],
-            mem_limit="256m", pids_limit=16, nano_cpus=500000000, labels=labels,
-            volumes={workspace.name:{"bind":"/workspace","mode":"ro"}}, use_config_proxy=False)
-        try:
-            harvester.start()
-            stream, _ = harvester.get_archive("/workspace/outputs", encode_stream=False)
-            payload = io.BytesIO()
-            for chunk in stream:
-                payload.write(chunk)
-            payload.seek(0)
-            return collect_outputs(payload, int(request.bounds["output_bytes"]))
-        except docker.errors.NotFound:
-            return []  # A run that wrote nothing is not a failure here.
-        except (docker.errors.DockerException, requests.exceptions.RequestException) as exc:
-            raise RuntimeFailure("output_harvest_failed", "Validated output could not be collected.") from exc
-        except ValueError as exc:
-            raise RuntimeFailure("output_limit", "Workload produced more output than its limit allows.") from exc
-        finally:
-            harvester.remove(force=True)
-
-    def load_lab_base(self, daemon, event, stopping=lambda: None):
-        """The daemon starts with an empty image store and only public registry access, so the
-        bundled lab base is streamed in. The lab verifier rebuilds a bundle offline, so a base the
-        agent cannot obtain here is a base its bundle must not use."""
-        try:
-            image = self.client.images.get("asset-monitor-lab:" + VERSION)
-        except docker.errors.DockerException:
-            event({"type":"build_base_unavailable",
-                   "message":f"asset-monitor-lab:{VERSION} is not built, so the build daemon has no offline lab base."})
-            return False
-        api = self.client.api
-        try:
-            # An exec does not inherit the rootless daemon's own socket, so it is addressed over TCP.
-            exec_id = api.exec_create(daemon.id, ["docker","load"], stdin=True, stdout=False, stderr=False,
-                                      environment=["DOCKER_HOST=tcp://127.0.0.1:2375"])["Id"]
-            stream = api.exec_start(exec_id, socket=True)
-            try:
-                raw = getattr(stream, "_sock", stream)
-                for chunk in image.save(named="asset-monitor-lab:" + VERSION):
-                    raw.sendall(chunk)
-                raw.shutdown(socket.SHUT_WR)
-                deadline = time.monotonic() + 600
-                while api.exec_inspect(exec_id)["Running"]:
-                    stopping()
-                    if time.monotonic() > deadline:
-                        raise RuntimeError("lab base load timed out")
-                    time.sleep(0.25)
-                # A missing exit code is not a success.
-                if api.exec_inspect(exec_id)["ExitCode"] != 0:
-                    raise RuntimeError("lab base load failed")
-            finally:
-                stream.close()
-        except (docker.errors.DockerException, OSError, RuntimeError) as exc:
-            raise RuntimeFailure("build_base_load_failed",
-                                 "The bundled lab base could not be loaded into the build daemon.") from exc
-        event({"type":"build_base_loaded", "message":f"Loaded asset-monitor-lab:{VERSION} into the build daemon."})
-        return True
-
     def run(self, run_id, request, cancelled, event, login_input=None):
         timeout = request.bounds["timeout_seconds"]
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -465,11 +240,9 @@ class DockerEngine:
         profile = request.profile.model_dump()
         kind = request.kind
         environment = {"HOME":"/home/job","PATH":"/opt/numen/node_modules/.bin:/opt/runner/.venv/bin:/usr/local/bin:/usr/bin:/bin"}
+        interactive = self.hosts_session(request)
         if kind in {"agent","capabilities","account_login","probe"}:
-            config = {"provider_hosts":(PROVIDERS.get(profile["provider_id"], []) if kind != "probe" else [])
-                                       + (BUILD_HOSTS if request.build else [])}
-            if request.build:
-                config["tunnel"] = {"bytes":4 * 1024 * 1024 * 1024, "seconds":10800}
+            config = gateway_config(request, profile, interactive)
             if request.target_policy:
                 policy = dict(request.target_policy)
                 # An explicit internal asset exception never authorizes application/control subnets.
@@ -487,14 +260,10 @@ class DockerEngine:
                                                    environment={"NUMEN_GATEWAY_CONFIG":json.dumps(config)}, **proxy_spec)
             job_network.connect(proxy, aliases=["gateway"])
             proxy.start()
-            environment.update({"HTTP_PROXY":"http://gateway:8082","HTTPS_PROXY":"http://gateway:8082","ALL_PROXY":"http://gateway:8082","NO_PROXY":"gateway,localhost,127.0.0.1",
-                                "NODE_OPTIONS":"--require=/opt/numen/proxy-preload.cjs","NODE_USE_ENV_PROXY":"1"})
+            environment.update(PROXY_ENVIRONMENT)
         image = "asset-monitor-" + (profile["agent"] if kind in {"agent","capabilities","account_login"} else kind) + ":" + VERSION
         lab_image = None
-        build_daemon = None
         lab_application = None
-        workspace = None
-        data_base_loaded = False
         if kind == "lab":
             # The application installs and updates, so its own bridge reaches the internet. Docker
             # keeps bridges apart, so it cannot reach the application or control networks.
@@ -521,33 +290,9 @@ class DockerEngine:
         input_volume = self.materialize_inputs(run_id, request, labels)
         spec = self.spec(request, job_network, labels)
         spec["volumes"] = {input_volume.name:{"bind":"/workspace/inputs","mode":"ro"}}
-        if request.build:
-            # The agent's own workspace is disk backed so a full checkout and its dependencies fit.
-            # ponytail: volume and daemon storage are bounded only by the run's lifetime; add a
-            # quota-backed driver if a build run ever fills the Engine's disk.
-            def stopping():
-                self.stopping(cancelled, deadline)
-            stopping()
-            self.require_build_disk(image, labels)
-            workspace = self.prepare_workspace(run_id, image, labels)
-            daemon = build_daemon = self.start_build_daemon(
-                run_id, request, job_network, labels, workspace, stopping)
-            spec["volumes"][workspace.name] = {"bind":"/workspace","mode":"rw"}
-            environment["DOCKER_HOST"] = "tcp://docker:2375"
-            # Ports a nested container publishes are reachable on the daemon, so the agent exercises
-            # the same TARGET_URL contract the lab run uses.
-            environment["TARGET_URL"] = "http://docker:8080"
-            # The daemon is addressed directly; the credential-free proxy never carries its API.
-            environment["NO_PROXY"] = ",".join(filter(None, [environment.get("NO_PROXY"), "docker"]))
-            event({"type":"build_daemon_started","message":"Private build daemon ready at tcp://docker:2375.",
-                   "daemon_image":self.client.images.get("asset-monitor-dind:" + VERSION).id, "daemon_id":daemon.id})
-            data_base_loaded = self.load_lab_base(daemon, event, stopping)
-            if request.repository is not None:
-                self.seed_repository(request, image, job_network, labels, workspace, environment, event, stopping)
         if kind == "agent" and profile["agent"] == "codex":
             policy = json.loads((Path(__file__).parents[1] / "seccomp-codex.json").read_text())
             spec["security_opt"].append("seccomp=" + json.dumps(policy, separators=(",", ":")))
-        interactive = kind == "agent" and self.agent_backend == "herdr"
         if interactive:
             home = self.prepare_session_home(run_id, image, labels)
             spec["tmpfs"].pop("/home/job", None)
@@ -562,8 +307,6 @@ class DockerEngine:
         data["lab_image"] = lab_image
         data["inputs"] = []
         data["inputs_materialized"] = True
-        data["lab_base_loaded"] = data_base_loaded
-        data["outputs_harvested"] = workspace is not None
         data["session"] = interactive
         if data["session"]:
             self.sessions[run_id] = container
@@ -594,21 +337,6 @@ class DockerEngine:
                     # The PoC's own outcome still stands; the operator learns why it saw nothing.
                     signalled.add("exited")
                     event({"type":"lab_application_exited","message":"lab_application_exited"})
-            if build_daemon is not None and polls % 20 == 1:
-                # The whole log is scanned, not a tail: a one-line rejection scrolls out of a window
-                # between samples. Its size is already capped by the daemon's own log configuration.
-                recorded = build_daemon.logs(stdout=False, stderr=True)
-                for signature, signal in BUILD_SIGNALS:
-                    if signature in recorded and signature not in signalled:
-                        signalled.add(signature)
-                        refused = IMAGE_REFUSED.search(recorded) if signal == "build_rejected_image" else None
-                        event({"type":signal,"message":signal,
-                               **({"image":refused.group(1).decode()} if refused else {})})
-                build_daemon.reload()
-                if build_daemon.status in {"exited","dead"} and "lost" not in signalled:
-                    # The agent keeps running and would otherwise report only that it could not build.
-                    signalled.add("lost")
-                    event({"type":"build_daemon_lost","message":"build_daemon_lost"})
             if cancelled():
                 container.kill()
                 raise RuntimeFailure("cancelled", "Workload stopped. No validated partial output was retained.")
@@ -664,8 +392,6 @@ class DockerEngine:
                 raise failure
         if state["ExitCode"] or final is None:
             raise RuntimeFailure("workload_failed", "Workload exited without a validated completion envelope.")
-        if workspace is not None:
-            final["outputs"] = self.harvest_outputs(request, workspace, labels)
         final["execution"] = execution
         if native_credential is not None:
             final["credential"] = native_credential

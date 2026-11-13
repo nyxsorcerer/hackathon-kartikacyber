@@ -1,5 +1,6 @@
 """Domain orchestration. Generated code executes only through the isolated broker."""
 
+import bisect
 import json
 import hashlib
 import os
@@ -36,62 +37,68 @@ from .models import (
     ApplicationRepository,
     Repository,
     Snapshot,
+    Transcript,
     VersionRecipe,
     now,
     uid,
 )
-from .schemas import AUDIT_MAX_FUNCTIONS, CATEGORIES, CHANGE_KINDS, ModelCapability
+from .schemas import (
+    AUDIT_MAX_FUNCTIONS, CHANGE_KINDS, CONFIDENCES, SERVED_CONTENT_VERDICTS, VERDICTS, ModelCapability,
+)
 from .security import DomainError, fingerprint, retry_delay
 from .prefilter import MANIFESTS, prefilter
 from .sources import Sources, release_branch_candidates
 
 
 EVIDENCE_SCHEMA = {"type": "array", "items": {"type": "object"}}
+# A commit SHA (abbreviated or full), a CVE, a GHSA, or another advisory database's id.
+ADDRESS = r"^(?:[0-9a-f]{7,64}|CVE-\d{4}-\d{4,}|GHSA(?:-[0-9a-z]{4}){3}|[A-Z][A-Z0-9]*-[A-Za-z0-9._:-]{1,80})$"
+# The Verdicts that open a 0day Finding with a drafted Proof bundle.
+FINDING_VERDICTS = ("Vulnerability fix", "Vulnerability introduced")
+# Each Verdict's review decision. Insufficient context stays pending: the Review queue.
+VERDICT_REVIEW = {
+    "Vulnerability fix": "candidate",
+    "Vulnerability introduced": "candidate",
+    "Malicious change": "candidate",
+    "Security hardening": "dismissed",
+    "Unrelated": "dismissed",
+    "Insufficient context": "pending",
+}
+# Analysis and CVE analysis deadline (A04). An expired one fails the job, never decides Unrelated.
+ANALYSIS_SECONDS = 1800
 SCHEMAS = {
+    # Triage decides only whether a change deserves Analysis (A03).
     "commit_triage": {
         "type": "object",
-        "required": ["decision", "title", "change_kind", "reason", "confidence"],
+        "required": ["decision", "title", "reason"],
         "properties": {
             "decision": {"enum": ["security_candidate", "unrelated", "insufficient_context"]},
             "title": {"type": "string", "minLength": 1, "maxLength": 300},
-            "change_kind": {"enum": list(CHANGE_KINDS)},
-            "reason": {"type": "string"},
-            "confidence": {"type": ["object", "number", "null"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 2000},
         },
     },
+    # Analysis returns exactly one Verdict (A04). Nothing is run, so nothing is reproduced.
     "commit_analysis": {
         "type": "object",
         "required": [
-            "category",
-            "summary",
-            "evidence",
-            "confidence",
-            "open_questions",
-            "before_after",
-            "affected_behavior",
-            "title", "finding_decision", "finding_reason", "reproduction",
+            "verdict", "confidence", "title", "summary", "evidence",
+            "open_questions", "before_after", "affected_behavior",
         ],
         "properties": {
-            "category": {"enum": list(CATEGORIES)},
+            "verdict": {"enum": list(VERDICTS)},
+            "confidence": {"enum": list(CONFIDENCES)},
             "title": {"type": "string", "minLength": 1, "maxLength": 300},
-            "finding_decision": {"enum": ["finding", "not_a_finding", "needs_more_evidence"]},
-            "finding_reason": {"type": "string", "minLength": 1},
             "vulnerable_ref": {"type": ["string", "null"]},
-            "reproduction": {"type": "object", "required": ["status", "summary"], "additionalProperties": False, "properties": {"status": {"enum": ["reproduced", "not_reproduced", "not_run"]}, "summary": {"type": "string"}}},
+            # Commits or advisories the change addresses, for linking to Findings (Phase 3).
+            "addresses": {"type": "array", "maxItems": 50, "items": {"type": "string", "pattern": ADDRESS}},
             "summary": {"type": "string"},
             "evidence": EVIDENCE_SCHEMA,
-            "confidence": {"type": "object"},
             "open_questions": {"type": "array"},
             "before_after": {"type": "string"},
             "affected_behavior": {"type": "string"},
-            # The complete change the agent reviewed in the provided repository, for a commit whose
-            # upstream diff was incomplete (a merge or an oversized change).
-            "diff_review": {"type": "object", "required": ["range"], "additionalProperties": False, "properties": {"range": {"type": "string", "minLength": 1, "maxLength": 300}, "files": {"type": "integer", "minimum": 0}}},
         },
         "allOf": [
-            {"if": {"properties": {"finding_decision": {"const": "finding"}}}, "then": {"required": ["vulnerable_ref"], "properties": {"category": {"enum": ["Likely vulnerability fix", "Potentially introduced vulnerability"]}, "vulnerable_ref": {"type": "string", "minLength": 1}, "evidence": {"minItems": 1}}}},
-            {"if": {"properties": {"category": {"const": "Insufficient context"}}}, "then": {"properties": {"finding_decision": {"const": "needs_more_evidence"}}}},
-            {"if": {"properties": {"category": {"const": "Unrelated change"}}}, "then": {"properties": {"finding_decision": {"const": "not_a_finding"}}}},
+            {"if": {"properties": {"verdict": {"enum": list(FINDING_VERDICTS)}}}, "then": {"required": ["vulnerable_ref"], "properties": {"vulnerable_ref": {"type": "string", "minLength": 1}, "evidence": {"minItems": 1}}}},
         ],
     },
     "cve_analysis": {
@@ -163,15 +170,10 @@ SCHEMAS = {
 }
 for _schema in SCHEMAS.values():
     _schema["additionalProperties"] = False
-SCHEMAS["commit_triage"]["allOf"] = [
-    {"if": {"properties": {"decision": {"const": decision}}},
-     "then": {"properties": {"change_kind": {"enum": kinds}}}}
-    for decision, kinds in (
-        ("security_candidate", list(CHANGE_KINDS[:3])),
-        ("unrelated", ["unrelated"]),
-        ("insufficient_context", ["insufficient_context"]),
-    )
-]
+# A Triage run is one tool-less call: the change travels in its prompt, its diff capped (a capped
+# diff counts as incomplete), and the run has a deadline.
+TRIAGE_DIFF_CHARS = 100_000
+TRIAGE_SECONDS = 120
 
 ISSUE_TYPES = {
     "cross_site_scripting": "Cross-site scripting", "sql_injection": "SQL injection",
@@ -212,6 +214,17 @@ def validate_result(operation, result):
                 422,
                 fields={"result": "Invalid field at " + ".".join(str(p) for p in errors[0].path)},
             )
+    return result
+
+
+def check_verdict(result, served_content=False):
+    """Served-content Analysis may not return a code-vulnerability Verdict (A04)."""
+    if served_content and result["verdict"] not in SERVED_CONTENT_VERDICTS:
+        raise DomainError(
+            "verdict_not_allowed",
+            "Served-content Analysis may return only Malicious change, Security hardening, Unrelated or Insufficient context",
+            422,
+        )
     return result
 
 
@@ -442,8 +455,6 @@ class Workflows:
         suffix="",
         limits=None,
         progress=None,
-        build=False,
-        repository=None,
     ):
         self.context.heartbeat()
         if profile:
@@ -474,10 +485,7 @@ class Workflows:
                     "cancelled", "The operation stopped before this runtime phase started", 409
                 )
             self.context.set_phase(phase)
-            submitted = self.broker.submit(
-                phase, kind, profile, prompt, schema, files, policy, limits, build,
-                **({"repository": repository} if repository else {}),
-            )
+            submitted = self.broker.submit(phase, kind, profile, prompt, schema, files, policy, limits)
             self.context.set_run(submitted["run_id"], phase, kind=kind)
         state = None
         try:
@@ -538,10 +546,7 @@ class Workflows:
                 ) from exc
         return result or {}, files, state
 
-    def agent(
-        self, db, job, operation, files, facts, suffix="", policy=None, build=False, repository=None,
-        limits=None,
-    ):
+    def agent(self, db, job, operation, files, facts, suffix="", policy=None, limits=None):
         profile = self.runtime_profile(db, job, job.kind)
         # VCS administrative data is outside source evidence. Ordinary hidden application/config
         # files remain immutable evidence; runtime adapters disable ambient configuration loading.
@@ -560,7 +565,7 @@ class Workflows:
             ).encode()
             facts = {**facts, "input_coverage": {"omitted_paths": omitted}}
         schema = SCHEMAS[operation]
-        prompt, customized = prompts.prompt(db, operation, facts, build)
+        prompt, customized = prompts.prompt(db, operation, facts)
         if customized:
             self.context.note(
                 "prompt_customized",
@@ -586,9 +591,11 @@ class Workflows:
                 ) from exc
             raise
         result, outputs, state = self.run(
-            db, job, "agent", profile, prompt, schema, files, policy=policy, suffix=suffix, build=build,
-            repository=repository, limits=limits,
+            db, job, "agent", profile, prompt, schema, files, policy=policy, suffix=suffix, limits=limits,
         )
+        if operation == "commit_triage":
+            # The raw reply: commit_triage redacts and validates it, and keeps it with its prompt.
+            return {**result, "prompt": prompt}, outputs, state
         validate_result(operation, result)
         secrets = credential_strings(profile["credential"]) + all_secrets(db, self.vault)
         artifacts.clean_files({"result.json": json.dumps(result).encode(), **outputs}, secrets)
@@ -910,7 +917,7 @@ class Workflows:
                         ),
                     )
                 else:
-                    profile = domain.resolve_profile(db, triage, "commit_triage")
+                    profile = domain.automated_profile(db, triage, "commit_triage")
                     if profile["agent"] != mode:
                         raise DomainError(
                             "triage_profile_mismatch",
@@ -969,7 +976,7 @@ class Workflows:
                 "audit_context",
                 application,
                 domain.audit_refresh_input(db, application, base),
-                None,
+                domain.automated_profile(db, application, "audit_context"),
                 f"audit-refresh:{application.id}:{cursor}",
             )
         except DomainError as exc:
@@ -991,12 +998,14 @@ class Workflows:
         if manual is None:
             commit.review_decision = decision
 
-    def triage_result(self, db, job, commit, result):
-        if not commit.data.get("diff_complete") and result["decision"] == "unrelated":
+    def triage_result(self, db, job, commit, result, complete):
+        """Records a validated Triage result and starts the automatic Analysis of a flagged change.
+        `complete` says whether Triage saw the whole diff; without it, unrelated cannot be confirmed."""
+        if not complete and result["decision"] == "unrelated":
             result = {
                 **result,
                 "decision": "insufficient_context",
-                "change_kind": "insufficient_context",
+                **({"change_kind": "insufficient_context"} if "change_kind" in result else {}),
                 "title": "Incomplete diff requires security review",
                 "reason": "Source diff is incomplete; an unrelated determination cannot be confirmed",
             }
@@ -1020,18 +1029,77 @@ class Workflows:
                 f"/commits/{commit.id}",
                 result["reason"],
             )
+        if result["decision"] in ("security_candidate", "insufficient_context"):
+            # A flagged change is analysed automatically, after the changes already waiting for a
+            # cap; an incomplete diff is never left unjudged.
+            domain.start_waiting(db)
+            domain.start_analysis(db, commit)
         return result
 
+    def redacted(self, db, value):
+        """`value` with every configured secret replaced by [redacted], as stored Transcripts need."""
+        text = json.dumps(value, default=str)
+        secrets = {s for s in [*all_secrets(db, self.vault), *self.context.secrets] if s and len(s) >= 8}
+        for secret in sorted(secrets, key=len, reverse=True):
+            text = text.replace(json.dumps(secret)[1:-1], "[redacted]")
+        return json.loads(text)
+
+    def triage_transcript(self, db, job, commit, run, failure=None):
+        """Keeps one Triage run as a Transcript. A failed run's Transcript is committed before its
+        failure is raised, so it survives while the worker records the failure and retries."""
+        self.context.fence(db)
+        data = {**run, "status": "failed" if failure else "completed"}
+        if failure:
+            data["error"] = failure.as_dict()
+        db.add(Transcript(kind="triage", job_id=job.id, subject_id=commit.id, data=data))
+        if failure:
+            db.commit()
+            raise failure
+
     def commit_triage(self, db, job, application):
+        """One tool-less agent run with the change in its prompt (A03). Application code validates
+        the reply; a reply that fails the Triage schema fails the job, which the worker retries."""
         commit = domain.get(db, Commit, job.input["commit_id"])
-        result, _, _ = self.agent(
-            db,
-            job,
-            "commit_triage",
-            {"commit.json": commit_inputs(db, commit)["commit.json"]},
-            {"revision": commit.revision, "diff_complete": commit.data.get("diff_complete")},
+        diff = commit.data.get("diff") or ""
+        cut = diff[:TRIAGE_DIFF_CHARS]
+
+        def encoded(n):
+            return len(json.dumps(cut[:n], ensure_ascii=False)) - 2
+
+        # The cap counts the diff as the prompt encodes it, so escapes never push it past the
+        # runner's prompt bound: the longest prefix whose encoding fits.
+        cut = cut[: bisect.bisect_right(range(len(cut) + 1), TRIAGE_DIFF_CHARS, key=encoded) - 1]
+        complete = bool(commit.data.get("diff_complete")) and len(cut) == len(diff)
+        change = {
+            "message": commit.data.get("message", ""),
+            "author": commit.data.get("author", ""),
+            "files": [item.get("path") for item in commit.data.get("files", [])],
+            "diff": cut,
+            "diff_complete": complete,
+        }
+        result, _, state = self.agent(
+            db, job, "commit_triage", {}, {"revision": commit.revision, "commit": change},
+            limits={"timeout_seconds": TRIAGE_SECONDS},
         )
-        return self.triage_result(db, job, commit, result)
+        run = self.redacted(db, {
+            "prompt": result.get("prompt", ""),
+            "reply": str(result.get("reply", "")),
+            "profile": job.profile,
+            "run_id": state.get("run_id"),
+            "execution": next((e for e in self.context.executions if e.get("run_id") == state.get("run_id")), None),
+        })
+        reply = run["reply"]
+        try:
+            # The reply's JSON object, read past any code fence or prose around it.
+            parsed = validate_result("commit_triage", json.loads(reply[reply.index("{") : reply.rindex("}") + 1]))
+        except ValueError:
+            failure = DomainError("invalid_agent_output", "The Triage reply holds no JSON object", 422)
+        except DomainError as exc:
+            failure = exc
+        else:
+            failure = None
+        self.triage_transcript(db, job, commit, run, failure)  # Raises a failure after keeping it.
+        return self.triage_result(db, job, commit, parsed, complete)
 
     def jev_base_url(self):
         return (
@@ -1123,8 +1191,13 @@ class Workflows:
             raise DomainError(
                 "jev_rate_limited", "Jev rate limiting prevented typed triage", 503, retryable=True
             )
+        run = self.redacted(db, {
+            "request": body,
+            "response": response.text,
+            "profile": {"provider": "jev", "connection_id": account.id, "model_id": model},
+        })
         try:
-            data = response.json()
+            data = json.loads(run["response"])
             answer = typed_choice(data["answers"]["commit_security"], criteria)
             kind_answer = typed_choice(data["answers"]["change_kind"], CHANGE_KINDS)
             issue_answer = typed_choice(data["answers"]["issue_type"], ISSUE_TYPES)
@@ -1132,12 +1205,12 @@ class Workflows:
             confidence = answer["confidence"]
             if not isinstance(data.get("model"), str):
                 raise ValueError
-        except (KeyError, TypeError, ValueError) as exc:
-            raise DomainError(
+        except (KeyError, TypeError, ValueError):
+            self.triage_transcript(db, job, commit, run, DomainError(
                 "invalid_jev_output",
                 "Jev did not return a valid typed choice/probability distribution",
                 422,
-            ) from exc
+            ))
         result = {
             "decision": answer["choice"],
             "reason": "Typed Jev choice: " + criteria[answer["choice"]],
@@ -1170,7 +1243,8 @@ class Workflows:
             "insufficient_context": f"Uncertain security change in {application.product_name}",
         }[result["change_kind"]][:300]
         artifacts.clean_files({"triage.json": json.dumps(result).encode()}, [key])
-        return self.triage_result(db, job, commit, result)
+        self.triage_transcript(db, job, commit, run)
+        return self.triage_result(db, job, commit, result, commit.data.get("diff_complete"))
 
     def audit_context_for(self, db, application, source_ref):
         """The audit context an analysis of `source_ref` starts from: a complete one built at that
@@ -1246,22 +1320,6 @@ class Workflows:
             "function_documents": any(p.startswith("functions/") for p in context),
         }
 
-    def reviewed_complete_change(self, db, job, state, result):
-        """An agent that had the repository for this run can see the whole change, so its report of
-        the range it diffed stands in for the upstream diff that was incomplete."""
-        review = result.get("diff_review")
-        if not isinstance(review, dict) or not str(review.get("range", "")).strip():
-            return False
-        return db.scalar(
-            select(JobEvent.id)
-            .where(
-                JobEvent.job_id == job.id,
-                JobEvent.data["kind"].as_string() == "repository_ready",
-                JobEvent.data["run_id"].as_string() == str((state or {}).get("run_id", "")),
-            )
-            .limit(1)
-        ) is not None
-
     def commit_analysis(self, db, job, application):
         commit = domain.get(db, Commit, job.input["commit_id"])
         repository = db.get(Repository, commit.repository_id)
@@ -1278,7 +1336,7 @@ class Workflows:
                 files.update({"before-source/" + path: data for path, data in before_files.items() if path != "manifest.json"})
             except DomainError as exc:
                 before_error = {"code": exc.code, "message": exc.message}
-        result, outputs, state = self.agent(
+        result, outputs, _ = self.agent(
             db,
             job,
             "commit_analysis",
@@ -1294,28 +1352,18 @@ class Workflows:
                 "before_source_error": before_error,
                 "source_delta": "Source is pinned to the analyzed commit revision; its diff supplies before/after evidence.",
             },
-            build=True,
-            repository=source_repository(repository, commit.revision),
+            limits={"timeout_seconds": ANALYSIS_SECONDS},
         )
+        check_verdict(result)
         if "report.md" not in outputs:
             raise DomainError("missing_report", "Analysis completed without report.md", 422)
-        if not commit.data.get("diff_complete") and result["category"] == "Unrelated change":
-            # A capped diff can never be ruled Unrelated, even after a whole-change review.
-            result = {**result, "category": "Insufficient context", "finding_decision": "needs_more_evidence"}
-        elif (
-            not commit.data.get("diff_complete")
-            and result["finding_decision"] == "not_a_finding"
-            and not self.reviewed_complete_change(db, job, state, result)
-        ):
-            raise DomainError(
-                "insufficient_diff",
-                "An incomplete upstream diff cannot support a not-a-finding verdict unless the agent "
-                "reviewed the complete change in the provided repository (diff_review)",
-                422,
-            )
-        verdict = result["finding_decision"]
+        if not commit.data.get("diff_complete") and result["verdict"] in ("Unrelated", "Security hardening"):
+            # The snapshot has no history, so the whole of a capped diff can never be reviewed: it
+            # can never be ruled Unrelated or mere hardening.
+            result = {**result, "verdict": "Insufficient context"}
+        verdict = result["verdict"]
         vulnerable_ref, revision_error = None, None
-        if verdict == "finding":
+        if verdict in FINDING_VERDICTS:
             try:
                 # Legacy parent resolution and SVN snapshotting may heartbeat or
                 # perform source I/O. Finish them before holding the publication fence.
@@ -1348,9 +1396,12 @@ class Workflows:
             },
             all_secrets(db, self.vault),
         )
-        self.set_commit_decision(db, job, commit, {"finding": "candidate", "not_a_finding": "dismissed", "needs_more_evidence": "pending"}[verdict])
+        self.set_commit_decision(db, job, commit, VERDICT_REVIEW[verdict])
+        commit.verdict = verdict
+        commit.analysis_state = {"status": "completed", "analysis_id": analysis.id}
         response = {"analysis_id": analysis.id, "commit_id": commit.id, **result}
-        if verdict != "finding":
+        # A Malicious change opens no Finding yet (Phase 3); its drafts stay with the analysis.
+        if verdict not in FINDING_VERDICTS:
             return response
         if revision_error:
             self.context.fence(db).result = response
@@ -1367,14 +1418,17 @@ class Workflows:
         finding.data = {**finding.data, "source_commit_id": commit.id, "source_analysis_id": analysis.id,
                         "evidence": result["evidence"], "target_applicability": "unknown"}
         analysis.result = {**result, "finding_id": finding.id}
-        return self.publish_finding_bundle(db, job, application, finding, vulnerable_ref, outputs, response)
+        # Nothing was run, so an incomplete drafted bundle is still published, as a draft.
+        return self.publish_finding_bundle(
+            db, job, application, finding, vulnerable_ref, outputs, response, require_complete=False
+        )
 
     def commit_finding_ref(self, db, repository, commit, result, outputs):
         ref = result["vulnerable_ref"]
         if repository.source_kind == "github":
             if not re.fullmatch(r"[0-9a-fA-F]{40,64}", ref):
                 raise DomainError("invalid_finding_revision", "A commit finding must pin a full immutable source revision", 422)
-            if result["category"] == "Potentially introduced vulnerability":
+            if result["verdict"] == "Vulnerability introduced":
                 allowed = [commit.revision]
             else:
                 allowed = commit.data.get("parent_revisions")
@@ -1383,7 +1437,7 @@ class Workflows:
             if ref.lower() not in [parent.lower() for parent in allowed]:
                 raise DomainError("invalid_finding_revision", "A fix finding must use a parent; an introduction must use the analyzed commit", 422)
         else:
-            expected = commit.revision if result["category"] == "Potentially introduced vulnerability" else str(int(commit.revision) - 1)
+            expected = commit.revision if result["verdict"] == "Vulnerability introduced" else str(int(commit.revision) - 1)
             if ref != expected:
                 raise DomainError("invalid_finding_revision", "The vulnerable SVN revision must match the selected before/after source", 422)
             self.snapshot(db, repository, expected)
@@ -2110,8 +2164,7 @@ class Workflows:
         )
         files["cve.json"] = json.dumps(job.input.get("source_record", row.raw)).encode()
         result, outputs, _ = self.agent(
-            db, job, "cve_analysis", files, facts, build=True,
-            repository=source_repository(repository, snapshot.source_ref),
+            db, job, "cve_analysis", files, facts, limits={"timeout_seconds": ANALYSIS_SECONDS}
         )
         if (
             result["cve_id"] != row.id
@@ -2246,7 +2299,9 @@ class Workflows:
         )
         return self.publish_finding_bundle(db, job, application, finding, snapshot.source_ref, outputs, result)
 
-    def publish_finding_bundle(self, db, job, application, finding, source_ref, outputs, result):
+    def publish_finding_bundle(
+        self, db, job, application, finding, source_ref, outputs, result, require_complete=True
+    ):
         locked = self.context.fence(db)
         revision, _ = artifacts.publish(
             db,
@@ -2270,7 +2325,7 @@ class Workflows:
             "artifact_revision": revision,
             "artifact_state": state,
         }
-        if result["artifact_state"]["status"] != "complete":
+        if require_complete and result["artifact_state"]["status"] != "complete":
             # Retain useful evidence and expose its location even when generation is incomplete.
             locked.result = result
             db.commit()
@@ -2640,13 +2695,13 @@ class Workflows:
 
 PRIOR_ANALYSES_NOTICE = (
     "Untrusted prior analysis of this revision. Do not reuse it as a verdict: use it only as a "
-    "checklist of claims to verify independently against the source, its history and your own "
-    "lab run. Its reports, PoCs and bundles are not provided."
+    "checklist of claims to verify independently against the source and its diff. Its reports, "
+    "PoCs and bundles are not provided."
 )
 # Claims worth checking again; artifacts and links are omitted because they are not provided.
 PRIOR_CLAIMS = (
-    "title", "category", "summary", "finding_decision", "finding_reason", "before_after",
-    "affected_behavior", "vulnerable_ref", "reproduction", "evidence", "open_questions", "confidence",
+    "title", "verdict", "confidence", "summary", "before_after", "affected_behavior",
+    "vulnerable_ref", "evidence", "open_questions", "addresses",
 )
 
 
@@ -2670,16 +2725,6 @@ def commit_inputs(db, commit):
             {"notice": PRIOR_ANALYSES_NOTICE, "analyses": claims}, default=str, indent=2
         ).encode()
     return files
-
-
-def source_repository(repository, ref):
-    """The canonical repository a build run receives with full history (GitHub sources only)."""
-    url = (repository.source_url or "").rstrip("/")
-    if repository.source_kind != "github" or not re.fullmatch(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", url):
-        return None
-    if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", ref or ""):
-        return None
-    return {"url": url, "ref": ref}
 
 
 FINGERPRINT_BUDGET = 10  # requests for Numen's own fingerprint stage, apart from the recipe's

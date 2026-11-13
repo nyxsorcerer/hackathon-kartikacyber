@@ -52,7 +52,6 @@ function fixture() {
           JSON.stringify({
             prompt: `Rendered ${body.operation}: ${body.source}`,
             templates: ["attack-path", body.operation],
-            build: true,
           }),
         );
       if (url.startsWith("/api/prompts/")) {

@@ -16,7 +16,7 @@ def test_limits_only_lower_and_credentials_required():
     with pytest.raises(ValueError):
         RunRequest(attempt_token="one", kind="probe", limits={"memory_mb": 99999})
     with pytest.raises(ValueError):
-        RunRequest(attempt_token="one", kind="agent", profile={"operation": "commit_analysis", "model_id": "m"})
+        RunRequest(attempt_token="one", kind="agent", profile={"agent": "pi", "provider_id": "deepseek", "operation": "commit_analysis", "model_id": "m"})
     assert RunRequest(attempt_token="one", kind="probe", limits={"memory_mb": 128}).bounds["memory_mb"] == 128
 
 
@@ -50,7 +50,7 @@ def source_archive(*members):
 
 def agent_request(inputs, kind="agent"):
     return RunRequest(attempt_token="one", kind=kind, inputs=inputs,
-                      profile={"operation": "cve_analysis", "model_id": "m", "credential": {"api_key": "k"}})
+                      profile={"agent": "pi", "provider_id": "deepseek", "operation": "cve_analysis", "model_id": "m", "credential": {"api_key": "k"}})
 
 
 def test_agent_source_archive_expands_regular_files_under_its_path():
@@ -82,23 +82,32 @@ def test_source_archive_is_agent_only_bounded_and_cannot_shadow_inputs(monkeypat
 def test_agent_runs_have_no_deadline_unless_requested():
     assert agent_request([]).bounds["timeout_seconds"] is None
     explicit = RunRequest(attempt_token="one", kind="agent", limits={"timeout_seconds": 60},
-                          profile={"operation": "cve_analysis", "model_id": "m", "credential": {"api_key": "k"}})
+                          profile={"agent": "pi", "provider_id": "deepseek", "operation": "cve_analysis", "model_id": "m", "credential": {"api_key": "k"}})
     assert explicit.bounds["timeout_seconds"] == 60
     assert RunRequest(attempt_token="one", kind="probe").bounds["timeout_seconds"] == 1800
 
 
-def test_build_is_limited_to_supported_agent_operations_and_raises_the_ceiling():
-    agent = {"attempt_token":"t","kind":"agent","profile":{"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}}}
-    run = RunRequest(**agent, build=True, limits={"memory_mb":6144,"pids":2048})
-    assert run.bounds["memory_mb"] == 6144 and run.bounds["pids"] == 2048
-    # An ordinary agent run has no deadline; a build run keeps one, because its daemon is privileged.
-    assert run.bounds["timeout_seconds"] == contracts.BUILD_MAXIMA["timeout_seconds"]
-    assert RunRequest(**agent).bounds["timeout_seconds"] is None
-    with pytest.raises(ValueError):  # The same limits exceed an ordinary run's ceiling.
+def test_build_and_repository_fields_are_refused():
+    """No agent run builds anything: the fields that granted a build daemon and a mirrored
+    repository are unknown launch fields, and no ceiling above ordinary analysis remains."""
+    agent = {"attempt_token":"t","kind":"agent","profile":{"agent":"pi","provider_id":"deepseek","operation":"commit_analysis","model_id":"m","credential":{"api_key":"k"}}}
+    repository = {"url": "https://github.com/demo/plugin", "ref": "a" * 40}
+    for operation in ("commit_analysis", "cve_analysis"):
+        for extra in ({"build": True}, {"build": False}, {"repository": repository}):
+            with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+                RunRequest(**{**agent, "profile": {**agent["profile"], "operation": operation}}, **extra)
+    with pytest.raises(ValueError):  # Former build limits exceed every agent run's ceiling.
         RunRequest(**agent, limits={"memory_mb":6144,"pids":2048})
-    commit = RunRequest(**{**agent, "profile":{**agent["profile"], "operation":"commit_analysis"}}, build=True, limits={"memory_mb":6144,"pids":2048})
-    assert commit.bounds == run.bounds
-    with pytest.raises(ValueError):
-        RunRequest(**{**agent, "profile":{**agent["profile"], "operation":"commit_triage"}}, build=True)
-    with pytest.raises(ValueError):
-        RunRequest(attempt_token="t", kind="lab", build=True)
+    assert not {"BUILD_MAXIMA", "BUILD_OPERATIONS", "BUILD_HOSTS", "Repository"} & set(vars(contracts))
+
+
+def test_codex_triage_is_refused():
+    """Codex has no flag that removes its shell, so it never runs Triage, Analysis or CVE analysis (ADR-0004)."""
+    profile = {"agent": "codex", "operation": "commit_triage", "model_id": "m", "credential": {"api_key": "k"}}
+    with pytest.raises(ValueError, match="Triage on Codex is refused until a no-tools restriction is verified"):
+        RunRequest(attempt_token="one", kind="agent", profile=profile)
+    for operation in ("commit_analysis", "cve_analysis"):
+        with pytest.raises(ValueError, match="Analysis and CVE analysis on Codex are refused"):
+            RunRequest(attempt_token="one", kind="agent", profile={**profile, "operation": operation})
+    assert RunRequest(attempt_token="one", kind="agent", profile={**profile, "operation": "version_recipe"})
+    assert RunRequest(attempt_token="one", kind="agent", profile={**profile, "agent": "pi", "provider_id": "deepseek"})

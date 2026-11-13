@@ -296,6 +296,17 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 .limit(20)
             )
         )
+        # The Review queue: Insufficient context Verdicts the Operator has not judged yet.
+        # ponytail: sorted in Python because committed_at lives in commit data; index it if it grows.
+        queue = sorted(
+            db.scalars(
+                select(Commit).where(
+                    Commit.verdict == "Insufficient context", Commit.review_decision == "pending"
+                )
+            ),
+            key=lambda c: c.data.get("committed_at") or "",
+            reverse=True,
+        )
         due = list(
             db.scalars(
                 select(Application)
@@ -319,6 +330,17 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 for e in recent
             ],
             "due_applications": [domain.application_json(db, p) for p in due],
+            "review_queue": [
+                {
+                    "id": c.id,
+                    "title": domain.commit_label(c),
+                    "revision": c.revision,
+                    "application_id": getattr(domain.commit_application(db, c), "id", None),
+                    "committed_at": c.data.get("committed_at"),
+                }
+                for c in queue[:20]
+            ],
+            "review_queue_count": len(queue),
         }
 
     @router.get("/applications")
@@ -633,6 +655,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             profile.model_dump() if profile else None,
             key,
         )
+        if job.status == "queued":  # An idempotent replay may return a finished job.
+            row.analysis_state = {"status": "queued", "job_id": job.id}
         action(db, "commit", row.id, {"action": "analysis_requested", "job_id": job.id})
         return job
 
@@ -1373,6 +1397,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             )
         application = domain.get(db, Application, row.application_id) if row.application_id else None
         job = domain.enqueue(db, row.kind, application, row.input, row.profile, key)
+        commit = db.get(Commit, row.input["commit_id"]) if row.kind == "commit_analysis" else None
+        if commit and job.status == "queued":
+            commit.analysis_state = {"status": "queued", "job_id": job.id}
         if row.kind == "lab_run" and not db.scalar(select(LabRun).where(LabRun.job_id == job.id)):
             original = db.scalar(select(LabRun).where(LabRun.job_id == row.id))
             db.add(
@@ -1510,7 +1537,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
     @router.post("/prompts/preview")
     def preview_prompt(body: PromptPreviewInput, db=database_dependency):
-        return prompts.preview(db, body.operation, body.name, body.source, body.build)
+        return prompts.preview(db, body.operation, body.name, body.source)
 
     @router.post("/settings/webhook/test")
     def webhook_test(db=database_dependency):

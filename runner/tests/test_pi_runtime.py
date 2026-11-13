@@ -161,7 +161,7 @@ await mkdir('/workspace/inputs',{recursive:true});await mkdir('/workspace/output
 await writeFile('/workspace/inputs/source.txt','source evidence');await writeFile('/home/job/private.txt','fixture private marker');
 let tools=[];register({registerTool:t=>tools.push(t)});
 async function call(name,args){const tool=tools.find(t=>t.name===name);return tool.execute('1',validateToolCall(tools,{id:'1',name,arguments:args}));}
-const denied=[];for(const [name,args] of [['numen_read',{path:'/home/job/private.txt'}],['numen_write',{path:'inputs/source.txt',content:'mutated'}],['numen_read',{path:'inputs/../../home/job/private.txt'}],['target_fetch',{url:'https://example.invalid',method:'POST'}],['numen_shell',{command:'id'}]]){try{await call(name,args);denied.push(false);}catch{denied.push(true);}}
+const denied=[];for(const [name,args] of [['numen_read',{path:'/home/job/private.txt'}],['numen_write',{path:'inputs/source.txt',content:'mutated'}],['numen_read',{path:'inputs/../../home/job/private.txt'}],['target_fetch',{url:'https://example.invalid',method:'POST'}],['numen_write',{path:'escape.md',content:'outside outputs'}],['numen_write',{path:'/workspace/escape.md',content:'outside outputs'}]]){try{await call(name,args);denied.push(false);}catch{denied.push(true);}}
 await symlink('/home/job/private.txt','/workspace/inputs/escape.txt');try{await call('numen_read',{path:'inputs/escape.txt'});denied.push(false);}catch{denied.push(true);}
 const read=await call('numen_read',{path:'inputs/source.txt'});await call('numen_write',{path:'outputs/report.md',content:'# Artifact'});
 console.log(JSON.stringify({denied,read:read.content[0].text,source:await readFile('/workspace/inputs/source.txt','utf8'),artifact:await readFile('/workspace/outputs/report.md','utf8'),tools:tools.map(t=>t.name)}));
@@ -170,8 +170,8 @@ console.log(JSON.stringify({denied,read:read.content[0].text,source:await readFi
     assert all(observed["denied"])
     assert observed["read"] == observed["source"] == "source evidence"
     assert observed["artifact"] == "# Artifact"
-    # numen_shell is registered but refuses without a build capability, and only build runs enable it.
-    assert set(observed["tools"]) == {"numen_read", "numen_list", "numen_write", "target_fetch", "numen_shell"}
+    # No shell exists; writes land only under outputs/.
+    assert set(observed["tools"]) == {"numen_read", "numen_list", "numen_write", "target_fetch"}
 
 
 @DOCKER
@@ -240,7 +240,7 @@ def test_pi_incomplete_length_result_cannot_be_published_as_success(finish):
 
 
 @DOCKER
-@pytest.mark.parametrize("operation", ["commit_triage", "commit_analysis"])
+@pytest.mark.parametrize("operation", ["commit_triage", "commit_analysis", "version_recipe"])
 def test_pinned_pi_cli_runs_bounded_extension_and_returns_native_json_protocol(operation):
     profile = {
         "agent": "pi",
@@ -291,15 +291,13 @@ console.log(JSON.stringify({{exit:child.status,stdout:child.stdout,stderr:child.
     assert observed["trace"]["ambient"] is False
     assert "bash" not in observed["trace"]["active"]
     if operation == "commit_triage":
-        assert set(observed["trace"]["active"]) == {"numen_read", "numen_list"}
+        # A one-shot Triage call is offered no tools at all (--no-tools).
+        assert observed["trace"]["active"] == []
         assert observed["artifact"] is None and parsed["turns"] == 1
     else:
-        assert set(observed["trace"]["active"]) == {
-            "numen_read",
-            "numen_list",
-            "numen_write",
-            "target_fetch",
-        }
+        # target_fetch exists only for the operation that reads the registered target.
+        assert set(observed["trace"]["active"]) == {"numen_read", "numen_list", "numen_write"} | (
+            {"target_fetch"} if operation == "version_recipe" else set())
         assert observed["artifact"] == "# Observed offline artifact" and parsed["turns"] == 2
 
 
@@ -366,7 +364,7 @@ server.close();console.log(JSON.stringify({{exit,stdout,stderr:stderr.slice(-100
     assert request["path"] == path and request["credential_matches"]
     assert request["model"] == model_id
     assert effort in (request["reasoning_effort"], request["output_effort"])
-    assert request["tools"] == ["numen_list", "numen_read"]
+    assert request["tools"] == []  # Triage is offered no tools.
 
 
 @DOCKER
@@ -583,9 +581,9 @@ export default function(api){
 import json,os,sys
 sys.path.insert(0,'/opt/runner')
 from numen_runner import workload
-from numen_runner.adapters import agent_argv,agent_events,pi_repair_argv
+from numen_runner.adapters import agent_argv,agent_events,pi_no_tools_argv
 fixture=['--extension','/opt/numen/pi-offline-fixture.ts']
-workload.pi_repair_argv=lambda p:pi_repair_argv(p)+fixture
+workload.pi_no_tools_argv=lambda p:pi_no_tools_argv(p)+fixture
 profile={'agent':'pi','provider_id':'openai','auth_type':'api_key','model_id':'numen-fixture','reasoning_effort':'high','operation':'version_recipe'}
 schema={'type':'object','required':['metadata'],'additionalProperties':False,'properties':{'metadata':{'type':'object'}}}
 code,out,_=workload.run_process(agent_argv(profile)+fixture,dict(os.environ),'Write the recipe.',None,events=agent_events('pi'))
@@ -601,42 +599,3 @@ console.log(child.stdout.trim().split('\\n').pop()||JSON.stringify({{stderr:chil
                             env={"OPENAI_API_KEY": "synthetic-pi-key-no-access"})
     assert observed.get("code") == 0, observed
     assert observed["result"] == {"metadata": {"restated": True, "tools": 0}}
-
-
-@DOCKER
-def test_pi_build_run_writes_scratch_files_but_never_evidence_or_private_paths():
-    script = """
-import register from '/opt/numen/pi-tools.ts';
-import {mkdir,writeFile} from 'node:fs/promises';
-import {validateToolCall} from '@earendil-works/pi-ai/compat';
-await mkdir('/workspace/inputs',{recursive:true});await mkdir('/workspace/outputs',{recursive:true});
-await mkdir('/workspace/repo/.git',{recursive:true});
-await writeFile('/workspace/repo/.git/config','cloned history');await writeFile('/home/job/private.txt','fixture private marker');
-let tools=[];register({registerTool:t=>tools.push(t)});
-async function call(name,args){const tool=tools.find(t=>t.name===name);return tool.execute('1',validateToolCall(tools,{id:'1',name,arguments:args}));}
-async function denied(name,args){try{await call(name,args);return false;}catch{return true;}}
-const {readFile,symlink}=await import('node:fs/promises');
-await symlink('/workspace/inputs','/workspace/evidence');
-const clone=await call('numen_read',{path:'repo/.git/config'});
-await call('numen_write',{path:'outputs/report.md',content:'# Report'});
-await call('numen_write',{path:'dev/Dockerfile',content:'FROM asset-monitor-lab:0.1.0'});
-console.log(JSON.stringify({
-  clone:clone.content[0].text,
-  wrote:await readFile('/workspace/outputs/report.md','utf8'),
-  scratch:await readFile('/workspace/dev/Dockerfile','utf8'),
-  denied_inputs:await denied('numen_write',{path:'inputs/source.txt',content:'mutated'}),
-  denied_inputs_via_link:await denied('numen_write',{path:'evidence/source.txt',content:'mutated'}),
-  denied_private:await denied('numen_write',{path:'/home/job/private.txt',content:'mutated'}),
-  denied_private_read:await denied('numen_read',{path:'/home/job/private.txt'}),
-  shell_enabled:!(await denied('numen_shell',{command:'echo shell-ok'})),
-}));
-"""
-    # A build run is the only run where DOCKER_HOST is set. Its shell can already write anywhere
-    # in /workspace, so the write tool may too, except the read-only evidence; only outputs/ is
-    # ever published.
-    observed = image_script(script, env={"DOCKER_HOST": "tcp://docker:2375"})
-    assert observed["clone"] == "cloned history"
-    assert observed["wrote"] == "# Report" and observed["scratch"] == "FROM asset-monitor-lab:0.1.0"
-    assert observed["denied_inputs"] and observed["denied_inputs_via_link"]
-    assert observed["denied_private"] and observed["denied_private_read"]
-    assert observed["shell_enabled"]

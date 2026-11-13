@@ -15,5 +15,8 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     css: false,
+    // ponytail: the default worker count times out 5 s tests and 1 s findBy lookups
+    // under load on an 8 GB Docker Desktop; raise it when the test VM grows.
+    maxWorkers: 2,
   },
 });

@@ -93,26 +93,28 @@ def test_claude_auth_modes_cache_permissions_and_refresh_detection(tmp_path,monk
     assert not Path(api_env['CLAUDE_CONFIG_DIR']).exists()
 
 
-def test_claude_api_and_native_argv_keep_bare_and_target_tool_contracts_separate(tmp_path):
+def test_claude_api_and_native_argv_share_the_tool_profile_and_target_tool_contract(tmp_path):
     schema=tmp_path/'schema.json'
     schema.write_text(json.dumps(workload.NATIVE_SCHEMA))
     api=profile(operation='version_recipe')
     api['reasoning_effort']='high'
     args=agent_argv(api,str(schema))
-    assert '--bare' in args and '--restricted' in args
+    assert '--bare' not in args and '--restricted' in args
     assert args[args.index('--effort')+1]=='high'
     assert args[args.index('--setting-sources')+1]==''
     assert args[args.index('--permission-prompts')+1]=='none'
     assert args[args.index('--tools')+1]=='Read,Grep,Glob,Write,Edit'
-    assert 'mcp__numen_target__target_fetch' in args[args.index('--allowedTools')+1]
+    assert '--allowedTools' not in args and args[args.index('--permission-mode')+1]=='dontAsk'
+    assert json.loads(args[args.index('--settings')+1])['permissions']['allow']==['Edit(//workspace/outputs/**)','mcp__numen_target__target_fetch']
     assert set(json.loads(args[args.index('--mcp-config')+1])['mcpServers'])=={'numen_target'}
     assert '--strict-mcp-config' in args
     assert not any('dangerously' in value for value in args)
     native=agent_argv(profile('native_oauth'),str(schema))
-    assert '--bare' not in native
-    assert '--effort' not in native
+    assert '--effort' not in native and native[native.index('--tools')+1]=='Read,Grep,Glob,Write,Edit'
+    # Triage alone is offered no tools, so --bare (an API key's minimal mode) cannot drop any.
     triage=agent_argv(profile(operation='commit_triage'),str(schema))
-    assert triage[triage.index('--tools')+1]=='Read,Grep,Glob'
+    assert triage[triage.index('--tools')+1]=='' and '--bare' in triage
+    assert not {'--settings','--permission-mode','--json-schema','--allowedTools'}&set(triage)
 
 
 def test_claude_successful_structured_envelope_is_decoded_without_text_fallback():
@@ -136,7 +138,7 @@ def test_claude_failed_or_invalid_protocol_never_becomes_success(event):
 def test_pinned_claude_initialization_accepts_native_flags_and_reports_effort_levels():
     import docker
     script='''import json,subprocess,os
-args=['claude','--print','--input-format','stream-json','--output-format','stream-json','--verbose','--restricted','--setting-sources','','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--tools','Read,Grep,Glob,Write,Edit','--allowedTools','Read,Grep,Glob,Write,Edit','--permission-mode','dontAsk','--permission-prompts','none','--no-session-persistence']
+args=['claude','--print','--input-format','stream-json','--output-format','stream-json','--verbose','--restricted','--setting-sources','','--strict-mcp-config','--mcp-config','{"mcpServers":{}}','--tools','Read,Grep,Glob,Write,Edit','--settings','{"permissions":{"allow":["Edit(//workspace/outputs/**)"]}}','--permission-mode','dontAsk','--permission-prompts','none','--no-session-persistence']
 data=json.dumps({'type':'control_request','request_id':'fixture-init','request':{'subtype':'initialize'}})+'\\n'
 env={**os.environ,'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1'}
 values=[]
@@ -196,44 +198,47 @@ def test_claude_native_catalog_uses_post_cli_cache_and_never_api_key(monkeypatch
 
 
 @pytest.mark.skipif(os.getenv('NUMEN_DOCKER_TESTS')!='1',reason='explicit credential-free native tool execution fixture')
-def test_pinned_claude_restricted_tools_and_structured_result_with_loopback_provider():
+@pytest.mark.parametrize('interactive',[False,True])
+def test_pinned_claude_restricted_tools_and_structured_result_with_loopback_provider(interactive):
+    """--tools decides which tools exist and --settings approves writes under outputs/ only, in
+    print mode and in the interactive TUI a Herdr session runs, without --allowedTools."""
     import docker
-    script=r'''import json,os,subprocess,threading
+    script=r"""import json,os,pty,re,select,signal,subprocess,threading,time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+from numen_runner import session
 from numen_runner.adapters import agent_argv,parse_agent
 from numen_runner.workload import NATIVE_SCHEMA
+interactive=ARGS
 work=Path('/workspace');(work/'outputs').mkdir();(work/'inputs').mkdir();(work/'inputs/source-fixture.txt').write_text('public fixture')
-private=Path('/home/job/private-fixture.txt');private.write_text('synthetic-private-read-must-be-denied')
+Path('/home/job/private-fixture.txt').write_text('synthetic-private-read-must-be-denied')
+# Untrusted instructions where Claude would auto-load memory files; they must never reach the provider.
+for memory in (work/'CLAUDE.md',work/'inputs/CLAUDE.md'):memory.write_text('UNTRUSTED_CLAUDE_MD_MARKER')
 (work/'schema.json').write_text(json.dumps(NATIVE_SCHEMA))
-observed={'requests':0,'private_denied':False,'names':[],'write_result':None,'read_result':None,'discovery':None,'schemas':{}}
+answer=json.dumps({'category':'Insufficient context','evidence':'fixture only'})
+steps=[('Read',{'file_path':'/home/job/private-fixture.txt'}),('Read',{'file_path':'/workspace/inputs/source-fixture.txt'}),
+ ('Glob',{'pattern':'**/*.txt','path':'/workspace/inputs'}),('Edit',{'file_path':'/workspace/outputs/report.md','old_string':'','new_string':'fixture native report'}),
+ ('Edit',{'file_path':'/workspace/escape.md','old_string':'','new_string':'escaped'})]
+observed={'tools':None,'results':[],'claude_md':False}
 class H(BaseHTTPRequestHandler):
  def log_message(self,*_args):pass
- def do_GET(self):
-  data={'id':'claude-opus-5','type':'model','display_name':'Fixture','created_at':'2026-01-01T00:00:00Z','capabilities':None,'max_input_tokens':200000,'max_tokens':8192}
-  self.reply(data)
  def reply(self,data):
   raw=json.dumps(data).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+ def do_GET(self):
+  self.reply({'id':'claude-opus-5','type':'model','display_name':'Fixture','created_at':'2026-01-01T00:00:00Z','capabilities':None,'max_input_tokens':200000,'max_tokens':8192})
  def do_POST(self):
-  body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  raw=self.rfile.read(int(self.headers['Content-Length']));body=json.loads(raw)
+  observed['claude_md']=observed['claude_md'] or b'UNTRUSTED_CLAUDE_MD_MARKER' in raw
   if self.path.startswith('/v1/messages/count_tokens'):self.reply({'input_tokens':10});return
-  observed['requests']+=1;n=observed['requests']
-  tools=body.get('tools',[]);observed['names']=sorted(t.get('name','')for t in tools)
-  observed['schemas']={t['name']:t.get('input_schema')for t in tools if t.get('name')in['Read','Edit']}
-  if n>1:
-   results=[b for m in body.get('messages',[])for b in (m.get('content',[])if isinstance(m.get('content'),list)else[])if b.get('type')=='tool_result']
-   if results:
-    last=results[-1]
-    if n==2:observed['read_result']=last;observed['private_denied']=last.get('is_error') is True and 'synthetic-private-read-must-be-denied' not in json.dumps(last)
-    if n==3:observed['discovery']=last
-    if n==4:observed['write_result']=last
+  tools=body.get('tools',[])
+  if tools:observed['tools']=observed['tools'] or sorted(t.get('name','')for t in tools)
+  results=[b for m in body.get('messages',[])for b in (m.get('content',[])if isinstance(m.get('content'),list)else[])if b.get('type')=='tool_result']
+  if tools:observed['results']=[{'is_error':r.get('is_error') is True,'text':json.dumps(r.get('content'))}for r in results]
+  n=len(results)
   structured=next((t.get('name')for t in tools if 'result_json' in t.get('input_schema',{}).get('properties',{})),None)
-  if n==1:name,inputs='Read',{'file_path':'/home/job/private-fixture.txt'}
-  elif n==2:name,inputs='Read',{'file_path':'/workspace/inputs'}
-  elif n==3:name,inputs='Edit',{'file_path':'/workspace/outputs/report.md','old_string':'','new_string':'fixture native report'}
-  elif n==4 and structured:name,inputs=structured,{'result_json':json.dumps({'category':'Insufficient context','evidence':'fixture only'})}
-  else:name,inputs=None,None
-  content={'type':'tool_use','id':'tool_fixture_'+str(n),'name':name,'input':inputs}if name else {'type':'text','text':json.dumps({'result_json':json.dumps({'category':'Insufficient context','evidence':'fixture only'})})}
+  # A side request without tools (a title, a summary) gets plain text and is not a step.
+  name,inputs=(None,None) if not tools else steps[n] if n<len(steps) else (structured,{'result_json':answer}) if n==len(steps) and structured else (None,None)
+  content={'type':'tool_use','id':'tool_fixture_'+str(n),'name':name,'input':inputs}if name else {'type':'text','text':json.dumps({'result_json':answer})}
   message={'id':'msg_fixture_'+str(n),'type':'message','role':'assistant','model':'claude-opus-5','content':[content],'stop_reason':'tool_use'if name else'end_turn','stop_sequence':None,'usage':{'input_tokens':10,'output_tokens':10}}
   if not body.get('stream'):self.reply(message);return
   events=[('message_start',{'type':'message_start','message':{**message,'content':[],'stop_reason':None}})]
@@ -245,23 +250,103 @@ class H(BaseHTTPRequestHandler):
   self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
 server=ThreadingHTTPServer(('127.0.0.1',0),H)
 threading.Thread(target=server.serve_forever,daemon=True).start()
-env={**os.environ,'ANTHROPIC_API_KEY':'sk-ant-synthetic-fixture-not-a-real-key','ANTHROPIC_BASE_URL':'http://127.0.0.1:'+str(server.server_port),'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1','CLAUDE_CONFIG_DIR':'/home/job/.claude'}
-args=agent_argv({'agent':'claude','provider_id':'claude','model_id':'claude-opus-5','auth_type':'api_key','operation':'commit_analysis','reasoning_effort':None})+['--max-turns','6']
-p=subprocess.run(args,input='Execute the fixture tool calls and return structured output.',cwd=work,capture_output=True,text=True,timeout=25,env=env)
-result=None
-try:result=parse_agent('claude',p.stdout,None)
-except Exception:pass
+key='sk-ant-synthetic-fixture-not-a-real-key'
+env={**os.environ,'ANTHROPIC_API_KEY':key,'ANTHROPIC_BASE_URL':'http://127.0.0.1:'+str(server.server_port),'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1','CLAUDE_CONFIG_DIR':'/home/job/.claude'}
+profile={'agent':'claude','provider_id':'claude','model_id':'claude-opus-5','auth_type':'api_key','operation':'commit_analysis','reasoning_effort':None}
+result,code=None,None
+if interactive:
+ # The arguments a Herdr pane starts, with the onboarding and key approval a session seeds.
+ args=['claude']+session.agent_argv(agent_argv(profile),'claude')
+ env.update({'CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN':'1','TERM':'xterm-256color'})
+ session.seed_claude(env,profile)
+ pid,fd=pty.fork()
+ if pid==0:
+  # The prompt leads: a trailing one would be taken as another --add-dir directory.
+  os.chdir('/workspace');os.execvpe('claude',['claude','Execute the fixture tool calls.']+args[1:],env)
+ deadline,screen=time.monotonic()+60,b''
+ while time.monotonic()<deadline and len(observed['results'])<len(steps):
+  if select.select([fd],[],[],0.5)[0]:
+   try:screen=(screen+os.read(fd,65536))[-4000:]
+   except OSError:break
+ os.kill(pid,signal.SIGKILL);os.waitpid(pid,0)
+ # The terminal's last text, to diagnose a session that never reached the provider.
+ code=re.sub(r'\x1b\[[0-9;?>]*[A-Za-z]|\x1b\][^\x07]*\x07','',screen.decode(errors='replace'))[-1500:]
+else:
+ args=agent_argv(profile)+['--max-turns','8']
+ p=subprocess.run(args,input='Execute the fixture tool calls and return structured output.',cwd=work,capture_output=True,text=True,timeout=40,env=env)
+ code=p.returncode
+ try:result=parse_agent('claude',p.stdout,None)
+ except Exception:pass
 report=work/'outputs/report.md'
-print(json.dumps({'exit':p.returncode,'private_denied':observed['private_denied'],'requests':observed['requests'],'report_written':report.exists()and report.read_text()=='fixture native report','result':result,'tools':observed['names'],'stderr_empty':not p.stderr,'report_exists':report.exists(),'report_text':report.read_text()if report.exists()else None,'write_result':observed['write_result'],'schemas':observed['schemas'],'read_result':observed['read_result'],'discovery':observed['discovery']}))
+print(json.dumps({'exit':code,'result':result,'tools':observed['tools'],'results':observed['results'],'claude_md':observed['claude_md'],
+ 'report':report.read_text()if report.exists()else None,'escaped':(work/'escape.md').exists(),'argv':args}))
 server.shutdown()
-'''
-    client=docker.from_env(timeout=45)
+""".replace('ARGS',repr(interactive))
+    client=docker.from_env(timeout=90)
     output=client.containers.run('asset-monitor-claude:0.1.0',['python','-c',script],network_mode='none',user='10001:10001',read_only=True,
         cap_drop=['ALL'],security_opt=['no-new-privileges:true'],remove=True,working_dir='/workspace',mem_limit='768m',pids_limit=64,
         tmpfs={'/workspace':'rw,size=32m,uid=10001,gid=10001','/home/job':'rw,size=32m,uid=10001,gid=10001','/tmp':'rw,size=32m,uid=10001,gid=10001'})
-    result=json.loads(output)
-    assert result['exit']==0,result
-    assert result['private_denied'] and result['report_written'],json.dumps(result)
-    assert result['result']=={'category':'Insufficient context','evidence':'fixture only'},result
-    assert 'source-fixture.txt' in json.dumps(result['discovery']),json.dumps(result)
-    assert 'Bash' not in result['tools'] and 'WebFetch' not in result['tools']
+    observed=json.loads(output.decode().strip().splitlines()[-1])
+    assert '--allowedTools' not in observed['argv'] and '--bare' not in observed['argv']
+    # Offered tools equal the profile: no Bash, WebFetch or other built-in.
+    assert observed['tools']==sorted(['Edit','Glob','Grep','Read','Write']+([] if interactive else ['StructuredOutput'])),observed['exit']
+    private,source,discovery,report,escape=observed['results'][:5]
+    assert private['is_error'] and 'synthetic-private-read-must-be-denied' not in private['text'],observed
+    assert not source['is_error'] and 'public fixture' in source['text'],observed
+    assert not discovery['is_error'] and 'source-fixture.txt' in discovery['text'],observed
+    assert not report['is_error'] and observed['report']=='fixture native report',observed
+    assert escape['is_error'] and 'denied' in escape['text'] and not observed['escaped'],observed
+    assert not observed['claude_md'],observed  # Without --bare, no CLAUDE.md is auto-loaded either.
+    if not interactive:
+        assert observed['exit']==0,observed
+        assert observed['result']=={'category':'Insufficient context','evidence':'fixture only'},observed
+
+
+@pytest.mark.skipif(os.getenv('NUMEN_DOCKER_TESTS')!='1',reason='explicit credential-free native tool execution fixture')
+def test_pinned_claude_triage_is_offered_no_tools_with_loopback_provider():
+    """The pinned CLI sends Triage's turn with no tools at all, and its plain-text reply is the result."""
+    import docker
+    script=r"""import json,os,subprocess,threading
+from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+from numen_runner.adapters import agent_argv,final_text
+answer=json.dumps({'decision':'unrelated','title':'Documentation wording','reason':'No security bearing'})
+observed=[]
+class H(BaseHTTPRequestHandler):
+ def log_message(self,*_args):pass
+ def reply(self,data):
+  raw=json.dumps(data).encode();self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+ def do_GET(self):
+  self.reply({'id':'claude-opus-5','type':'model','display_name':'Fixture','created_at':'2026-01-01T00:00:00Z','capabilities':None,'max_input_tokens':200000,'max_tokens':8192})
+ def do_POST(self):
+  body=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+  if self.path.startswith('/v1/messages/count_tokens'):self.reply({'input_tokens':10});return
+  observed.append({'path':self.path,'tools':body.get('tools')})
+  message={'id':'msg_fixture','type':'message','role':'assistant','model':'claude-opus-5','content':[{'type':'text','text':answer}],'stop_reason':'end_turn','stop_sequence':None,'usage':{'input_tokens':10,'output_tokens':10}}
+  if not body.get('stream'):self.reply(message);return
+  events=[('message_start',{'type':'message_start','message':{**message,'content':[],'stop_reason':None}}),
+   ('content_block_start',{'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}}),
+   ('content_block_delta',{'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':answer}}),
+   ('content_block_stop',{'type':'content_block_stop','index':0}),
+   ('message_delta',{'type':'message_delta','delta':{'stop_reason':'end_turn','stop_sequence':None},'usage':{'output_tokens':10}}),('message_stop',{'type':'message_stop'})]
+  raw=''.join('event: '+kind+'\ndata: '+json.dumps(value)+'\n\n'for kind,value in events).encode()
+  self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+server=ThreadingHTTPServer(('127.0.0.1',0),H)
+threading.Thread(target=server.serve_forever,daemon=True).start()
+env={**os.environ,'ANTHROPIC_API_KEY':'sk-ant-synthetic-fixture-not-a-real-key','ANTHROPIC_BASE_URL':'http://127.0.0.1:'+str(server.server_port),'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC':'1','CLAUDE_CONFIG_DIR':'/home/job/.claude'}
+profile={'agent':'claude','provider_id':'claude','model_id':'claude-opus-5','auth_type':'api_key','operation':'commit_triage','reasoning_effort':None}
+args=agent_argv(profile)
+p=subprocess.run(args,input='Triage this change and reply with JSON.',cwd='/workspace',capture_output=True,text=True,timeout=40,env=env)
+try:text=final_text('claude',p.stdout)
+except Exception as exc:text='failed: '+repr(exc)
+print(json.dumps({'exit':p.returncode,'text':text,'requests':observed,'argv':args,'stderr':p.stderr[-1500:]}))
+server.shutdown()
+"""
+    client=docker.from_env(timeout=90)
+    output=client.containers.run('asset-monitor-claude:0.1.0',['python','-c',script],network_mode='none',user='10001:10001',read_only=True,
+        cap_drop=['ALL'],security_opt=['no-new-privileges:true'],remove=True,working_dir='/workspace',mem_limit='768m',pids_limit=64,
+        tmpfs={'/workspace':'rw,size=32m,uid=10001,gid=10001','/home/job':'rw,size=32m,uid=10001,gid=10001','/tmp':'rw,size=32m,uid=10001,gid=10001'})
+    observed=json.loads(output.decode().strip().splitlines()[-1])
+    assert observed['exit']==0,observed
+    assert observed['text']==json.dumps({'decision':'unrelated','title':'Documentation wording','reason':'No security bearing'}),observed
+    assert observed['requests'] and all(request['tools'] in (None,[]) for request in observed['requests']),observed
+    assert '--allowedTools' not in observed['argv'] and observed['argv'][observed['argv'].index('--tools')+1]==''

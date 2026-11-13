@@ -290,8 +290,8 @@ const triage = {
   error: null,
   result: {
     decision: "security_candidate",
-    change_kind: "vulnerability_fix",
-    confidence: { level: "medium" },
+    title: "Potential path traversal in template selection",
+    reason: "The include path is now validated",
   },
 };
 function serveJobs(jobs: Record<string, unknown>[]) {
@@ -452,4 +452,64 @@ it("summarizes an Upstream derivation", async () => {
   expect(
     within(outcome).getByText("2 unresolved packages"),
   ).toBeInTheDocument();
+});
+
+it("summarizes an Analysis by its Verdict and confidence", async () => {
+  serveJobs([
+    {
+      ...triage,
+      id: "job-analysis",
+      kind: "commit_analysis",
+      result: {
+        verdict: "Vulnerability fix",
+        confidence: "high",
+        finding_id: "finding-1",
+      },
+    },
+  ]);
+  renderJob("job-analysis");
+  const outcome = await screen.findByRole("region", { name: "Job outcome" });
+  expect(outcome).toHaveTextContent(
+    "Commit analysis succeeded: Vulnerability fix · finding created",
+  );
+  expect(within(outcome).getByText("High confidence")).toBeInTheDocument();
+});
+
+it.each([
+  [
+    "commit_analysis",
+    "api_key_required",
+    "Automated runs use only Provider accounts that hold an API key.",
+  ],
+  ["commit_triage", "triage_codex_unsupported", "Triage cannot run on Codex."],
+  [
+    "commit_analysis",
+    "analysis_codex_unsupported",
+    "Analysis and CVE analysis cannot run on Codex",
+  ],
+  [
+    "commit_analysis",
+    "verdict_not_allowed",
+    "Served content can only be Malicious change",
+  ],
+  [
+    "commit_analysis",
+    "timeout",
+    "Analysis stopped at its 30-minute deadline. The change stays pending and is never read as Unrelated.",
+  ],
+])("explains a %s failed with %s", async (kind, code, hint) => {
+  serveJobs([
+    {
+      ...triage,
+      id: "job-failed",
+      kind,
+      status: "failed",
+      result: null,
+      error: { code, message: "Refused", retryable: false },
+    },
+  ]);
+  renderJob("job-failed");
+  expect(
+    await screen.findByRole("region", { name: "Job outcome" }),
+  ).toHaveTextContent(hint);
 });

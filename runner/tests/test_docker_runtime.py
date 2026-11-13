@@ -7,7 +7,7 @@ import tarfile
 import threading
 import uuid
 import pytest
-from numen_runner.contracts import RunRequest, validate_outputs
+from numen_runner.contracts import PROVIDERS, RunRequest
 from numen_runner.engine import DockerEngine, RuntimeFailure, LABEL, INSTANCE, VERSION
 
 pytestmark = pytest.mark.skipif(os.getenv("NUMEN_DOCKER_TESTS") != "1", reason="explicit Docker Engine verification only")
@@ -42,7 +42,7 @@ def test_agent_source_archive_is_staged_as_read_only_files(engine):
             info.size = len(path)
             archive.addfile(info, io.BytesIO(path.encode()))
     job = RunRequest(attempt_token=run_id, kind="agent",
-                     profile={"operation": "cve_analysis", "model_id": "m", "credential": {"api_key": "k"}},
+                     profile={"agent": "pi", "provider_id": "deepseek", "operation": "cve_analysis", "model_id": "m", "credential": {"api_key": "k"}},
                      inputs=[{"path": "source", "content_base64": base64.b64encode(payload.getvalue()).decode(), "archive": True}])
     labels = {LABEL: run_id, INSTANCE: engine.instance}
     try:
@@ -149,9 +149,12 @@ def test_reconciliation_removes_abandoned_workloads(engine):
     run_id=str(uuid.uuid4())
     network=engine.client.networks.create('numen-abandoned-'+run_id,internal=True,labels={LABEL:run_id,INSTANCE:engine.instance})
     engine.client.containers.run('asset-monitor-probe:0.1.0',['sleep','60'],network=network.name,labels={LABEL:run_id,INSTANCE:engine.instance},detach=True)
+    # The git mirror volume build runs shared before ADR-0005 carries no run label.
+    cache=engine.client.volumes.create('numen-git-cache-test-'+run_id,labels={INSTANCE:engine.instance,'org.pruferva.asset-monitor.cache':'git'})
     engine.reconcile()
     assert not engine.client.containers.list(all=True,filters={"label":f"{LABEL}={run_id}"})
     assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
+    assert cache.name not in {v.name for v in engine.client.volumes.list()}
 
 
 def test_codex_narrow_seccomp_preserves_native_read_and_write_policies(engine):
@@ -352,71 +355,6 @@ def test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed(
             engine.cleanup(run_id)
 
 
-def test_build_run_shares_its_workspace_and_carries_the_offline_lab_base(engine):
-    run_id = str(uuid.uuid4())
-    job = RunRequest(attempt_token=run_id, kind="agent", build=True,
-                     profile={"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}})
-    labels = {LABEL:run_id, INSTANCE:engine.instance}
-    events = []
-    try:
-        network = engine.client.networks.create("numen-job-" + run_id, internal=True, labels=labels)
-        workspace = engine.prepare_workspace(run_id, "asset-monitor-codex:" + VERSION, labels)
-        daemon = engine.start_build_daemon(run_id, job, network, labels, workspace)
-        engine.load_lab_base(daemon, events.append)
-        assert [e["type"] for e in events] == ["build_base_loaded"], events
-        spec = engine.spec(job, network, labels)
-        # The workspace is disk backed for a build run, and the workload itself stays unprivileged.
-        assert "/workspace" not in spec["tmpfs"] and spec["read_only"] and spec["user"] == "10001:10001"
-        assert spec["cap_drop"] == ["ALL"] and "no-new-privileges:true" in spec["security_opt"]
-        observed = engine.client.containers.run(
-            "asset-monitor-codex:" + VERSION,
-            ["sh","-c",
-             "id -u; git --version >/dev/null && echo git-ok; "
-             "test -e /var/run/docker.sock && echo SOCKET || echo no-host-socket; "
-             "echo shared > /workspace/share/from-agent.txt; "
-             # A bind mount source resolves in the daemon, so this only works because it shares the volume.
-             "docker run --rm -v /workspace/share:/s asset-monitor-lab:" + VERSION + " "
-             "sh -c 'cat /s/from-agent.txt; echo written-by-container > /s/from-container.txt'; "
-             "cat /workspace/share/from-container.txt"],
-            environment={"DOCKER_HOST":"tcp://docker:2375"}, network=network.name,
-            volumes={workspace.name:{"bind":"/workspace","mode":"rw"}}, user="10001:10001",
-            labels=labels, remove=True)
-        assert observed.decode().split() == ["10001","git-ok","no-host-socket","shared","written-by-container"]
-    finally:
-        engine.cleanup(run_id)
-        assert not engine.client.containers.list(all=True,filters={"label":f"{LABEL}={run_id}"})
-        assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})
-        assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
-
-
-@pytest.mark.parametrize("operation", ["cve_analysis", "commit_analysis"])
-def test_build_agent_run_wires_the_daemon_and_workspace_before_the_provider_step(engine, operation):
-    run_id = str(uuid.uuid4())
-    job = RunRequest(attempt_token=run_id, kind="agent", build=True, limits={"timeout_seconds":600},
-                     profile={"agent":"codex","provider_id":"openai","model_id":"m",
-                              "operation":operation,"credential":{"api_key":"fixture-key-no-real-access"}})
-    events = []
-    try:
-        # The run cannot reach a provider with a fixture credential; its capability wiring still must hold.
-        with pytest.raises(RuntimeFailure):
-            engine.run(run_id, job, lambda: False, events.append)
-        kinds = [e["type"] for e in events]
-        assert "build_daemon_started" in kinds and "build_base_loaded" in kinds, events
-        workload = next(c for c in engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})
-                        if c.image.tags and c.image.tags[0].startswith("asset-monitor-codex"))
-        environment = workload.attrs["Config"]["Env"]
-        assert "DOCKER_HOST=tcp://docker:2375" in environment
-        # The daemon is reached directly, never through the credential-free provider proxy.
-        assert any(v.startswith("NO_PROXY=") and v.endswith(",docker") for v in environment), environment
-        workspace = [m for m in workload.attrs["Mounts"] if m["Destination"] == "/workspace"]
-        assert workspace and workspace[0]["Type"] == "volume" and workspace[0]["RW"]
-        assert workload.attrs["HostConfig"]["ReadonlyRootfs"] and workload.attrs["HostConfig"]["CapDrop"] == ["ALL"]
-        assert not any(m["Source"] == "/var/run/docker.sock" for m in workload.attrs["Mounts"])
-    finally:
-        engine.cleanup(run_id)
-        assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})
-
-
 PHP_BASE = "php@sha256:8c0ac7363ba26de6279a0614a9072277e3c86f90d11447002bdf74ad7db9aac3"
 
 
@@ -491,30 +429,57 @@ print("observed the stored value rendered by the application")
         assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
 
 
-def test_build_run_outputs_a_whole_application_bundle_past_the_log_bound(engine):
-    """The reported failure: a bundle of thousands of files died on 'output limit exceeded'."""
+def test_analysis_container_has_no_docker_daemon_no_registry_and_only_provider_and_herdr_egress(engine, monkeypatch):
+    """An Analysis builds nothing. DockerEngine.run sets up a real Analysis run in a Herdr session,
+    with only its workload command swapped for a probe (so no agent or provider is involved): the
+    workload has no daemon, socket or registry, and its only way out is the credential-free gateway,
+    which allows its provider's hosts plus herdr.dev."""
+    from docker.models.containers import ContainerCollection
     run_id = str(uuid.uuid4())
-    job = RunRequest(attempt_token=run_id, kind="agent", build=True,
-                     profile={"operation":"cve_analysis","model_id":"m","credential":{"api_key":"k"}})
-    labels = {LABEL:run_id, INSTANCE:engine.instance}
+    job = RunRequest(attempt_token=run_id, kind="agent", limits={"timeout_seconds":120},
+                     profile={"agent":"pi","provider_id":"deepseek","model_id":"m","operation":"commit_analysis",
+                              "credential":{"api_key":"fixture-key-no-real-access"}})
+    script = """import http.client,json,os,shutil,socket,time
+for _ in range(50):
+ try:
+  c=http.client.HTTPConnection('gateway',8082,timeout=2);c.request('GET','/health');c.getresponse().read();break
+ except OSError:time.sleep(.2)
+def connect(host):
+ c=http.client.HTTPConnection('gateway',8082,timeout=10);c.request('CONNECT',host+':443');return c.getresponse().status
+def resolves(host):
+ try:socket.getaddrinfo(host,2375);return True
+ except OSError:return False
+s=socket.socket();s.settimeout(3)
+try:s.connect(('8.8.8.8',443));direct=True
+except OSError:direct=False
+print(json.dumps({'envelope':{'outputs':[],'result':{'docker_binary':shutil.which('docker'),
+ 'docker_socket':os.path.exists('/var/run/docker.sock'),'docker_host':'DOCKER_HOST' in os.environ,
+ 'daemon_resolves':resolves('docker'),'direct_egress':direct,
+ 'registries':{h:connect(h) for h in ('registry.npmjs.org','github.com','pypi.org')}}}}))
+"""
+    create = ContainerCollection.create
+    def probe(self, image, command=None, **kwargs):
+        if command == ["python","-m","numen_runner.workload"]:
+            command = ["python","-c",script]
+        return create(self, image, command, **kwargs)
+    monkeypatch.setattr(ContainerCollection, "create", probe)
+    monkeypatch.setattr(engine, "agent_backend", "herdr")
     try:
-        workspace = engine.prepare_workspace(run_id, "asset-monitor-codex:" + VERSION, labels)
-        # Stand in for the agent: write an application-sized bundle into its workspace.
-        engine.client.containers.run(
-            "asset-monitor-codex:" + VERSION,
-            ["sh","-c","mkdir -p /workspace/outputs/vulnerable-app/app && "
-                       "for i in $(seq 1 1200); do echo \"<?php // $i\" > /workspace/outputs/vulnerable-app/app/f$i.php; done && "
-                       "dd if=/dev/urandom of=/workspace/outputs/vulnerable-app/vendor.bin bs=1M count=80 2>/dev/null && "
-                       "printf '# Report' > /workspace/outputs/report.md"],
-            volumes={workspace.name:{"bind":"/workspace","mode":"rw"}}, user="10001:10001",
-            network_mode="none", labels=labels, remove=True)
-        outputs = engine.harvest_outputs(job, workspace, labels)
-        assert len(outputs) == 1202, len(outputs)
-        total = sum(o["size"] for o in outputs)
-        # Past both the former 512-file cap and the 16MB container log the envelope used to carry.
-        assert total > 80 * 1024 * 1024, total
-        assert any(o["path"] == "report.md" for o in outputs)
-        assert all(not o["path"].startswith("outputs/") for o in outputs)
-        validate_outputs(outputs, int(job.bounds["output_bytes"]))
+        observed = engine.run(run_id, job, lambda: False, lambda _: None)["result"]
+        assert observed == {"docker_binary": None, "docker_socket": False, "docker_host": False, "daemon_resolves": False,
+                            "direct_egress": False, "registries": {"registry.npmjs.org": 403, "github.com": 403, "pypi.org": 403}}
+        containers = {c.image.tags[0]: c for c in engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})}
+        assert set(containers) == {"asset-monitor-gateway:" + VERSION, "asset-monitor-pi:" + VERSION}
+        gateway, agent = containers["asset-monitor-gateway:" + VERSION], containers["asset-monitor-pi:" + VERSION]
+        config = dict(e.split("=", 1) for e in gateway.attrs["Config"]["Env"])["NUMEN_GATEWAY_CONFIG"]
+        assert json.loads(config) == {"provider_hosts": PROVIDERS["deepseek"] + ["herdr.dev"]}
+        assert not agent.attrs["HostConfig"]["Privileged"] and agent.attrs["HostConfig"]["CapDrop"] == ["ALL"]
+        assert list(agent.attrs["NetworkSettings"]["Networks"]) == ["numen-job-" + run_id]
+        # Only its read-only inputs and its private session home: no socket, no cache, no daemon.
+        assert {(m["Destination"], m["RW"]) for m in agent.attrs["Mounts"]} == {("/workspace/inputs", False), ("/home/job", True)}
+        assert not any(e.startswith("DOCKER_") for e in agent.attrs["Config"]["Env"])
     finally:
         engine.cleanup(run_id)
+        assert not engine.client.containers.list(all=True, filters={"label":f"{LABEL}={run_id}"})
+        assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
+        assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})

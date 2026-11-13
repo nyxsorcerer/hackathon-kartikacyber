@@ -170,14 +170,25 @@ export function applicationState(application: Application) {
         ? "monitoring"
         : "paused";
 }
+/** The outcome of Analysis, in the glossary's words. */
+export const verdicts = [
+  "Vulnerability fix",
+  "Vulnerability introduced",
+  "Malicious change",
+  "Security hardening",
+  "Unrelated",
+  "Insufficient context",
+] as const;
+/** The Verdicts that open a Finding with a drafted Proof bundle. */
+export const findingVerdicts: string[] = verdicts.slice(0, 2);
 const analysisResultSchema = z
   .object({
-    category: z.string().optional(),
+    verdict: z.string().optional(),
+    // low|medium|high; "unknown" for Verdicts carried over from Numen. CVE analysis keeps an object.
+    confidence: z.union([z.string(), unknownRecord]).optional(),
+    // Commit SHAs or advisory ids the change addresses.
+    addresses: z.array(z.string()).optional(),
     title: z.string().optional(),
-    finding_decision: z
-      .enum(["finding", "not_a_finding", "needs_more_evidence"])
-      .optional(),
-    finding_reason: z.string().optional(),
     vulnerable_ref: z.string().nullable().optional(),
     summary: z.string().optional(),
     report: z.string().optional(),
@@ -191,7 +202,6 @@ export const analysisSchema = z
     id: z.string().optional(),
     job_id: z.string().optional(),
     superseded: z.boolean().optional(),
-    category: z.string().optional(),
     summary: z.string().optional(),
     created_at: z.string().optional(),
     profile: profileSchema.optional(),
@@ -201,11 +211,6 @@ export const analysisSchema = z
   })
   .passthrough();
 export type Analysis = z.infer<typeof analysisSchema>;
-export const findingDecisionLabels: Record<string, string> = {
-  finding: "Finding",
-  not_a_finding: "Not a finding",
-  needs_more_evidence: "Needs more evidence",
-};
 /** Changed paths arrive as objects from source imports, or as bare paths. */
 const commitFileSchema = z.union([
   z.string().transform((path) => ({
@@ -236,6 +241,23 @@ export const commitSchema = z.object({
   triage_status: z.string(),
   triage_result: z.unknown().nullable(),
   review_decision: z.string(),
+  /** The newest Analysis's Verdict. */
+  verdict: z.string().nullable().default(null),
+  /** Where the latest Analysis stands: queued, waiting_for_cap, timed_out, blocked, failed, completed. */
+  analysis_state: z
+    .object({
+      status: z.string(),
+      since: z.string().optional(),
+      cap: z.string().optional(),
+      job_id: z.string().optional(),
+      error: z.unknown().optional(),
+    })
+    .nullable()
+    .default(null),
+  /** Pre-filter flags: each rule the change matched and the paths that matched it. */
+  prefilter: z
+    .array(z.object({ rule: z.string(), paths: z.array(z.string()) }))
+    .default([]),
   analyses: z.array(analysisSchema).default([]),
   /** Findings recorded from this revision. */
   findings: z
@@ -294,7 +316,6 @@ export const promptTemplatesSchema = z.object({
 export const promptPreviewSchema = z.object({
   prompt: z.string(),
   templates: z.array(z.string()),
-  build: z.boolean(),
 });
 export const scoreSchema = z.object({
   version: z.string(),
@@ -513,6 +534,17 @@ export const dashboardSchema = z.object({
   failed_jobs: z.number(),
   recent_events: z.array(z.unknown()),
   due_applications: z.array(z.unknown()),
+  /** The newest 20 changes of the Review queue, and how many it holds. */
+  review_queue: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string(),
+      revision: z.string(),
+      application_id: z.string().nullable(),
+      committed_at: z.string().nullable().optional(),
+    }),
+  ),
+  review_queue_count: z.number(),
 });
 export const agentSessionSchema = z.object({
   runs: z.array(z.string()),

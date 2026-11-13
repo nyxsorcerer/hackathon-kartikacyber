@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -164,12 +164,14 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
           triage_status: "security_candidate",
           triage_result: { decision: "security_candidate" },
           review_decision: "candidate",
+          verdict: "Vulnerability fix",
           analyses: [
             {
               id: "analysis-1",
               created_at: "2026-10-03T00:00:00Z",
               result: {
-                category: "Likely vulnerability fix",
+                verdict: "Vulnerability fix",
+                confidence: "unknown",
                 summary: "Prior evidence retained",
               },
               artifacts: [],
@@ -203,7 +205,9 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
   const user = userEvent.setup();
   render(<App />);
   expect(
-    await screen.findByText("Likely vulnerability fix"),
+    within(
+      await screen.findByRole("region", { name: "Analysis summary" }),
+    ).getByText("Vulnerability fix"),
   ).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Create finding" })).toHaveAttribute(
     "href",
@@ -232,4 +236,55 @@ it("requires an explicit analysis submit and preserves the runtime model and nat
       },
     },
   ]);
+});
+
+it("lists the Review queue on the dashboard", async () => {
+  const dashboard = {
+    applications: 1,
+    security_reviews: 0,
+    eligible_cves: 0,
+    open_findings: 0,
+    running_jobs: 0,
+    failed_jobs: 0,
+    recent_events: [],
+    due_applications: [],
+    review_queue: [
+      {
+        id: "commit-1",
+        title: "Rework session cookie handling",
+        revision: "c".repeat(40),
+        application_id: "application-1",
+        committed_at: "2026-10-06T00:00:00Z",
+      },
+    ],
+    review_queue_count: 21,
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const body =
+        url === "/api/auth/session"
+          ? { authenticated: true, username: "admin", csrf_token: "token" }
+          : url === "/api/dashboard"
+            ? dashboard
+            : { items: [], next_cursor: null };
+      return new Response(JSON.stringify(body));
+    }),
+  );
+  render(<App />);
+  const queue = await screen.findByRole("region", { name: "Review queue" });
+  expect(
+    within(queue).getByRole("link", { name: /Rework session cookie handling/ }),
+  ).toHaveAttribute("href", "/commits/commit-1");
+  expect(within(queue).getByText("cccccccccc")).toBeInTheDocument();
+  expect(
+    within(queue).getByText("Showing the newest 1 of 21."),
+  ).toBeInTheDocument();
+  cleanup();
+  dashboard.review_queue = [];
+  dashboard.review_queue_count = 0;
+  render(<App />);
+  expect(
+    await screen.findByText("The Review queue is empty"),
+  ).toBeInTheDocument();
 });

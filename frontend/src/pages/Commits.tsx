@@ -26,12 +26,15 @@ import {
   commitsSchema,
   applicationSchema,
   applicationsSchema,
+  findingVerdicts,
   repositoryLabel,
   reviewBatchSchema,
+  verdicts,
 } from "../types";
 import type { Analysis, Commit, CommitFile, Application } from "../types";
 import { AnalysisResult } from "../components/AnalysisResult";
 import { JobLaunch } from "../components/JobLaunch";
+import { confidenceText } from "../jobSummary";
 import {
   ActionButton,
   announceChange,
@@ -41,6 +44,7 @@ import {
   countBy,
   DataState,
   date,
+  describeError,
   DetailGrid,
   DiffView,
   Empty,
@@ -60,59 +64,105 @@ import {
   toneFor,
   useShowMore,
 } from "../components/ui";
-const findingCategories = [
-  "Likely vulnerability fix",
-  "Potentially introduced vulnerability",
-];
-function categoryOf(analysis: Analysis) {
-  return analysis.result?.category || analysis.category;
+function verdictOf(analysis: Analysis) {
+  return analysis.result?.verdict;
 }
-function triageField(
-  commit: Commit,
-  key: "decision" | "reason" | "confidence" | "title" | "change_kind",
-) {
+function triageField(commit: Commit, key: "decision" | "reason" | "title") {
   const result = commit.triage_result;
   if (typeof result !== "object" || !result || !(key in result)) return;
   const value: unknown = Reflect.get(result, key);
   return typeof value === "string" ? value : undefined;
 }
+/** A Triage that failed or was blocked decided nothing, so it is never read as unrelated. */
+function triageKey(commit: Commit) {
+  return ["failed", "blocked"].includes(commit.triage_status)
+    ? commit.triage_status
+    : triageField(commit, "decision") || commit.triage_status;
+}
 function TriageBadge({ commit }: { commit: Commit }) {
-  return (
-    <Badge>
-      {changeLabels[triageField(commit, "change_kind") || ""] ||
-        triageField(commit, "decision") ||
-        commit.triage_status}
-    </Badge>
+  const key = triageKey(commit);
+  return key === "failed" || key === "blocked" ? (
+    <Badge tone="danger">{`Triage ${key}`}</Badge>
+  ) : (
+    <Badge>{key}</Badge>
   );
 }
-const changeLabels: Record<string, string> = {
-  vulnerability_fix: "Possible vulnerability fix",
-  security_hardening: "Security hardening",
-  vulnerability_introduction: "Potentially introduced vulnerability",
-  unrelated: "Unrelated change",
-  insufficient_context: "Insufficient context",
+const prefilterLabels: Record<string, string> = {
+  dependency_manifest: "Dependency manifest",
+  package_scripts: "Package scripts",
+  ci_workflow: "CI workflow",
+  minified_or_obfuscated: "Minified or obfuscated",
+  auth_or_crypto: "Auth or crypto",
 };
+function prefilterLabel(rule: string) {
+  return prefilterLabels[rule] || humanize(rule);
+}
+/** The Pre-filter's flags, shown beside the Triage result they never override. */
+function PrefilterFlags({ commit }: { commit: Commit }) {
+  if (!commit.prefilter.length) return null;
+  return (
+    <ul className="chip-row prefilter-flags" aria-label="Pre-filter flags">
+      {commit.prefilter.map((flag) => (
+        <li className="chip" key={flag.rule} title={flag.paths.join("\n")}>
+          {prefilterLabel(flag.rule)}
+        </li>
+      ))}
+    </ul>
+  );
+}
+const analysisStates: Record<string, { label: string; tone: string }> = {
+  queued: { label: "Queued", tone: "info" },
+  waiting_for_cap: { label: "Waiting for cap", tone: "warm" },
+  timed_out: { label: "Timed out after 30 minutes", tone: "danger" },
+  blocked: { label: "Blocked", tone: "danger" },
+  failed: { label: "Failed", tone: "danger" },
+};
+const capLabels: Record<string, string> = {
+  application: "Application",
+  account: "Provider account",
+};
+/** The newest Verdict with its confidence, and where a later Analysis stands. */
+function AnalysisState({ commit }: { commit: Commit }) {
+  const state = commit.analysis_state;
+  const shown = state ? analysisStates[state.status] : undefined;
+  const confidence = confidenceText(commit.analyses[0]?.result?.confidence);
+  const detail =
+    state?.status === "waiting_for_cap"
+      ? `Daily ${capLabels[state.cap || ""] || "Analysis"} cap reached`
+      : describeError(state?.error);
+  return (
+    <>
+      {commit.verdict ? (
+        <>
+          <Badge>{commit.verdict}</Badge>
+          {confidence && (
+            <div className="table-subtitle">{humanize(confidence)}</div>
+          )}
+        </>
+      ) : (
+        !shown &&
+        (commit.analyses.length ? (
+          <Badge>Report available</Badge>
+        ) : (
+          <span className="muted">Not analysed</span>
+        ))
+      )}
+      {shown && (
+        <div className={commit.verdict ? "table-subtitle" : undefined}>
+          <Badge tone={shown.tone}>{shown.label}</Badge>
+          {detail && state?.status !== "timed_out" && (
+            <div className="table-subtitle clamp">{detail}</div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
 function commitTitle(commit: Commit) {
   return (
     commit.analyses[0]?.result?.title ||
     triageField(commit, "title") ||
     commit.message.split("\n")[0]
-  );
-}
-function changeKind(commit: Commit) {
-  const category = commit.analyses[0] && categoryOf(commit.analyses[0]);
-  return (
-    (
-      {
-        "Likely vulnerability fix": "vulnerability_fix",
-        "Potentially introduced vulnerability": "vulnerability_introduction",
-        "Security hardening": "security_hardening",
-        "Unrelated change": "unrelated",
-        "Insufficient context": "insufficient_context",
-      } as Record<string, string>
-    )[category || ""] ||
-    triageField(commit, "change_kind") ||
-    "unknown"
   );
 }
 function triageConfidence(commit: Commit) {
@@ -151,11 +201,11 @@ export function AnalysisHistory({
     return (
       <Empty
         icon={FileSearch}
-        title="No detailed analysis yet"
-        description="Choose Analyze and review the execution profile. The agent can investigate the before/after source, build a lab, and determine whether a finding is supported."
+        title="No Analysis yet"
+        description="Analysis starts automatically when Triage flags this change, or choose Analyze. It reads a read-only checkout of the commit, builds nothing, and gives one Verdict."
       />
     );
-  const category = categoryOf(analysis);
+  const verdict = verdictOf(analysis);
   return (
     <div className="commit-analysis-history">
       <div className="analysis-run-toolbar">
@@ -191,25 +241,25 @@ export function AnalysisHistory({
         analysis={analysis}
         kind="commit"
       />
-      {(category === "Insufficient context" ||
-        analysis.result?.finding_decision === "needs_more_evidence") &&
-        onRerun && (
-          <Callout
-            tone="warm"
-            title="More evidence is needed"
-            action={
+      {verdict === "Insufficient context" && (
+        <Callout
+          tone="warm"
+          title="Sent to the Review queue"
+          action={
+            onRerun && (
               <button className="secondary" onClick={onRerun}>
                 Analyze again
               </button>
-            }
-          >
-            Review the open questions and available source before starting
-            another run.
-          </Callout>
-        )}
-      {!analysis.result?.finding_decision &&
-        !analysis.result?.finding_id &&
-        findingCategories.includes(category || "") && (
+            )
+          }
+        >
+          Analysis could not decide from what it could see, so the change waits
+          in the Review queue for your review decision. Review the open
+          questions and source, or analyze it again.
+        </Callout>
+      )}
+      {!analysis.result?.finding_id &&
+        findingVerdicts.includes(verdict || "") && (
           <Link
             className="secondary button"
             to={`/findings/new?application_id=${encodeURIComponent(applicationId)}${commitId ? `&source_commit_id=${encodeURIComponent(commitId)}` : ""}${analysis.id ? `&source_analysis_id=${encodeURIComponent(analysis.id)}` : ""}`}
@@ -351,9 +401,6 @@ export function sortCommits(items: Commit[], oldest = false) {
     oldest ? committedAt(a) - committedAt(b) : committedAt(b) - committedAt(a),
   );
 }
-function triageKey(commit: Commit) {
-  return triageField(commit, "decision") || commit.triage_status;
-}
 function dayLabel(commit: Commit) {
   if (!commit.committed_at) return "Undated";
   return new Date(commit.committed_at).toLocaleDateString(undefined, {
@@ -369,7 +416,7 @@ type CommitFilters = {
   triage: string;
   show: string;
   sort: string;
-  kind: string;
+  verdict: string;
 };
 function applyCommitFilters(
   items: Commit[],
@@ -391,9 +438,14 @@ function applyCommitFilters(
         f.decision === "all" ||
         c.review_decision === f.decision) &&
       (skip === "triage" || f.triage === "all" || triageKey(c) === f.triage) &&
-      (skip === "kind" || f.kind === "all" || changeKind(c) === f.kind) &&
+      (skip === "verdict" ||
+        f.verdict === "all" ||
+        (c.verdict || "none") === f.verdict) &&
       (skip === "show" ||
         f.show === "all" ||
+        (f.show === "review" &&
+          c.verdict === "Insufficient context" &&
+          c.review_decision === "pending") ||
         (f.show === "analyzed" && c.analyses.length > 0) ||
         (f.show === "unanalyzed" && c.analyses.length === 0) ||
         (f.show === "incomplete" && !c.diff_complete) ||
@@ -560,7 +612,7 @@ export function CommitList({
     triage: "all",
     show: "all",
     sort: "newest",
-    kind: "all",
+    verdict: "all",
   });
   const items = useMemo(() => commits.data?.items || [], [commits.data]);
   const visible = useMemo(
@@ -577,7 +629,7 @@ export function CommitList({
     filters.triage,
     filters.show,
     filters.sort,
-    filters.kind,
+    filters.verdict,
   ].join("|");
   const { shown, footer } = useShowMore(visible, filterKey);
   // A selection belongs to one filtered view, so a batch change never reaches
@@ -658,17 +710,23 @@ export function CommitList({
     applyCommitFilters(items, filters, "triage"),
     triageKey,
   );
-  const kindCounts = countBy(
-    applyCommitFilters(items, filters, "kind"),
-    changeKind,
+  const verdictCounts = countBy(
+    applyCommitFilters(items, filters, "verdict"),
+    (c) => c.verdict || "none",
   );
   const clear = () =>
-    update({ q: "", decision: "all", triage: "all", show: "all", kind: "all" });
+    update({
+      q: "",
+      decision: "all",
+      triage: "all",
+      show: "all",
+      verdict: "all",
+    });
   let lastDay = "";
   return (
     <Panel
-      title={application ? "Source history" : "Review queue"}
-      description="Triage classification and detailed analysis are separate judgments."
+      title={application ? "Source history" : "Commit review"}
+      description="A Triage flag starts Analysis automatically. Analysis reads a read-only checkout, builds nothing, and gives one Verdict."
       className="commit-queue-panel"
     >
       <div className="queue-filters">
@@ -699,20 +757,20 @@ export function CommitList({
         </div>
         <div className="queue-filters-row secondary-filters">
           <FilterSelect
-            label="Change type"
-            value={filters.kind}
-            onChange={(kind) => update({ kind })}
+            label="Verdict"
+            value={filters.verdict}
+            onChange={(verdict) => update({ verdict })}
             options={[
               { value: "all", label: "Any" },
-              ...Object.entries(changeLabels).map(([value, label]) => ({
+              ...verdicts.map((value) => ({
                 value,
-                label,
-                count: kindCounts[value] || 0,
+                label: value,
+                count: verdictCounts[value] || 0,
               })),
               {
-                value: "unknown",
-                label: "Not classified",
-                count: kindCounts.unknown || 0,
+                value: "none",
+                label: "Not analysed",
+                count: verdictCounts.none || 0,
               },
             ]}
           />
@@ -734,11 +792,17 @@ export function CommitList({
           <FilterSelect
             label="Show"
             value={filters.show}
-            onChange={(show) => update({ show })}
+            // The Review queue holds only changes still pending a decision.
+            onChange={(show) =>
+              update(
+                show === "review" ? { show, decision: "pending" } : { show },
+              )
+            }
             options={[
               { value: "all", label: "All revisions" },
+              { value: "review", label: "Review queue" },
               { value: "analyzed", label: "With analysis" },
-              { value: "unanalyzed", label: "Not analyzed" },
+              { value: "unanalyzed", label: "Not analysed" },
               { value: "incomplete", label: "Incomplete diff" },
               { value: "finding", label: "With finding" },
             ]}
@@ -815,14 +879,13 @@ export function CommitList({
                   <th scope="col">Security issue / revision</th>
                   <th scope="col">Author</th>
                   <th scope="col">Triage</th>
-                  <th scope="col">Detailed analysis</th>
+                  <th scope="col">Analysis</th>
                   <th scope="col">Decision</th>
                 </tr>
               </thead>
               <tbody>
                 {shown.flatMap((commit) => {
                   const day = dayLabel(commit);
-                  const latest = commit.analyses[0];
                   const title = commitTitle(commit);
                   const subject = commit.message.split("\n")[0];
                   const isSelected = selectedIds.has(commit.id);
@@ -885,6 +948,12 @@ export function CommitList({
                       </td>
                       <td>
                         <TriageBadge commit={commit} />
+                        {["failed", "blocked"].includes(triageKey(commit)) && (
+                          <div className="table-subtitle clamp">
+                            {triageField(commit, "reason")}
+                          </div>
+                        )}
+                        <PrefilterFlags commit={commit} />
                         {!commit.diff_complete && (
                           <div className="table-subtitle warning">
                             Incomplete diff
@@ -892,13 +961,7 @@ export function CommitList({
                         )}
                       </td>
                       <td>
-                        {latest ? (
-                          <Badge>
-                            {categoryOf(latest) || "Report available"}
-                          </Badge>
-                        ) : (
-                          <span className="muted">Not analyzed</span>
-                        )}
+                        <AnalysisState commit={commit} />
                       </td>
                       <td>
                         <DecisionBadge decision={commit.review_decision} />
@@ -1054,7 +1117,7 @@ export function Reviews() {
       {!scope.application ? (
         <Panel
           title="Choose an application"
-          description="Each application has its own review queue, so different sources never mix."
+          description="Each application's commits are reviewed on their own, so different sources never mix."
         >
           <div className="explorer-toolbar">
             <SearchField
@@ -1498,7 +1561,14 @@ function CommitDetailBody({
               "Committed",
               <Time value={commit.committed_at} absolute fallback="Unknown" />,
             ],
-            ["Triage", <TriageBadge commit={commit} />],
+            [
+              "Triage",
+              <>
+                <TriageBadge commit={commit} />
+                <PrefilterFlags commit={commit} />
+              </>,
+            ],
+            ["Verdict", <AnalysisState commit={commit} />],
             [
               "Finding",
               commit.findings.length ? (
@@ -1644,7 +1714,7 @@ function CommitDetailBody({
       {activeView === "triage" && (
         <Panel
           title="Triage evidence"
-          description="Classification input, completeness, and supporting context"
+          description="Triage result, Pre-filter flags, and input completeness"
           padded
         >
           <div className="triage-summary">
@@ -1659,17 +1729,35 @@ function CommitDetailBody({
             <p className="muted">
               {commit.triage_status === "disabled"
                 ? "Triage is disabled for this application. Review the change manually."
-                : "No classification reason recorded."}
+                : "No Triage reason recorded."}
             </p>
           )}
+          <h3>Pre-filter</h3>
+          {commit.prefilter.length ? (
+            <ul className="prefilter-list" aria-label="Pre-filter rules">
+              {commit.prefilter.map((flag) => (
+                <li key={flag.rule}>
+                  <strong>{prefilterLabel(flag.rule)}</strong>
+                  {flag.paths.map((path) => (
+                    <code key={path}>{path}</code>
+                  ))}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">No sensitive files were flagged.</p>
+          )}
+          <p className="hint">
+            The Pre-filter only flags files; it never decides on its own.
+          </p>
           {commit.diff_complete ? (
             <Callout tone="good">
               Diff input is complete for this revision.
             </Callout>
           ) : (
             <Callout tone="warm" title="Diff input is incomplete">
-              An unrelated classification cannot be confirmed. Detailed analysis
-              may need more source context.
+              Triage cannot call it unrelated, and an Analysis that finds no
+              security bearing gives Insufficient context.
             </Callout>
           )}
           <div className="triage-footer">
@@ -1682,21 +1770,18 @@ function CommitDetailBody({
               </Link>
             )}
             <span className="hint">
-              A security candidate is a prompt to review. It does not start
-              analysis.
+              A security candidate or insufficient context result starts
+              Analysis automatically.
             </span>
           </div>
           {commit.triage_result !== null && (
-            <Evidence
-              value={commit.triage_result}
-              label="Classification result"
-            />
+            <Evidence value={commit.triage_result} label="Triage result" />
           )}
         </Panel>
       )}
       {activeView === "analysis" && (
         <Panel
-          title="Detailed analysis"
+          title="Analysis"
           description="Each run keeps its source input and resolved execution profile."
         >
           <AnalysisHistory
@@ -1723,9 +1808,9 @@ function CommitDetailBody({
                 {commit.diff_complete ? "Complete diff" : "Incomplete diff"}
               </p>
               <p className="hint">
-                The agent can inspect the before/after source, build the
-                vulnerable revision, and exercise a PoC. Supported findings link
-                to their report and reproducible bundle.
+                Analysis reads a read-only checkout of this commit and builds
+                nothing. It gives one Verdict and may draft a Proof bundle,
+                which a Lab verifies only after your Approval.
               </p>
             </div>
           }

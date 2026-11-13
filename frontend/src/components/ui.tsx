@@ -198,8 +198,9 @@ const tones: Record<string, string[]> = {
     "rejected",
     "unavailable",
     "blocked",
-    "likely vulnerability fix",
-    "potentially introduced vulnerability",
+    "vulnerability fix",
+    "vulnerability introduced",
+    "malicious change",
   ],
   warm: [
     "candidate",

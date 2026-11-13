@@ -9,25 +9,29 @@ from test_artifacts import bundle, queue_cve_analysis
 from test_commit_review import assessment, prepared
 
 
-def default(operation, build=False):
-    return prompts.render(operation, prompts.context(operation, build=build), prompts.defaults())
+def default(operation):
+    return prompts.render(operation, prompts.context(operation), prompts.defaults())
 
 
 def test_each_operation_gets_only_the_sections_it_uses():
     triage = default("commit_triage")
-    assert "Classify the security change" in triage and "untrusted evidence" in triage
-    assert "Build sandbox" not in triage and "Finding bundle" not in triage
+    assert "This is Triage: one reply, with no tools." in triage and "untrusted evidence" in triage
+    assert "Finding bundle" not in triage
     recipe = default("version_recipe")
     assert "Attack path" not in recipe and "release-corpus.json" in recipe
-    analysis = default("commit_analysis", build=True)
-    for part in ("## Attack path", "## Finding bundle", "## Build sandbox", "prior-analyses.json"):
+    analysis = default("commit_analysis")
+    for part in ("## Attack path", "## Finding bundle", "prior-analyses.json"):
         assert part in analysis, part
     assert ", ".join(artifacts.REQUIRED) in analysis
     assert "release-corpus.json" not in analysis and "Trail of Bits" not in analysis
-    assert "prior-analyses.json" not in default("cve_analysis", build=True)
-    # Finding artifacts run without a build sandbox unless the run has one.
-    assert "Build sandbox" not in default("finding_artifacts")
-    assert "Build sandbox" in default("finding_artifacts", build=True)
+    assert "prior-analyses.json" not in default("cve_analysis")
+    # No operation builds anything: Analysis, CVE analysis and finding artifacts only draft a bundle.
+    assert "build-sandbox" not in prompts.defaults()
+    for operation in ("commit_analysis", "cve_analysis", "finding_artifacts"):
+        text = default(operation)
+        assert "inputs/source is a read-only checkout of the pinned revision" in text, operation
+        assert "Build and run nothing" in text and "draft" in text, operation
+        assert "Build sandbox" not in text and "DOCKER_HOST" not in text and "/workspace/repo" not in text, operation
     for phase in ("audit_orientation", "audit_function", "audit_synthesis"):
         assert "Trail of Bits" in default(phase) and "Attack path" not in default(phase)
 
@@ -37,11 +41,11 @@ def test_templates_list_their_sections_and_the_operations_using_them(system):
     body = client.get("/api/prompts").json()
     items = {item["name"]: item for item in body["items"]}
     assert set(items) == set(prompts.defaults())
-    assert set(body["variables"]) == {"operation", "build", "required_files", "facts"}
+    assert set(body["variables"]) == {"operation", "required_files", "facts"}
     assert items["attack-path"]["kind"] == "section"
     assert items["attack-path"]["used_by"] == ["commit_analysis", "cve_analysis", "finding_artifacts"]
     assert items["commit_analysis"]["kind"] == "operation"
-    assert items["commit_analysis"]["includes"] == ["attack-path", "build-sandbox", "bundle", "rules"]
+    assert items["commit_analysis"]["includes"] == ["attack-path", "bundle", "rules"]
     assert items["audit-context"]["used_by"] == ["cve_analysis", "finding_artifacts"]
     assert not any(item["customized"] for item in items.values())
     # Sections come first, then operations.
@@ -52,7 +56,7 @@ def test_templates_list_their_sections_and_the_operations_using_them(system):
 def queue_commit(system):
     _, ident, _ = prepared(system)
     queued = system[1].post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    return queued, FixtureBroker(assessment("Security hardening", "not_a_finding"), {"report.md": b"# Assessment"})
+    return queued, FixtureBroker(assessment("Security hardening"), {"report.md": b"# Assessment"})
 
 
 def queue_cve(system):
@@ -135,10 +139,9 @@ def test_a_draft_previews_without_being_saved(system):
     body = preview.json()
     assert "Draft-only rule." in body["prompt"] and body["prompt"].endswith("as JSON)")
     assert "bundle" in body["templates"] and "version_recipe" not in body["templates"]
-    # Each operation previews the way its jobs run: finding artifacts have no build sandbox.
-    assert body["build"] is True and "## Build sandbox" in body["prompt"]
-    artifacts_preview = client.post("/api/prompts/preview", json={"operation": "finding_artifacts"}).json()
-    assert artifacts_preview["build"] is False and "## Build sandbox" not in artifacts_preview["prompt"]
+    assert set(body) == {"prompt", "templates"}
+    # A preview no longer takes a build flag.
+    assert client.post("/api/prompts/preview", json={"operation": "cve_analysis", "build": True}).status_code == 422
     assert "Draft-only rule." not in client.post("/api/prompts/preview", json={"operation": "cve_analysis"}).json()["prompt"]
     assert client.post("/api/prompts/preview", json={"operation": "cve_analysis", "name": "bundle"}).status_code == 422
 

@@ -80,18 +80,9 @@ export function duration(start?: string | null, end?: string | null) {
 }
 const triageDecisions: Record<string, string> = {
   security_candidate: "Flagged as a security candidate",
-  unrelated: "Classified as unrelated to security",
-  insufficient_context: "Not enough context to classify",
-};
-const changeKinds: Record<string, string> = {
-  vulnerability_fix: "possible vulnerability fix",
-  security_hardening: "security hardening",
-  vulnerability_introduction: "potentially introduced vulnerability",
-};
-const findingDecisions: Record<string, string> = {
-  finding: "supported finding",
-  not_a_finding: "not a finding",
-  needs_more_evidence: "needs more evidence",
+  unrelated: "Judged unrelated to security",
+  insufficient_context:
+    "Flagged: not enough context to rule out a security issue",
 };
 /** One plain sentence describing what a successful job produced. */
 function successSummary(job: Job): {
@@ -147,29 +138,21 @@ function successSummary(job: Job): {
     }
     case "commit_triage": {
       const decision = text(r, "decision") || "";
-      const kind = changeKinds[text(r, "change_kind") || ""];
-      if (kind) facts.push(humanize(kind));
-      if (confidence) facts.push(humanize(confidence));
       return {
         summary:
           triageDecisions[decision] ||
-          (decision ? `Classified as ${humanize(decision)}` : "Triage saved"),
+          (decision ? `Triage decided ${humanize(decision)}` : "Triage saved"),
         facts,
         tone: decision === "security_candidate" ? "warm" : undefined,
       };
     }
     case "commit_analysis": {
-      const category = text(r, "category");
-      const decision = findingDecisions[text(r, "finding_decision") || ""];
-      const reproduction = text(field(r, "reproduction"), "status");
-      if (decision) facts.push(humanize(decision));
-      if (reproduction)
-        facts.push(`Reproduction: ${humanize(reproduction).toLowerCase()}`);
+      const verdict = text(r, "verdict") || "Analysis saved";
       if (confidence) facts.push(humanize(confidence));
       return {
         summary: text(r, "finding_id")
-          ? `${category || "Analysis saved"} · finding created`
-          : category || "Analysis saved",
+          ? `${verdict} · finding created`
+          : verdict,
         facts,
       };
     }
@@ -350,10 +333,18 @@ const failureHints: Record<string, string> = {
     "The upstream source could not be reached. A retry resumes from the retained cursor.",
   internal_job_error:
     "An unexpected error stopped the job and no output was published. Check the job's execution events.",
-  build_disk_low:
-    "The Docker host is nearly out of disk. Remove unused images (make prune) or enlarge the Docker disk, then retry.",
   cancelled: "The operator cancelled this job.",
+  api_key_required:
+    "Automated runs use only Provider accounts that hold an API key. Select an API-key account for this operation, or start the run by hand.",
+  triage_codex_unsupported:
+    "Triage cannot run on Codex. Choose Pi, Claude or Jev for Triage in the Application settings.",
+  analysis_codex_unsupported:
+    "Analysis and CVE analysis cannot run on Codex, which always has a shell. Choose Pi or Claude Code for this operation in the Application settings or the default profiles.",
+  verdict_not_allowed:
+    "Served content can only be Malicious change, Security hardening, Unrelated or Insufficient context. Retry the Analysis.",
 };
+const analysisTimeout =
+  "Analysis stopped at its 30-minute deadline. The change stays pending and is never read as Unrelated. Retry, or choose a faster model or lower reasoning effort.";
 const failureActions: Record<
   string,
   (job: Job) => { label: string; to: string } | undefined
@@ -377,6 +368,24 @@ const failureActions: Record<
     label: "Open connections",
     to: "/settings?tab=accounts",
   }),
+  api_key_required: () => ({
+    label: "Open connections",
+    to: "/settings?tab=accounts",
+  }),
+  triage_codex_unsupported: (job) =>
+    job.application_id
+      ? {
+          label: "Edit application",
+          to: `/applications/${job.application_id}/edit`,
+        }
+      : undefined,
+  analysis_codex_unsupported: (job) =>
+    job.application_id
+      ? {
+          label: "Edit application",
+          to: `/applications/${job.application_id}/edit`,
+        }
+      : undefined,
   runtime_error: () => ({
     label: "Open connections",
     to: "/settings?tab=accounts",
@@ -438,7 +447,10 @@ export function jobOutcome(job: Job): JobOutcome {
         tone: "danger",
         summary: sentence(jobError(job)),
         hint:
-          failureHints[code] ||
+          (job.kind === "commit_analysis" &&
+          ["timeout", "runtime_timeout"].includes(code)
+            ? analysisTimeout
+            : failureHints[code]) ||
           (retryable
             ? "This failure is temporary. Retry the job."
             : "Check the job's execution events for the cause before retrying."),

@@ -2,48 +2,65 @@
 import json
 from pathlib import Path
 
-WRITE_OPERATIONS = {"commit_analysis", "cve_analysis", "version_recipe", "finding_artifacts", "audit_context"}
 PI_BASE = ["pi", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"]
+CODEX_TRIAGE = "Triage on Codex is refused until a no-tools restriction is verified for it"
+CODEX_ANALYSIS = "Analysis and CVE analysis on Codex are refused until a Codex mode without a shell is verified"
+# Codex has no flag that removes its shell, so it cannot run the operations whose tools exclude one (ADR-0004).
+CODEX_REFUSED = {"commit_triage": CODEX_TRIAGE, "commit_analysis": CODEX_ANALYSIS, "cve_analysis": CODEX_ANALYSIS}
 
 
-def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/workspace/final.json", build=False, session=False):
+def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/workspace/final.json"):
+    """Each operation's tools are fixed here by the flags that decide which tools exist, never by an
+    approval list (ADR-0004): Triage gets no tools, Pi and Claude get no shell tool, Codex (whose
+    shell no flag removes) is refused for Triage, Analysis and CVE analysis, every other operation
+    writes only under outputs/, and only version_recipe reaches the target."""
     agent, model, effort = profile["agent"], profile["model_id"], profile.get("reasoning_effort")
-    # An interactive session writes its result file, so every session operation can write outputs.
-    write = session or profile.get("operation") in WRITE_OPERATIONS
+    if agent == "codex" and profile.get("operation") in CODEX_REFUSED:
+        raise ValueError(CODEX_REFUSED[profile["operation"]])
+    if profile.get("operation") == "commit_triage":
+        # One tool-less print-mode call whose plain reply application code validates (A03).
+        if agent == "claude":
+            args = ["claude", "-p", "--output-format", "json", "--model", model, "--tools", "", "--setting-sources", "",
+                    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--no-session-persistence"]
+            # With no tools, an API key's minimal mode drops nothing and skips hooks, plugins and CLAUDE.md.
+            if profile.get("auth_type") == "api_key":
+                args.append("--bare")
+            return args + (["--effort", effort] if effort else [])
+        if agent == "pi":
+            return pi_no_tools_argv(profile) + (["--thinking", effort] if effort else [])
+        raise ValueError("unsupported agent")
+    recipe = profile.get("operation") == "version_recipe"
     if agent == "codex":
         args = ["codex", "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--color", "never",
                 "--model", model, "--output-schema", schema_path, "--output-last-message", output_path,
-                "-c", 'default_permissions="numen"', "-c", 'permissions.numen.extends=' + json.dumps(":workspace" if write else ":read-only"),
+                "-c", 'default_permissions="numen"', "-c", 'permissions.numen.extends=":workspace"',
                 "-c", 'permissions.numen.filesystem./home/job="deny"', "-C", "/workspace", "-c", 'approval_policy="never"',
                 "-c", "project_doc_max_bytes=0", "-c", 'shell_environment_policy.inherit="all"',
-                "-c", 'shell_environment_policy.include_only=' + json.dumps(
-                    ["PATH","HOME","NUMEN_FETCH_URL","NUMEN_FETCH_TOKEN"]
-                    + (["DOCKER_HOST","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY"] if build else [])),
-                "-c", "sandbox_workspace_write.network_access=" + ("true" if build or profile.get("operation") == "version_recipe" else "false")]
+                "-c", 'shell_environment_policy.include_only=' + json.dumps(["PATH","HOME","NUMEN_FETCH_URL","NUMEN_FETCH_TOKEN"]),
+                # Codex keeps its shell, so its sandbox keeps the network off except for
+                # version_recipe, whose commands reach the target only through the fetch gateway.
+                "-c", "sandbox_workspace_write.network_access=" + ("true" if recipe else "false")]
         if effort:
             args += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
         return args + ["-"]
     if agent == "claude":
-        tools = "Read,Grep,Glob,Write,Edit" if write else "Read,Grep,Glob"
-        if build:
-            tools += ",Bash"
-        allowed_tools = tools
+        # dontAsk denies whatever is not approved, so --settings approves file writes under outputs/
+        # only (an Edit rule covers every file-editing tool) and the target tool for version_recipe.
+        allow = ["Edit(//workspace/outputs/**)"]
         target_mcp = {"mcpServers":{}}
-        if profile.get("operation") == "version_recipe":
-            allowed_tools += ",mcp__numen_target__target_fetch"
+        if recipe:
+            allow.append("mcp__numen_target__target_fetch")
             target_mcp["mcpServers"]["numen_target"] = {"command":"python","args":["-m","numen_runner.fetch_mcp"]}
         args = ["claude", "--print", "--output-format", "json", "--model", model, "--json-schema", Path(schema_path).read_text(),
-                "--tools", tools, "--allowedTools", allowed_tools, "--permission-mode", "dontAsk", "--permission-prompts", "none",
+                "--tools", "Read,Grep,Glob,Write,Edit", "--settings", json.dumps({"permissions":{"allow":allow}}), "--permission-mode", "dontAsk", "--permission-prompts", "none",
                 "--no-session-persistence", "--setting-sources", "", "--strict-mcp-config", "--mcp-config", json.dumps(target_mcp), "--restricted", "--add-dir", "/opt/resources"]
-        if profile["auth_type"] == "api_key":
-            args.append("--bare")
+        # Never --bare: its CLAUDE_CODE_SIMPLE tool set drops Grep, Glob and Write from --tools.
         if effort:
             args += ["--effort", effort]
         return args
     if agent == "pi":
-        tools = "numen_read,numen_list,numen_write,target_fetch" if write else "numen_read,numen_list"
-        args = pi_argv(profile) + ["--no-builtin-tools", "--extension", "/opt/numen/pi-tools.ts",
-                                   "--tools", tools + ",numen_shell" if build else tools]
+        tools = "numen_read,numen_list,numen_write" + (",target_fetch" if recipe else "")
+        args = pi_argv(profile) + ["--no-builtin-tools", "--extension", "/opt/numen/pi-tools.ts", "--tools", tools]
         if effort:
             args += ["--thinking", effort]
         return args
@@ -58,8 +75,9 @@ def pi_argv(profile):
     return args
 
 
-def pi_repair_argv(profile):
-    """A tool-less Pi call that restates a final answer as the result JSON."""
+def pi_no_tools_argv(profile):
+    """A Pi call with no tools at all (built-in and extension): Triage, and the restatement of a
+    final answer as the result JSON. Only an explicitly selected provider extension loads."""
     return pi_argv(profile) + ["--no-tools"]
 
 
@@ -118,14 +136,28 @@ def parse_agent(agent, stdout, final_path):
         final = json.loads(Path(final_path).read_text())
         return result_json(final["result_json"])
     if agent == "claude":
-        event = json.loads(stdout)
-        if event.get("is_error") or event.get("subtype") != "success":
-            raise ValueError("Claude turn did not complete")
-        result = event.get("structured_output")
+        result = claude_result(stdout).get("structured_output")
         if result is None:
             raise ValueError("Claude omitted structured output")
         return result_json(result["result_json"])
     return result_json(pi_final_text(stdout))
+
+
+def claude_result(stdout):
+    event = json.loads(stdout)
+    if event.get("is_error") or event.get("subtype") != "success":
+        raise ValueError("Claude turn did not complete")
+    return event
+
+
+def final_text(agent, stdout):
+    """The final reply text of a completed one-shot turn, unparsed: Triage's application code validates it."""
+    if agent == "claude":
+        text = claude_result(stdout).get("result")
+        if not isinstance(text, str):
+            raise ValueError("Claude turn did not complete")
+        return text
+    return pi_final_text(stdout)
 
 
 def pi_final_text(stdout):

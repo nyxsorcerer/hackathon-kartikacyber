@@ -10,15 +10,6 @@ from .domain import event
 # of these messages is recorded: the wording is the application's own, because a workload reports
 # its events on the same stdout an agent can write to.
 RUNTIME_EVENTS = {
-    "build_daemon_started": "Private build daemon ready",
-    "build_base_loaded": "Loaded the offline lab base into the build daemon",
-    "build_base_unavailable": "Build daemon has no offline lab base, so lab verification will fail",
-    "build_daemon_lost": "The private build daemon failed during this run",
-    "build_rejected_image": "A build failed on an image this daemon cannot pull",
-    "build_rejected_mount": "A build failed on a bind mount path not shared with this daemon",
-    "build_rejected_disk": "A build failed because the daemon ran out of disk space",
-    "repository_ready": "Cloned the Application's full repository, with history, into the workspace",
-    "repository_unavailable": "The Application's repository could not be prepared; the agent may clone it itself",
     "lab_started": "Pinned application launched for lab verification",
     "lab_application_exited": "The pinned application stopped before it could be verified",
     "lab_base_fetch": "Fetching the bundle's pinned base before the offline lab build",
@@ -27,21 +18,8 @@ RUNTIME_EVENTS = {
     "result_repair": "The agent was asked to restate its final answer as the result",
 }
 
-# The only runtime-supplied value a timeline message carries: a refused image, and only when it is
-# a plain image reference, so no other text can reach the operator through it.
-IMAGE_REFERENCE = re.compile(r"[a-z0-9][a-z0-9._/:@-]{0,199}")
-
 
 def runtime_event(record, run_id):
-    image = record.get("image")
-    if record["type"] == "build_rejected_image" and isinstance(image, str) and IMAGE_REFERENCE.fullmatch(image):
-        return {
-            "kind": record["type"],
-            "message": f"A build could not pull {image}: it does not exist or needs a login. "
-            "Use asset-monitor-lab:0.1.0, an image built earlier in the run, or a public image pinned by @sha256",
-            "image": image,
-            "run_id": run_id,
-        }
     return {"kind": record["type"], "message": RUNTIME_EVENTS[record["type"]], "run_id": run_id}
 
 

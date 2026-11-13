@@ -23,7 +23,7 @@ class Broker:
     def __init__(self, config):
         self.client = httpx.Client(
             base_url=config.broker_url.rstrip("/"),
-            # A build run's outputs are a whole application bundle, so the body takes a while.
+            # A lab run's bundle and outputs can be a whole application, so the body takes a while.
             timeout=httpx.Timeout(600.0, connect=10.0),
             headers={"X-Broker-Token": config.broker_token},
         )
@@ -62,8 +62,6 @@ class Broker:
         files=None,
         policy=None,
         limits=None,
-        build=False,
-        repository=None,
     ):
         files, source = dict(files or {}), {}
         # Agent source evidence travels as one compressed archive the runner expands read-only.
@@ -112,10 +110,6 @@ class Broker:
             # A lab run builds and boots a whole application, dependencies and database included.
             defaults.update({"timeout_seconds": 7200, "memory_mb": 6144, "cpus": 2, "pids": 4096,
                              "output_bytes": 64 * 1024 * 1024, "input_bytes": MAX_SUBMISSION})
-        if build:
-            # A build run compiles, installs and runs a real application in its own workspace.
-            defaults.update({"memory_mb": 6144, "cpus": 2, "pids": 2048,
-                             "output_bytes": 512 * 1024 * 1024})
         return self.request(
             "POST",
             "/internal/runs",
@@ -129,10 +123,6 @@ class Broker:
                 # An agent run's requested bounds refine its defaults; other kinds name all of theirs.
                 "limits": {**defaults, **limits} if limits and kind == "agent" else limits or defaults,
                 "target_policy": policy,
-                "build": build,
-                # The runner mirrors this repository and clones it, with full history, into
-                # the workspace, so the agent does not clone it again.
-                **({"repository": repository} if repository else {}),
             },
         )
 

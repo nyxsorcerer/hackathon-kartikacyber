@@ -14,6 +14,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlsplit
 
+# Each provider tunnel is bounded in bytes and lifetime.
+TUNNEL_BYTES, TUNNEL_SECONDS = 64 * 1024 * 1024, 1800
+
 
 def origin(url):
     p = urlsplit(url)
@@ -114,9 +117,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.connection.setblocking(False)
             upstream.setblocking(False)
-            deadline = time.monotonic() + self.server.tunnel_seconds
+            deadline = time.monotonic() + TUNNEL_SECONDS
             transferred = 0
-            while time.monotonic() < deadline and transferred < self.server.tunnel_bytes:
+            while time.monotonic() < deadline and transferred < TUNNEL_BYTES:
                 ready, _, _ = select.select([self.connection, upstream], [], [], 10)
                 for source in ready:
                     data = source.recv(65536)
@@ -172,11 +175,6 @@ def main():
     config = json.loads(os.environ.get("NUMEN_GATEWAY_CONFIG", "{}"))
     server = ThreadingHTTPServer(("0.0.0.0", 8082), GatewayHandler)
     server.allowed_hosts = set(config.get("provider_hosts", []))
-    # A build run clones whole repositories and installs dependency trees through one tunnel each,
-    # which the ordinary provider-sized budget would truncate mid-stream.
-    tunnel = config.get("tunnel", {})
-    server.tunnel_bytes = min(int(tunnel.get("bytes", 64 * 1024 * 1024)), 8 * 1024 * 1024 * 1024)
-    server.tunnel_seconds = min(int(tunnel.get("seconds", 1800)), 10800)
     server.fetcher = TargetFetcher(config["target_policy"]) if config.get("target_policy") else None
     server.fetch_token = config.get("fetch_token", "")
     server.serve_forever()

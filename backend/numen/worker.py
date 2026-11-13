@@ -2,6 +2,8 @@ import logging
 import socket
 import threading
 import time
+from datetime import timedelta
+
 from sqlalchemy import select
 
 from .broker import Broker
@@ -9,6 +11,7 @@ from .config import Config
 from .db import make_database
 from .models import (
     Account,
+    Application,
     AuditContext,
     Commit,
     Job,
@@ -22,7 +25,7 @@ from .models import (
 from .security import DomainError, Vault
 from .queue import ExecutionContext, claim, runtime_phases, stop_runs
 from .workflows import Workflows, all_secrets
-from .domain import event
+from .domain import enqueue, event
 
 log = logging.getLogger("numen.worker")
 # Agent, lab and interactive login work that can occupy a slot for hours.
@@ -36,6 +39,8 @@ LONG_KINDS = (
     "lab_run",
     "version_recipe",
 )
+# Attempts at one Triage of a change; retry n waits n minutes.
+TRIAGE_ATTEMPTS = 3
 
 
 def run_once(config, factory, broker=None, owner=None, exclude=()):
@@ -132,12 +137,41 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                 if repository and error["code"] not in ("input_changed", "source_check_superseded"):
                     repository.last_error = error
                 if row.kind in ("commit_triage", "jev_triage"):
+                    # A failed Triage has no decision: it is never read as unrelated. It is retried
+                    # unless the attempt was cancelled, lost or overtaken by a source change.
                     commit = db.get(Commit, row.input.get("commit_id"))
+                    attempt_number = row.input.get("attempt", 1)
                     if commit:
                         commit.triage_status, commit.triage_result = (
                             "failed",
-                            {"decision": "insufficient_context", "reason": error["message"]},
+                            {"error": error["code"], "reason": error["message"], "attempt": attempt_number},
                         )
+                        if (
+                            row.status == "failed"
+                            and attempt_number < TRIAGE_ATTEMPTS
+                            and error["code"] not in ("cancelled", "lease_lost", "input_changed")
+                        ):
+                            retry = enqueue(
+                                db,
+                                row.kind,
+                                db.get(Application, row.application_id) if row.application_id else None,
+                                {**row.input, "attempt": attempt_number + 1},
+                                row.profile,
+                            )
+                            retry.not_before = now() + timedelta(seconds=60 * attempt_number)
+                            commit.triage_result = {**commit.triage_result, "retry_job_id": retry.id}
+                if row.kind == "commit_analysis":
+                    # A failed or expired Analysis decides nothing: the review decision and the
+                    # Verdict stay as they were, so an expired deadline is never Unrelated.
+                    commit = db.get(Commit, row.input.get("commit_id"))
+                    if commit:
+                        commit.analysis_state = {
+                            "status": "timed_out"
+                            if error["code"] in ("timeout", "runtime_timeout")
+                            else "failed",
+                            "job_id": row.id,
+                            "error": error,
+                        }
                 if row.kind in ("account_capabilities", "account_check", "account_login"):
                     account = db.get(Account, row.input.get("account_id"))
                     if account and account.revision == row.input.get("credential_revision"):

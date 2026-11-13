@@ -134,6 +134,250 @@ Deviations and limits recorded for this phase:
 | `make test-ui` | 103 passed in 19 files |
 | `make test-journey` | passed (JOURNEY PASSED); the stack was then stopped |
 
+## Phase 2 T1: agent boundary (2026-11-13)
+
+ADR-0004 and ADR-0005. `commit_analysis` and `cve_analysis` no longer build anything. They read the pinned snapshot at `inputs/source` read-only and write only to `outputs/`. A bundle they write is a draft that only a `lab` run builds.
+
+Removed: the privileged Docker-in-Docker daemon and the `asset-monitor-dind` image (its Compose service and Dockerfile stages, and the image itself was removed locally). Also removed: the agent images' Docker CLI, `RunRequest.build`/`repository`, `BUILD_MAXIMA`/`BUILD_OPERATIONS`/`BUILD_HOSTS`, the git mirror at `/workspace/repo` and harvested outputs. In the backend, the `build-sandbox` prompt section and the `build` template variable, the `build_*`/`repository_*` runtime events, `diff_review` and `insufficient_diff`. Numen's `lab` path is unchanged.
+
+- **Egress.** `engine.gateway_config` allows the provider's hosts, plus `herdr.dev` (`contracts.HERDR_HOSTS`) for a run that hosts a Herdr session. `test_analysis_container_has_no_docker_daemon_no_registry_and_only_provider_and_herdr_egress` runs the Pi image on an internal job network behind that gateway. It finds no `docker` binary, no socket, no `DOCKER_HOST`, no `docker` host name and no direct egress. CONNECT to `registry.npmjs.org`, `github.com` and `pypi.org` returns 403 before any DNS lookup, so the test sends no third-party traffic. The test does not connect to the allowed hosts.
+- **Tool profiles.** Tools are fixed per operation by existence flags, never by `--allowedTools`. `test_tool_profiles_are_fixed_per_operation_without_a_shell_or_allowed_tools` covers every operation in print and session mode. Claude keeps `--permission-mode dontAsk`, and `--settings` approves `Edit(//workspace/outputs/**)`, plus the target MCP tool for `version_recipe`.
+- **Claude permission rules.** The pinned Claude Code 2.1.288 honours `--settings` under `--setting-sources ''` in print mode and in the interactive TUI. The rewritten `test_pinned_claude_restricted_tools_and_structured_result_with_loopback_provider` runs in both modes, the TUI on a pseudo-terminal. A write under `outputs/` succeeds. A write outside it is denied, and so is a read of `/home/job`. `Glob` lists `inputs/`, and a `CLAUDE.md` planted in the workspace and the inputs never reaches the provider. The offered tools equal the profile.
+- **Why the recorded failure is gone.** It came from `--bare`, which sets `CLAUDE_CODE_SIMPLE`. That mode offers only `Read` and `Edit` (plus `Bash`) of any `--tools` list, which is why the test saw no `Grep`/`Glob`. Claude now never runs with `--bare`, and the test passes.
+- **TUI prompt order.** The TUI case passes its prompt first, because a trailing prompt is read as another `--add-dir` directory. Herdr types the prompt instead, so sessions are unaffected.
+- **Incomplete diffs.** The snapshot has no history, so an incomplete diff can no longer be reviewed whole. Any `not_a_finding` result on one, `Unrelated change` included, becomes `Insufficient context` with `needs_more_evidence`. A result that still sends `diff_review` fails its schema with `invalid_agent_output` (`test_an_incomplete_diff_never_yields_unrelated`, `test_an_incomplete_diff_never_stands_as_not_a_finding`).
+
+Deviations and limits:
+
+- **Codex.** Codex has no flag that removes its shell. It keeps its native `:workspace` sandbox with network off (on only for `version_recipe`). That sandbox can write anywhere in the `/workspace` tmpfs, though only `outputs/` is collected. Pi enforces outputs-only writes in its tool code, and Claude enforces them through the permission rule.
+- **`--bare` dropped for API keys (not in the brief).** API-key Claude runs no longer pass `--bare`, so API-key and native sign-ins run with the same flags. Under `--bare`, an API-key Analysis had no `Grep`, `Glob` or `Write` once `Bash` was gone, and so no way to list files. The loopback test checks that `--setting-sources ''` and `--restricted` still load no `CLAUDE.md`. Nothing else that `--bare` skipped (hooks, plugins, keychain) is configured in the workload.
+- **Output size.** An Analysis now writes at most 8 MB of outputs (the broker's agent default), where a build run could write 512 MB. The bundle prompt tells the agent to fetch the application during the Lab build instead of copying it into the bundle.
+- **Saved prompt templates.** An Operator-saved template that includes `build-sandbox` fails at job time with `prompt_template_invalid` until it is reset. A saved `{% if build %}` simply renders as false. No migration rewrites saved templates.
+- **Old timeline rows.** Existing `build_*`/`repository_*` job-event rows are no longer runtime events, so they can appear in the dashboard activity feed until newer events push them out.
+- **Not checked live.** Whether Herdr 0.9.3 fetches its manifests only from `herdr.dev` was not checked in a live session, because tests cannot reach it.
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed |
+| `make test-unit` | backend 200 passed; runner 126 passed, 56 skipped (after the final `--bare` change) |
+| `make test-integration` | 299 passed against PostgreSQL |
+| `make test-runtime` | 182 passed, after `make build` with the final code. The formerly failing Claude loopback test passes in both modes. |
+| `make test-ui` | 99 passed, 4 timed out at 5 s under load in files this task did not touch; `frontend-tests npx vitest run --maxWorkers=2` then passed all 103 in 19 files |
+| `make test-journey` | passed (JOURNEY PASSED); the stack was then stopped |
+
+## Phase 2 T2: Triage (2026-11-13)
+
+A03. Triage is now a one-shot agent run with no tools and a 120-second deadline. It is never a Herdr session, so it never reaches `herdr.dev`. The prompt carries the change as `facts.commit` (message, author, changed paths, a diff capped at 100,000 characters, and `diff_complete`), with no input files.
+
+- **No tools.** Claude runs `claude -p --output-format json --model M --tools '' --setting-sources '' --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence`, with `--bare` for an API key and `--effort`. It gets no `--json-schema`, because structured output relies on a tool. Pi runs `pi_no_tools_argv`: `PI_BASE` plus `--print --mode json --provider P --model M --no-tools` and `--thinking`. In the pinned Pi 1.0.0, `--no-tools` disables every built-in and extension tool. `--no-extensions` stops discovery, though an explicit `-e` still loads, so only the Command Code provider extension loads, and only for that provider. `test_triage_is_offered_no_tools` checks the argv. `test_pinned_claude_triage_is_offered_no_tools_with_loopback_provider` runs the pinned Claude CLI against a loopback Messages API with no network: no request offers tools, the envelope is `subtype: success` with the reply in `result`, and `final_text` returns it. In `test_pinned_pi_cli_runs_commandcode_plugin_against_its_provider_api` the provider API receives `tools: []`, and in the native-protocol test the Triage case has no active tools.
+- **Codex refused.** `RunRequest`, `agent_argv`, `resolve_profile` (default profiles, Application profiles and the profile an import resolves) and `ApplicationConfig.triage_mode` all refuse Codex Triage. The API error is `triage_codex_unsupported`, or `validation_error` for the mode. A stored Codex mode blocks import with that reason (`test_triage_on_codex_is_refused_with_a_clear_error`, `test_codex_triage_is_refused`). The Application form no longer offers Codex for Triage.
+- **Application code validates the reply.** The runner returns `{reply}` without schema validation or a Pi restatement, and the credential scan still applies (`test_triage_returns_the_raw_reply_without_schema_validation`). The backend first replaces configured secrets with `[redacted]`. It then takes the JSON from the first `{` to the last `}` and validates it against the reduced schema: `decision`, `title` (1–300 characters) and `reason` (1–2,000 characters). `change_kind` and `confidence` are gone from agent Triage, and Jev keeps them.
+- **Failure and retry.** A reply that fails the schema fails the job with `invalid_agent_output`. The commit's `triage_status` becomes `failed`, and its `triage_result` holds `{error, reason, attempt, retry_job_id?}` with no `decision`. `review_decision` is unchanged. The worker treats every failed `commit_triage` or `jev_triage` the same way: unless it was cancelled, lost its lease or its input changed, it queues the same kind with `attempt` n+1 and the same profile, not before n minutes, up to three attempts (`test_a_reply_that_fails_the_schema_is_recorded_failed_and_retried`). This replaces Numen's failure record, which wrote `decision: insufficient_context`.
+- **Transcripts.** Migration `8e6f7a92b1c6` adds the `transcripts` table (`id`, `job_id`, `kind`, `subject_id`, `data`, `created_at`), and the downgrade drops it (`test_postgres_migration_adds_triage_transcripts`). Each Triage run that returns a reply, valid or not, stores a row: `kind: triage`, `subject_id` the commit, and `data` with `prompt`, `reply`, `status`, `error`, `profile`, `run_id` and `execution`. A failed run's row is committed before the failure is raised. Jev stores its `request` body, which never holds the key, and the raw `response` (`test_each_triage_run_stores_its_transcript`, `test_jev_official_model_discovery_and_typed_triage_keeps_uncertainty`).
+- **Kept.** Jev triage, Triage turned off per Application (`test_triage_can_be_turned_off_per_application`) and the shared repository triaged once all still work. So does a Pre-filter hit that Triage rejects: it stays in the commit list with both its `prefilter` and its `triage_result` (`test_prefilter_hit_rejected_by_triage_stays_listed_with_both_results`). A diff over 100,000 characters is truncated and counts as incomplete, so it is never Unrelated (`test_long_diff_is_truncated_and_never_unrelated`).
+
+Deviations and limits:
+
+- **Dead code removed.** With Triage off the tool-profile path, every remaining operation writes under `outputs/`. This removes `adapters.WRITE_OPERATIONS`, `agent_argv`'s `session` parameter and Codex's `:read-only` profile. `pi_repair_argv` is renamed `pi_no_tools_argv`.
+- **Runs without a reply.** A run that times out or fails in the runner has no reply. It gets no Transcript; its job error and the commit's `triage_result` record it, and it is retried.
+- **Configuration errors are retried too.** A configuration error such as `triage_codex_unsupported` for an already-queued job is attempted three times before it stays failed.
+- **Stored Codex mode.** An Application stored with Codex Triage cannot be saved, for any field, until its Triage mode is changed, because PATCH validates the whole configuration.
+- **Prompt text.** The runner's shared preamble and the `rules` section still mention writing to `/workspace/outputs`. The Triage task text says there is nothing to write.
+- **Prompt size.** The diff is capped at 100,000 characters before JSON encoding. A diff of mostly non-ASCII text can therefore exceed the runner's 262,144-character prompt bound. That run is refused and retried, and it then stays failed (never Unrelated).
+- **Engine flag untested.** No unit test covers `engine`'s Triage-is-not-interactive condition, because it is inline in `DockerEngine.run`.
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed |
+| `make test-unit` | backend 207 passed (now including `tests/test_triage.py`); runner 123 passed, 57 skipped |
+| `make test-integration` | 307 passed against PostgreSQL |
+| `make test-runtime` | 180 passed, after `make build` |
+| `frontend-tests npx vitest run --maxWorkers=2` | 103 passed in 19 files |
+| `make test-journey` | passed (JOURNEY PASSED); the stack was then stopped |
+
+## Phase 2 T3: Verdicts, deadline and Review queue (2026-11-13)
+
+A04 (backend half). Analysis returns exactly one of the six Verdicts.
+
+- **Verdict schema.** `commit_analysis` requires `verdict` (`schemas.VERDICTS`), `confidence` (`low`, `medium`, `high`), `title`, `summary`, `evidence`, `open_questions`, `before_after` and `affected_behavior`. `vulnerable_ref` and `addresses` are optional: up to 50 commit SHAs or advisory ids (CVE, GHSA or `PREFIX-id`). Vulnerability fix and Vulnerability introduced require `vulnerable_ref` and at least one evidence item. `category`, `finding_decision`, `finding_reason` and `reproduction` are gone, and `schemas.CATEGORIES` is deleted (`test_analysis_returns_exactly_one_verdict_with_a_confidence`, `test_addresses_are_recorded`).
+- **Review routing.** Vulnerability fix, Vulnerability introduced and Malicious change set `candidate`, Security hardening and Unrelated set `dismissed`, and Insufficient context stays `pending`. All of these still go through `set_commit_decision`, so a later manual review wins. The commit gets `verdict` and `analysis_state: {status: completed, analysis_id}`.
+- **Drafted bundles.** Vulnerability fix and Vulnerability introduced create or update the 0day Finding and publish its bundle with `require_complete=False`. An incomplete bundle becomes a draft and the job succeeds. CVE analysis and finding generation still fail with `incomplete_bundle` (`test_fix_and_introduced_verdicts_publish_a_finding_with_the_drafted_bundle`, `test_finding_regeneration_uses_the_validated_vulnerable_parent`). A Malicious change opens no Finding, and its `detection-rule.yar` and `cleanup-report.md` are saved with the analysis artifacts (`test_malicious_change_marks_the_commit_for_review_without_a_finding`).
+- **Served content.** `check_verdict(result, served_content=True)` refuses Vulnerability fix and Vulnerability introduced with `verdict_not_allowed` (422) and passes the other four (`test_served_content_analysis_rejects_vulnerability_fix`). Commit Analysis calls it with `served_content=False`.
+- **Deadline.** Analysis and CVE analysis request `timeout_seconds` 1800. A `timeout` or `runtime_timeout` failure sets `analysis_state: {status: timed_out, job_id, error}`, and any other failure sets `failed`. `verdict` and `review_decision` are left alone, and Retry sets the state back to `queued` (`test_an_expired_deadline_leaves_the_change_pending_with_a_visible_timeout`, `test_cve_analysis_is_read_only`).
+- **Review queue.** `GET /dashboard` adds `review_queue` (up to 20 Insufficient context commits still `pending`, newest `committed_at` first) and `review_queue_count`. A review decision by the Operator removes a change from it (`test_insufficient_context_lands_in_the_review_queue`).
+- **Incomplete diffs.** On an incomplete diff, Unrelated or Security hardening becomes Insufficient context (`test_an_incomplete_diff_never_yields_unrelated`, `test_an_incomplete_diff_never_stands_as_security_hardening`).
+- **Migration.** `9f7a8ba3c2d7` adds `commits.verdict` and `commits.analysis_state`. It rewrites each `commit_analysis` result in `analyses` and `jobs` from category to Verdict by the AC-A04 table, sets `confidence: unknown`, keeps Numen's confidence as `numen_confidence`, and sets each commit's `verdict` from its newest analysis. The downgrade restores the original rows exactly and drops the columns, and `alembic check` is clean (`test_postgres_migration_maps_categories_to_verdicts`).
+
+Deviations and limits:
+
+- **Downgrade.** Only migrated rows round-trip exactly. A Verdict written after the upgrade downgrades with `confidence: {level}`, and a Malicious change downgrades to the category `Insufficient context`, because Numen has no category for it.
+- **Old fields kept.** Migrated results keep Numen's other fields (`finding_decision`, `finding_reason`, `reproduction`). `PRIOR_CLAIMS` no longer passes them to a new Analysis.
+- **Analysis state after migration.** Migrated commits keep a null `analysis_state`.
+- **Cancelled runs.** A cancelled Analysis shows `failed` with error `cancelled`.
+- **Invalid vulnerable revision.** When an Analysis proposes an invalid vulnerable revision, the job still fails with `invalid_finding_revision`. Its Verdict and analysis are kept, and `analysis_state` ends as `failed`.
+- **Prompt text.** The shared `attack-path` section still describes how a Lab reproduction must travel the path, because CVE analysis and finding generation use it too.
+- **UI not updated.** The UI still reads `category` and `finding_decision`, so new Analyses show as "Analysis saved" or "Report available" until T5.
+
+| Command | Result |
+|---|---|
+| `make check` | passed |
+| `make test-unit` | backend 220 passed (now including `tests/test_analysis.py`); runner 123 passed, 57 skipped |
+| `make test-integration` | 319 passed against PostgreSQL |
+| `make test-integration CASE=job-recovery` | 18 passed |
+| focused `backend-tests pytest tests/test_analysis.py tests/test_commit_review.py tests/test_findings.py tests/test_artifacts.py tests/test_workflows.py tests/test_prompts.py tests/test_api.py` | 175 passed, ruff clean |
+
+## Phase 2 T4: Automatic Analysis, caps and API keys for automated runs (2026-11-13)
+
+A04 (automatic start, caps) and the first bullet of AC-A13.
+
+- **Automatic start.** A Triage decision of `security_candidate` or `insufficient_context`, agent or Jev, calls `domain.start_analysis`. It queues one `commit_analysis` per commit (idempotency key `analysis:{commit id}`) with job input `automatic: true` and `shared`, and sets `analysis_state: {status: queued, job_id}`. `unrelated` starts nothing, and a second flag starts nothing more (`test_triage_flag_starts_one_automatic_analysis`).
+- **Shared Upstream commit.** A commit of a repository that more than one Application uses is analysed once, in the first such Application's context, with `shared: true`. It starts even when that Application's cap is full, and it counts against the Provider account cap (`test_shared_upstream_commit_is_analysed_once_and_counts_only_against_the_account_cap`, `test_shared_upstream_repository_is_polled_and_triaged_once`).
+- **Caps.** 10 per Application (only `shared: false` jobs) and 30 per Provider account (`profile.connection_id`) per UTC day. They are counted from today's automatic `commit_analysis` job rows, so they survive a restart with no extra state (`test_caps_persist_across_restarts`). Over a cap the change gets `{status: waiting_for_cap, since, cap}` and one `actions` row per scope and day (`analysis_cap_reached`, `day`, `limit`) is recorded (`test_application_cap_makes_new_automatic_analyses_wait_and_records_one_cap_event`, `test_account_cap_of_thirty_makes_new_automatic_analyses_wait`). Another API-key account still starts the change, because the account cap is per account.
+- **Reset.** `domain.schedule()` re-checks waiting changes oldest `since` first. After 00:00 UTC they start in that order and only as many as the caps allow, and a change that still waits keeps its `since` (`test_caps_reset_at_midnight_utc_and_waiting_changes_start_oldest_first`). The count, cap-event and `FOR UPDATE SKIP LOCKED` waiting queries are also run against PostgreSQL (`test_postgres_automatic_analysis_caps_count_todays_automatic_jobs`).
+- **Manual Analysis.** It is neither capped nor counted, so it starts while both caps are full (`test_manual_analysis_still_works_at_a_cap`).
+- **API keys only.** `domain.automated_profile` refuses an account whose `auth_type` is not `api_key` with `api_key_required` and says why. An imported commit's Triage is then `blocked`, an automatic Analysis is `{status: blocked, error}`, an automatic CVE analysis lands in `analysis_blocked`, and an audit refresh records `audit_refresh_blocked`. No job is queued, and a manual Analysis on the same subscription sign-in is queued (`test_automated_runs_refuse_accounts_without_an_api_key`).
+- **Existing tests.** The Triage tests that drain the queue now leave the automatic Analysis unrun (`exclude=("commit_analysis",)`) or assert it is queued, because without a stored snapshot it would fetch from GitHub. The whole backend suite also passed with `NUMEN_GITHUB_API_URL` and `NUMEN_NVD_API_URL` pointed at a closed loopback port, so no test reached a real host. The only failure was `test_parent_lookup_checks_the_requested_commit_and_immutable_hashes`, which asserts the default URL against its mocked transport.
+
+Deviations and limits:
+
+- **Blocked stays blocked.** A change blocked for want of an API key is not retried when the profile is fixed. A later Triage flag, or Analyze by hand, starts it.
+- **Retry counts but is not held.** A Retry of an automatic job keeps `automatic: true`, so it counts toward the day's caps, but it is queued even at a cap.
+- **Soft caps under concurrency.** Two workers flagging changes at the same moment can each see the last free place, so a cap can be overrun by the number of concurrent Triage jobs.
+- **Scheduler cost.** Each 15-second scheduler tick re-checks every waiting change with two or three count queries. That is fine at current volumes; it needs an index on `analysis_state` or a stop on the first full cap if the waiting list grows large.
+- **No Alert yet.** The cap-reached event is an `actions` row; Phase 3 turns it into an Alert. The UI does not show `waiting_for_cap` or `blocked` yet (T5).
+
+| Command | Result |
+|---|---|
+| `make check` | passed |
+| `make test-unit` | backend 228 passed; runner 123 passed, 57 skipped |
+| `make test-integration` | 328 passed against PostgreSQL |
+| `make test-integration CASE=job-recovery` | 19 passed |
+| focused `backend-tests pytest tests/test_analysis.py tests/test_triage.py tests/test_repositories.py tests/test_commit_review.py tests/test_workflows.py tests/test_intake.py` | 141 passed |
+| `frontend-tests npm test -- --maxWorkers=2` | 103 passed (no frontend change) |
+
+## Phase 2 T5: Verdicts, Review queue, Analysis state and Pre-filter in the UI (2026-11-13)
+
+A04 and A03 (UI half). The frontend reads Verdicts instead of Numen's categories.
+
+- **Types.** `types.ts` has `verdicts` (the six Verdicts, in the glossary's words, which are also their labels) and `findingVerdicts`. An analysis result has `verdict`, `confidence` (a string, or an object for CVE analysis) and `addresses`; `category`, `finding_decision`, `finding_reason` and `findingDecisionLabels` are gone. A commit has `verdict`, `analysis_state` and `prefilter`, and the dashboard has `review_queue` and `review_queue_count`.
+- **Verdicts.** The commit list's Analysis column and the commit page show the Verdict with the newest analysis's confidence, so a migrated one reads "Unknown confidence". The Change type filter became a Verdict filter (the six Verdicts and Not analysed), filtering on `commit.verdict`. The analysis summary shows Verdict and confidence badges, the vulnerable revision and the addresses. It no longer has the finding decision or agent reproduction rows, and it notes that drafts are not reproduced. Create finding is offered only for Vulnerability fix and Vulnerability introduced (`CommitReview`: "presents each Verdict with its confidence…", "shows each Verdict with its confidence, migrated ones as unknown, and filters by Verdict"; `App`: "requires an explicit analysis submit…").
+- **Review queue.** Show → Review queue lists Insufficient context Verdicts still pending, and choosing it sets the decision filter to Pending. The dashboard has a Review queue panel: the newest 20 with title, revision and link, "Showing the newest N of M" when more wait, and an empty state. An Insufficient context analysis says the change was sent to the Review queue. The cross-Application panel is now titled Commit review (`CommitReview`: "filters to the Review queue…"; `App`: "lists the Review queue on the dashboard").
+- **Analysis state.** Queued, Waiting for cap ("Daily Application cap reached" or "Daily Provider account cap reached"), Timed out after 30 minutes, Blocked (with the error message, such as the API-key refusal) and Failed. A timed-out re-run keeps the earlier Verdict beside the timeout (`CommitReview`: "shows an Analysis that is queued, waits for a cap, timed out, or was blocked").
+- **Pre-filter and Triage.** The Triage column and the commit page show Pre-filter rule chips beside the Triage badge, with the paths in the chip's tooltip. The Triage tab lists each rule with its paths. A failed or blocked Triage reads "Triage failed" or "Triage blocked", with its reason in the list. The Triage badge shows the decision only, without the change kind (`CommitReview`: "lists a Pre-filter hit that Triage rejected with both results").
+- **Job summaries.** A `commit_analysis` job is summarised by its Verdict and confidence. `commit_triage` drops the change kind and confidence facts and no longer says "classified" (the glossary avoids the word). There are hints for `api_key_required` (with a link to the connections), `triage_codex_unsupported` (with a link to edit the application) and `verdict_not_allowed`, and a 30-minute-deadline hint for a timed-out Analysis (`Jobs`: "summarizes an Analysis by its Verdict and confidence", "explains a … failed with …").
+- **Copy.** The copy says that a Triage flag starts Analysis automatically, and that Analysis reads a read-only checkout, builds nothing, and drafts a Proof bundle that a Lab verifies only after Approval. The "build a lab" and "build the vulnerable revision" copy is gone.
+- **Stored Codex Triage mode (T2 leftover).** An Application saved with `triage_mode: codex` shows a disabled "Codex CLI — not supported for Triage" option and a warning to choose another mode, instead of silently showing Disabled and failing on save (`ApplicationForm`: "names a stored Codex Triage mode and asks for another one").
+
+Deviations and limits:
+
+- **Blocked layout.** "Blocked" is the badge and the reason sits under it, not "Blocked: reason" in one badge, because the API-key reason is about 150 characters long.
+- **Queued while running.** `analysis_state` stays `queued` while the job runs, so the list shows Queued until the Analysis completes or fails.
+- **Column header.** The Detailed analysis column header now reads Analysis.
+- **Dead style.** The unused `.analysis-category` CSS rule was left as it was.
+- **ui.tsx tones.** The Verdict badges' colours come from `ui.tsx`'s tone table, where Vulnerability fix, Vulnerability introduced and Malicious change replace Numen's two category names.
+
+| Command | Result |
+|---|---|
+| focused `frontend-tests npx vitest run --maxWorkers=2 src/pages/CommitReview.integration.test.tsx src/App.integration.test.tsx src/pages/Jobs.integration.test.tsx` | 33 passed (12 failed before the change) |
+| `frontend-tests npx vitest run --maxWorkers=2` | 114 passed |
+| `make test-ui` (default workers) | 111 passed, 3 timed out at 5,000 ms under load (ApplicationForm interval, ApplicationRepositories Own repository, PromptTemplates section preview); none of them changed in this task, and all pass with `--maxWorkers=2` |
+| `make check` | passed |
+| `frontend-tests npx prettier --check src` | clean (this also formatted `PromptTemplates.tsx` and `ApplicationForm.tsx` lines left unformatted earlier) |
+
+## Phase 2: Triage, Analysis and the agent boundary (2026-11-13)
+
+Phase 2, T6 (A03, A04, and the first and fourth bullets of AC-A13), and the phase as a whole. The T1–T5 sections above record each task in detail.
+
+What each task changed:
+- **T1, agent boundary (ADR-0004, ADR-0005).** `commit_analysis` and `cve_analysis` read the pinned snapshot at `inputs/source`, write only to `outputs/` and build nothing. The privileged Docker-in-Docker daemon, the `asset-monitor-dind` image, `BUILD_OPERATIONS`, the `build-sandbox` prompt section, the git mirror and their tests are gone. Numen's `lab`/`build_lab` path is unchanged. Tool sets are fixed per operation in `adapters.agent_argv` by existence flags, and the gateway allows the provider's hosts plus `herdr.dev` for a run that hosts a Herdr session.
+- **T2, Triage (A03).** One tool-less call with a 120-second deadline, never a Herdr session. Application code validates the reply (`decision`, `title`, `reason`), a reply that fails is recorded as failed and retried up to three attempts, each run is a Transcript row (migration `8e6f7a92b1c6`), and Codex is refused. Jev triage and Triage off per Application still work.
+- **T3, Verdicts (A04).** Analysis returns one of the six Verdicts with a confidence, a title, evidence, optional `addresses` and drafts. `check_verdict` restricts served-content Verdicts. Analysis and CVE analysis have a 30-minute deadline whose expiry sets `analysis_state: timed_out` and leaves the Verdict and review decision unchanged. Insufficient context lands in the Review queue (`GET /dashboard` `review_queue`). Migration `9f7a8ba3c2d7` maps Numen's categories to Verdicts with confidence `unknown`.
+- **T4, automatic Analysis, caps and API keys (A04, AC-A13 first bullet).** A Triage flag starts one automatic Analysis per commit. The caps are 10 per Application and 30 per Provider account per UTC day, counted from durable job rows; a shared Upstream Analysis counts only against the account. Over a cap the change waits as `waiting_for_cap` and starts oldest first after 00:00 UTC. Automated runs refuse accounts without an API key with `api_key_required`.
+- **T5, UI.** Verdicts with confidence (migrated ones "Unknown confidence"), the Review queue, the Analysis states (Queued, Waiting for cap, Timed out after 30 minutes, Blocked, Failed) and Pre-filter flags beside the Triage result.
+- **T6, this sweep.** README's runtime paragraph now gives Analysis, CVE analysis and audit function analyses their 30-minute deadline, where it said that agent runs other than Triage have none. The contract no longer says that a finding Verdict requires the complete bundle (commit Analysis publishes an incomplete draft and succeeds), and its migration sentence points to the AC-A04 table instead of repeating Numen's category names. The `.analysis-category` CSS rule, unused since T5, is deleted. A UI test now shows that a failed or blocked Triage reads as such, with its reason, and never as unrelated; T5 had implemented this without a test. With the badge label reverted to the bare status, the test fails. `frontend/vite.config.ts` sets `maxWorkers: 2`, because `make test-ui` at the default worker count failed 6 tests under load on this 8 GB Docker Desktop: four 5 s test timeouts and two 1 s `findBy` lookups, in files Phase 2 mostly did not change. With the setting, the suite passes in the same wall time (about 24 s).
+
+Acceptance tests, all passing in the runs below:
+
+| Criterion | Tests |
+|---|---|
+| AC-A03: a Triage run is offered no tools | runner `test_triage_is_offered_no_tools`, `test_tool_profiles_are_fixed_per_operation_without_a_shell_or_allowed_tools`, `test_codex_triage_is_refused`; runtime `test_pinned_claude_triage_is_offered_no_tools_with_loopback_provider`, `test_pinned_pi_cli_runs_commandcode_plugin_against_its_provider_api` (`tools: []` at the provider API), `test_pinned_pi_cli_runs_bounded_extension_and_returns_native_json_protocol` (no active tools in the Triage case); backend `test_triage_run_is_one_shot_with_the_change_in_its_prompt_and_a_120_second_deadline`, `test_triage_on_codex_is_refused_with_a_clear_error` |
+| AC-A03: a reply that fails the schema is recorded as failed and retried, never "not security-relevant" | backend `test_a_reply_that_fails_the_schema_is_recorded_failed_and_retried`, `test_long_diff_is_truncated_and_never_unrelated`; runner `test_triage_returns_the_raw_reply_without_schema_validation`, `test_triage_final_text_is_the_plain_reply_of_a_completed_turn`; UI `CommitReview` "shows a failed or blocked Triage with its reason, never as unrelated" (new in T6) |
+| AC-A03: a Pre-filter hit that Triage rejects stays listed with both results | backend `test_prefilter_hit_rejected_by_triage_stays_listed_with_both_results`; UI `CommitReview` "lists a Pre-filter hit that Triage rejected with both results" |
+| A03: Transcripts, Triage off per Application, Jev | `test_each_triage_run_stores_its_transcript`, `test_postgres_migration_adds_triage_transcripts`, `test_triage_can_be_turned_off_per_application`, `test_jev_official_model_discovery_and_typed_triage_keeps_uncertainty` |
+| AC-A04: no Analysis run has a Docker daemon or package-registry access | runtime `test_analysis_container_has_no_docker_daemon_no_registry_and_only_provider_and_herdr_egress`, `test_pinned_claude_restricted_tools_and_structured_result_with_loopback_provider`; backend `test_cve_analysis_is_read_only` |
+| AC-A04: an expired deadline leaves the change pending with a visible timeout | backend `test_an_expired_deadline_leaves_the_change_pending_with_a_visible_timeout`; UI `CommitReview` "shows an Analysis that is queued, waits for a cap, timed out, or was blocked" |
+| AC-A04: at a cap new automatic Analyses wait; manual Analysis still works | `test_triage_flag_starts_one_automatic_analysis`, `test_application_cap_makes_new_automatic_analyses_wait_and_records_one_cap_event`, `test_account_cap_of_thirty_makes_new_automatic_analyses_wait`, `test_shared_upstream_commit_is_analysed_once_and_counts_only_against_the_account_cap`, `test_caps_reset_at_midnight_utc_and_waiting_changes_start_oldest_first`, `test_caps_persist_across_restarts`, `test_manual_analysis_still_works_at_a_cap`, `test_postgres_automatic_analysis_caps_count_todays_automatic_jobs` |
+| AC-A04: a served-content Analysis that returns Vulnerability fix fails | `test_served_content_analysis_rejects_vulnerability_fix` |
+| AC-A04: categories migrate to Verdicts, migrated ones with confidence "unknown" | `test_postgres_migration_maps_categories_to_verdicts`; UI `CommitReview` "shows each Verdict with its confidence, migrated ones as unknown, and filters by Verdict" |
+| A04: one Verdict, evidence, title, addresses, drafts, Review queue, incomplete diffs | `test_analysis_returns_exactly_one_verdict_with_a_confidence`, `test_addresses_are_recorded`, `test_fix_and_introduced_verdicts_publish_a_finding_with_the_drafted_bundle`, `test_malicious_change_marks_the_commit_for_review_without_a_finding`, `test_insufficient_context_lands_in_the_review_queue`, `test_an_incomplete_diff_never_yields_unrelated`, `test_an_incomplete_diff_never_stands_as_security_hardening`; UI `App` "lists the Review queue on the dashboard" |
+| AC-A13 first bullet: an automated run on an account without an API key is refused with the reason | `test_automated_runs_refuse_accounts_without_an_api_key` (imported-commit Triage, automatic Analysis, automatic CVE analysis, audit refresh); UI `Jobs` `api_key_required` hint |
+| AC-A13 fourth bullet: an Analysis run reaches only its provider's hosts and `herdr.dev` | runtime `test_analysis_container_has_no_docker_daemon_no_registry_and_only_provider_and_herdr_egress` |
+
+**The runtime Analysis-container test.** `test_analysis_container_has_no_docker_daemon_no_registry_and_only_provider_and_herdr_egress` builds a `commit_analysis` request for Pi and checks that `engine.gateway_config` allows exactly the provider's hosts plus `herdr.dev` for a Herdr session, and only the provider's hosts without one. It then starts the real gateway with that configuration and the `asset-monitor-pi` image on an internal job network. Inside the agent container there is no `docker` binary, no `/var/run/docker.sock`, no `DOCKER_HOST` and no `docker` host name, and a direct connection to `8.8.8.8:443` fails. CONNECT to `registry.npmjs.org`, `github.com` and `pypi.org` returns 403, and the gateway refuses it before any DNS lookup. The container is unprivileged with all capabilities dropped and only the job network attached, and only the gateway and Pi images run under the run label. The test does not connect to the allowed hosts.
+
+**Recorded flag choices.**
+- **Pi.** Triage runs `pi_no_tools_argv`: `PI_BASE` (`--no-session --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve`) plus `--print --mode json --provider P --model M --no-tools`. In the pinned Pi 1.0.0, `--no-tools` disables every built-in and extension tool. `--no-extensions` stops discovery, but an explicit `-e` still loads, so only the Command Code provider extension loads, and only for that provider. Analysis and CVE analysis run with `--no-builtin-tools` and only the bundled `numen_read` and `numen_list`, plus `numen_write` under `outputs/`. They get no shell, and `target_fetch` is offered only to `version_recipe`.
+- **Claude.** Triage runs `claude -p --output-format json --tools '' --setting-sources '' --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence`, with `--bare` for an API key and no `--json-schema`. Other operations get `--tools Read,Grep,Glob,Write,Edit`, `--restricted`, `--setting-sources ''` and `--permission-mode dontAsk`. `--settings '{"permissions":{"allow":["Edit(//workspace/outputs/**)"]}}'` approves writes under `outputs/` only, and the target MCP tool is approved for `version_recipe` alone. The pinned Claude Code 2.1.288 honours that rule under `--setting-sources ''` in print mode and in the TUI. No operation uses `--allowedTools`.
+
+Deviations from the plan, PRD and ADRs:
+- **Read-only checkout.** The "read-only checkout" is the commit's source snapshot, staged read-only at `/workspace/inputs/source`. It has no git history, skips binary media and is capped at 20,000 files / 64 MiB. The git mirror at `/workspace/repo` existed only for build runs and is deleted. An incomplete diff (a merge or an oversized change) can therefore no longer be reviewed whole, so Unrelated and Security hardening on one become Insufficient context and land in the Review queue.
+- **Codex in Analysis.** Codex has no flag that removes its shell. It keeps its native `:workspace` sandbox with network off, so it can still run commands, and it can write anywhere in the `/workspace` tmpfs, though only `outputs/` is collected. Claude enforces outputs-only writes through the `--settings` rule and Pi through its tool code. Triage on Codex is refused.
+- **Cap event.** Reaching a cap records an `actions` row (`analysis_cap_reached`, once per scope and UTC day), not an Alert. Phase 3 turns it into one.
+- **Drafted commit bundles.** Commit Analysis publishes an incomplete drafted bundle as a draft Finding and the job succeeds, where Numen failed with `incomplete_bundle`. CVE analysis and finding generation keep the `incomplete_bundle` failure, so the two differ until Findings are reworked in Phase 3.
+- **Assumptions.** "Flagged by Triage" covers `security_candidate` and `insufficient_context`. A shared Upstream repository is one that more than one Application uses. Failed and cancelled automatic jobs count toward the day's caps.
+- **`--bare` dropped outside Triage.** Under `--bare` (`CLAUDE_CODE_SIMPLE`), an API-key Analysis would be offered only `Read` and `Edit`, and so no way to find files, so it runs with the same flags as a subscription sign-in.
+- **Saved templates, old events, Herdr hosts.** An Operator-saved template that includes `build-sandbox` fails with `prompt_template_invalid` until it is reset. Old `build_*`/`repository_*` event rows can still show in the activity feed. Whether Herdr 0.9.3 fetches manifests only from `herdr.dev` was not checked in a live session.
+
+**Stale-reference sweep.** `git grep -n -i 'build sandbox\|build run\|dind\|private Docker daemon\|Likely vulnerability fix\|Potentially introduced\|finding_decision\|--allowedTools\|repository_ready'` over `docs/implementation-contract.md`, `runner/README.md`, `README.md`, `backend`, `runner` and `frontend`, with migrations excluded, finds no stale text. The remaining hits are deliberate:
+- the contract's and runner README's "never by `--allowedTools`";
+- tests asserting that these names are absent (`test_adapters.py`, `test_claude_runtime.py`, `test_session.py`, `test_prompts.py`, `test_artifacts.py`, `test_commit_review.py`, and the forged `repository_ready` event in `test_accounts.py`);
+- the migration test's category table (`test_postgres.py`);
+- legacy fields in fixtures of migrated results (`test_analysis.py`, `CommitReview.integration.test.tsx`).
+
+**Known failing test.** None. `test_pinned_claude_restricted_tools_and_structured_result_with_loopback_provider`, recorded as known-failing since the fork baseline, has passed since T1 (the cause was `--bare`).
+
+**Outside traffic.** No paid inference was made, and no request reached a real Asset, GitHub, a package registry or `herdr.dev`. Model providers are loopback fixtures, GitHub and NVD are mocked transports or the integration fixture server, and gateway tests see 403 for registry hosts before any DNS lookup. Numen's pre-existing gateway runtime test still opens one credential-free TCP tunnel to `api.openai.com:443` to prove that a provider host is allowed. It sends no TLS handshake and no request.
+
+On Docker Desktop (Engine 20.10, 8 GB):
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed (ruff, eslint, tsc, vite build) |
+| `make test-unit` | backend 228 passed; runner 123 passed, 57 skipped |
+| `make test-integration` | 328 passed against PostgreSQL |
+| `make test-runtime` | 180 passed, 0 failed, the Claude loopback test included |
+| `make test-ui` | 115 passed in 19 files with `maxWorkers: 2`; before that setting, 109 passed and 6 failed under load as described above |
+| `make test-journey` | passed (its `make build` and all 8 PASS lines, JOURNEY PASSED); the `asset-monitor-test` stack was then stopped with its volumes kept |
+
+### Phase 2 review fixes (2026-11-13)
+
+These supersede the "Codex in Analysis" and "Saved templates" lines in the deviations above, and the description of the runtime Analysis-container test.
+
+- **Triage reached the application only in tests.** The broker validated every agent result against the schema it was sent, and a Triage result is `{reply}`, so every real Triage run failed in the runner with `runtime_error`. As a result no Transcript was stored and no Analysis started. Backend tests use `FixtureBroker` and runner tests call `workload.execute` directly, so neither caught it. `broker.do_run` now requires a Triage result to be exactly `{reply: string}` and does not validate it against the Triage schema. `test_triage_reply_passes_through_without_the_triage_schema` runs two Triage results through the broker: a non-JSON reply succeeds unchanged, and a schema-shaped object without `reply` fails.
+- **Codex refused for Analysis and CVE analysis.** Codex's shell let a prompt-injected diff run the change's own code. ADR-0004 rules that out: Analysis builds nothing, and a Malicious change never runs. Like Triage, `commit_analysis` and `cve_analysis` on Codex are now refused in `resolve_profile` with `analysis_codex_unsupported` ("Analysis and CVE analysis on Codex are refused until a Codex mode without a shell has been verified"), and in `RunRequest` and `agent_argv`. This covers default and Application profiles, manual runs, and queued jobs, which fail when they run. Codex stays available for `version_recipe`, `audit_context` and `finding_artifacts`. The `agent_argv` docstring no longer says that no runtime gets a shell. The Jobs page explains the error and links to the Application. Tests: `test_triage_on_codex_is_refused_with_a_clear_error`, `test_codex_triage_is_refused`, `test_tool_profiles_are_fixed_per_operation_without_a_shell_or_allowed_tools`, and the Jobs "explains a commit_analysis failed with analysis_codex_unsupported" case. The backend test fixtures now default Triage, Analysis and CVE analysis to Pi.
+- **Triage diff cap counts escapes.** The facts are appended as JSON with `ensure_ascii=False`. The Triage diff is cut to the longest prefix whose JSON encoding fits 100,000 characters (a bisect over the prefix length), so control characters, which still encode as six characters, cannot push the prompt past the runner's 262,144 characters. A cut diff still has `diff_complete: false`. `test_triage_caps_the_diff_as_its_prompt_encodes_it` sends 30,000 CJK characters plus 60,000 `\x1b` and checks that the prompt stays under the bound and keeps the CJK text unescaped. Under the old cap the whole diff went through and encoded to about 540,000 characters.
+- **Oldest first at the reset.** The waiting-change pass is now `domain.start_waiting`. Both `schedule()` and a Triage flag call it, the flag before it starts its own change, so a flag arriving just after midnight cannot take a freed slot ahead of a change already waiting. `test_a_new_flag_after_the_reset_waits_behind_changes_already_waiting` frees one slot, flags a new change through a real Triage run, and checks that the waiting change starts and the new one waits.
+- **Real `engine.run` in the runtime Analysis-container test.** `test_analysis_container_has_no_docker_daemon_no_registry_and_only_provider_and_herdr_egress` now runs `DockerEngine.run` for a Pi `commit_analysis` with the Herdr backend. Only the workload command is swapped for a probe, by wrapping `ContainerCollection.create`, so no agent or provider is involved. The probe sees no `docker` binary, socket, `DOCKER_HOST` or `docker` host and no direct egress, and the gateway answers 403 to CONNECT for `registry.npmjs.org`, `github.com` and `pypi.org`. The test then inspects the containers that `engine.run` created: only the gateway and the Pi workload, whose gateway configuration is exactly the provider's hosts plus `herdr.dev`. The workload is unprivileged with all capabilities dropped, is on the job network only, has no `DOCKER_*` variable, and mounts only `/workspace/inputs` read-only and its private `/home/job`. The rule that Triage never hosts a session is now `DockerEngine.hosts_session`. The unit test `test_only_a_run_hosting_a_herdr_session_may_reach_herdr_dev` shows that Triage gets no `herdr.dev`, that Analysis in a Herdr session does, and that a print-mode run does not.
+- **Saved templates broken by this phase.** Migration `9f7a8ba3c2d7` resets the saved versions of `commit_triage` and `commit_analysis`, whose results changed, of `build-sandbox`, and of any template that includes `build-sandbox`. Each reset works the way the Prompt templates page resets one: an `actions` row (`resource_type: prompt`, `data: {action: reset, previous, reason, saved}`) keeps the Operator's text, and the settings revision is bumped. The downgrade restores them and removes those rows. `test_postgres_migration_maps_categories_to_verdicts` covers the reset, a kept `audit-context` override, and the restore.
+- **Git mirror volume.** `DockerEngine.reconcile`, which runs at broker start, removes this instance's volumes labelled `org.pruferva.asset-monitor.cache=git`, which build runs left behind. A removal error never blocks readiness. `test_reconciliation_removes_abandoned_workloads` covers it.
+
+Deviation: the reviewer's option of refusing Codex only for automated runs was not taken. ADR-0004 fixes tool access per operation, not per starter, so manual Codex Analysis is refused too.
+
+On Docker Desktop (Engine 20.10, 8 GB):
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed (ruff, eslint, tsc, vite build) |
+| `make test-unit` | backend 230 passed; runner 125 passed, 57 skipped |
+| `make test-integration` | 330 passed against PostgreSQL |
+| `make test-runtime` | 182 passed, 0 failed |
+| `make test-ui` | 116 passed in 19 files |
+| `make test-journey` | passed (all 8 PASS lines, JOURNEY PASSED); the `asset-monitor-test` stack was then stopped |
+
 ## Commit review correction (2026-10-06)
 
 Program selection now precedes global review and only that program's records are fetched; switching programs clears the previous queue. New triage output includes a potential issue title and fix/hardening/introduction kind. Complete unrelated results are dismissed, incomplete evidence stays pending, and manual review actions after job submission take precedence. Jev's three typed questions follow its official contract; existing source messages and legacy reports remain readable without inventing classifications.

@@ -13,14 +13,27 @@ OPERATIONS = (
     "cve_analysis",
     "finding_artifacts",
 )
-CATEGORIES = (
-    "Likely vulnerability fix",
-    "Potentially introduced vulnerability",
+VERDICTS = (
+    "Vulnerability fix",
+    "Vulnerability introduced",
+    "Malicious change",
     "Security hardening",
-    "Unrelated change",
+    "Unrelated",
     "Insufficient context",
 )
+# Served content can carry a payload but never fixes or introduces a code vulnerability (A04).
+SERVED_CONTENT_VERDICTS = VERDICTS[2:]
+CONFIDENCES = ("low", "medium", "high")
 CHANGE_KINDS = ("vulnerability_fix", "security_hardening", "vulnerability_introduction", "unrelated", "insufficient_context")
+# Codex has no flag that removes its shell, so it cannot run Triage with no tools (ADR-0004).
+TRIAGE_CODEX = "Triage on Codex is refused until a no-tools restriction has been verified for it"
+# Analysis and CVE analysis get no shell either: a read-only checkout and a write-only output directory.
+ANALYSIS_CODEX = "Analysis and CVE analysis on Codex are refused until a Codex mode without a shell has been verified"
+CODEX_REFUSED = {
+    "commit_triage": ("triage_codex_unsupported", TRIAGE_CODEX),
+    "commit_analysis": ("analysis_codex_unsupported", ANALYSIS_CODEX),
+    "cve_analysis": ("analysis_codex_unsupported", ANALYSIS_CODEX),
+}
 # Monitoring intervals in seconds: at least 5 minutes, at most 10 years.
 MIN_INTERVAL, MAX_INTERVAL = 300, 3650 * 86400
 
@@ -98,6 +111,14 @@ class ApplicationConfig(Strict):
     asset_origins: list[str] = Field(default_factory=list)
     jev_connection_id: str | None = None
     jev_model_id: str | None = None
+
+    @field_validator("triage_mode")
+    @classmethod
+    def triage(cls, value):
+        # "codex" stays in the Literal so that configurations stored before this rule still load.
+        if value == "codex":
+            raise ValueError(TRIAGE_CODEX)
+        return value
 
     @field_validator("profiles")
     @classmethod
@@ -290,7 +311,7 @@ class BatchReviewInput(ReviewInput):
     ids: list[str] = Field(min_length=1, max_length=1000)
 
 
-# Each revision runs as its own agent job with a build sandbox, so one request queues few.
+# Each revision runs as its own agent job, so one request queues few.
 ANALYSIS_BATCH_MAX = 50
 
 
@@ -312,8 +333,6 @@ class PromptPreviewInput(Strict):
     # An unsaved draft of one template, rendered in place of its saved version.
     name: str | None = Field(default=None, max_length=100)
     source: str | None = Field(default=None, max_length=100_000)
-    # Defaults to how the operation's jobs run.
-    build: bool | None = None
 
     @model_validator(mode="after")
     def draft(self):
