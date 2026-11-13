@@ -364,7 +364,10 @@ it("shows findings ready to confirm and confirms them from the queue", async () 
         id: "finding-1",
         title: "Path traversal",
         status: "open",
-        kind: "0day",
+        source: "commit",
+        application_id: "alpha",
+        application_name: "Customer portal",
+        relation: "source",
       },
     ],
   });
@@ -375,10 +378,12 @@ it("shows findings ready to confirm and confirms them from the queue", async () 
   ).closest("tr")!;
   expect(within(row).getByText("Finding ready")).toBeInTheDocument();
   expect(
-    within(row).getByRole("link", { name: "Finding · Open" }),
+    within(row).getByRole("link", {
+      name: "Open finding · Customer portal",
+    }),
   ).toHaveAttribute("href", "/findings/finding-1");
   await user.click(within(row).getByRole("checkbox"));
-  await user.click(screen.getByRole("button", { name: "Confirm finding" }));
+  await user.click(screen.getByRole("button", { name: "Confirm revision" }));
   expect(await screen.findByText("1 revision confirmed.")).toBeInTheDocument();
   expect(batches).toEqual([{ ids: ["commit-one"], decision: "confirmed" }]);
   await user.click(screen.getByRole("button", { name: /^Confirmed/ }));
@@ -396,7 +401,10 @@ it("prompts to confirm an analysed finding and to record a missing one", async (
         id: "finding-1",
         title: "Path traversal",
         status: "open",
-        kind: "0day",
+        source: "commit",
+        application_id: "alpha",
+        application_name: "Customer portal",
+        relation: "source",
       },
     ],
   };
@@ -428,10 +436,13 @@ it("prompts to confirm an analysed finding and to record a missing one", async (
     </MemoryRouter>,
   );
   const user = userEvent.setup();
-  const prompt = (await screen.findByText("Analysis produced a finding"))
+  const prompt = (await screen.findByText("Analysis opened a Finding"))
     .parentElement!.parentElement!;
+  expect(
+    within(prompt).getByRole("link", { name: "Review finding" }),
+  ).toHaveAttribute("href", "/findings/finding-1");
   await user.click(
-    within(prompt).getByRole("button", { name: "Confirm finding" }),
+    within(prompt).getByRole("button", { name: "Confirm revision" }),
   );
   expect(reviewed).toEqual(["confirmed"]);
   // Confirmed without a recorded finding: offer the prefilled form.
@@ -443,6 +454,74 @@ it("prompts to confirm an analysed finding and to record a missing one", async (
     source_commit_id: "alpha-commit",
     title: "Potential path traversal through template selection",
   });
+});
+
+it("links a Verdict to the Findings it opened and was linked to", async () => {
+  const findings = [
+    {
+      id: "shop-finding",
+      title: "Path traversal",
+      status: "open",
+      source: "commit",
+      application_id: "alpha",
+      application_name: "Shop",
+      relation: "source",
+    },
+    {
+      id: "blog-finding",
+      title: "Stored XSS",
+      status: "confirmed",
+      source: "commit",
+      application_id: "beta",
+      application_name: "Blog",
+      relation: "linked",
+    },
+  ];
+  const expectLinks = (scope: HTMLElement) => {
+    expect(
+      within(scope).getByRole("link", { name: "Open finding · Shop" }),
+    ).toHaveAttribute("href", "/findings/shop-finding");
+    expect(
+      within(scope).getByRole("link", {
+        name: "Linked: Confirmed finding · Blog",
+      }),
+    ).toHaveAttribute("href", "/findings/blog-finding");
+  };
+  const commit = { ...records[0], findings };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const body =
+        url === "/api/commits/alpha-commit"
+          ? commit
+          : url === "/api/applications/alpha"
+            ? applications[0]
+            : { items: [commit], next_cursor: null };
+      return new Response(JSON.stringify(body));
+    }),
+  );
+  const { unmount } = render(
+    <MemoryRouter initialEntries={["/commits/alpha-commit"]}>
+      <Routes>
+        <Route path="/commits/:id" element={<CommitDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  const verdict = (
+    await screen.findByText("Verdict", { selector: "dt" })
+  ).closest("div")!;
+  const row = verdict.nextElementSibling as HTMLElement;
+  expect(row).toHaveTextContent(/^Finding/);
+  expectLinks(row);
+  unmount();
+  const { queue } = batchFixture();
+  Object.assign(queue[0], { review_decision: "candidate", findings });
+  renderQueue("/reviews?application=alpha");
+  expectLinks(
+    (
+      await screen.findByRole("checkbox", { name: "Select Change one" })
+    ).closest("tr")!,
+  );
 });
 
 it("queues a detailed analysis for each selected revision and reports skipped ones", async () => {

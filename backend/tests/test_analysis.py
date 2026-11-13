@@ -36,7 +36,7 @@ def analyze(system, ident, result, outputs):
     app, client, config = system
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     broker = FixtureBroker(result, outputs)
-    run_once(config, app.state.factory, broker)
+    run_once(config, app.state.factory, broker, exclude=("notification",))  # Alerts stay queued.
     return client.get(f"/api/jobs/{queued}").json(), broker
 
 
@@ -78,7 +78,7 @@ def test_fix_and_introduced_verdicts_publish_a_finding_with_the_drafted_bundle(s
     job, _ = analyze(system, ident, assessment(verdict, ref=ref), pinned_bundle(ref))
     assert job["status"] == "succeeded", job
     finding = client.get(f"/api/findings/{job['result']['finding_id']}").json()
-    assert finding["source_commit_id"] == ident and finding["kind"] == "0day"
+    assert finding["source_commit_id"] == ident and finding["source"] == "commit"
     assert finding["artifact_state"]["status"] == "complete"
     # Nothing is run, so an incomplete draft is still published, as a draft, and the job succeeds.
     job, _ = analyze(system, ident, assessment(verdict, ref=ref), {"report.md": b"# Drafted without a PoC"})
@@ -88,7 +88,7 @@ def test_fix_and_introduced_verdicts_publish_a_finding_with_the_drafted_bundle(s
     assert client.get(f"/api/findings/{finding['id']}").json()["artifact_state"]["status"] == "draft"
 
 
-def test_malicious_change_marks_the_commit_for_review_without_a_finding(system):
+def test_malicious_change_opens_a_finding_and_keeps_its_drafts_with_the_analysis(system):
     _, client, _ = system
     _, ident, _ = prepared(system)
     drafts = {
@@ -100,7 +100,12 @@ def test_malicious_change_marks_the_commit_for_review_without_a_finding(system):
     assert job["status"] == "succeeded", job
     commit = client.get(f"/api/commits/{ident}").json()
     assert (commit["verdict"], commit["review_decision"]) == ("Malicious change", "candidate")
-    assert commit["findings"] == [] and client.get("/api/findings").json()["items"] == []
+    (finding,) = client.get("/api/findings").json()["items"]
+    assert [f["id"] for f in commit["findings"]] == [finding["id"]] == [job["result"]["finding_id"]]
+    assert (finding["status"], finding["source"], finding["cause"]["verdict"]) == ("open", "commit", "Malicious change")
+    # Its drafts stay with the Analysis until Phase 5: the Finding has no artifact revision.
+    assert finding["artifact_revision"] is None and finding["artifacts"] == []
+    assert commit["analyses"][0]["result"]["finding_id"] == finding["id"]
     saved = {a["path"] for a in commit["analyses"][0]["artifacts"]}
     assert {"detection-rule.yar", "cleanup-report.md", "report.md"} <= saved
 

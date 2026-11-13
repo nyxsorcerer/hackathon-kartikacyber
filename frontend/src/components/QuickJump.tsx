@@ -131,7 +131,7 @@ export function QuickJump({ onClose }: { onClose: () => void }) {
         id: `finding:${f.id}`,
         group: "Findings",
         title: f.title,
-        detail: f.cve_id || `0day · ${f.id.slice(0, 8)}`,
+        detail: f.source_ref || `${f.source} · ${f.id.slice(0, 8)}`,
         to: `/findings/${f.id}`,
         icon: FileText,
       })),

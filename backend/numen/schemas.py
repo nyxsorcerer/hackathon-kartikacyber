@@ -24,6 +24,8 @@ VERDICTS = (
 # Served content can carry a payload but never fixes or introduces a code vulnerability (A04).
 SERVED_CONTENT_VERDICTS = VERDICTS[2:]
 CONFIDENCES = ("low", "medium", "high")
+# What opened a Finding (A11); cve only for CVE records carried over from Numen.
+FINDING_SOURCES = ("commit", "served_content", "advisory", "cve")
 CHANGE_KINDS = ("vulnerability_fix", "security_hardening", "vulnerability_introduction", "unrelated", "insufficient_context")
 # Codex has no flag that removes its shell, so it cannot run Triage with no tools (ADR-0004).
 TRIAGE_CODEX = "Triage on Codex is refused until a no-tools restriction has been verified for it"
@@ -209,10 +211,9 @@ class BackfillInput(Strict):
 
 class FindingInput(Strict):
     application_id: str
-    kind: Literal["cve", "0day"]
+    source: Literal[*FINDING_SOURCES]
     cve_id: str | None = None
     title: str = Field(min_length=1, max_length=300)
-    status: Literal["open", "fixed"] = "open"
     affected_versions: list = Field(default_factory=list)
     fixed_versions: list = Field(default_factory=list)
     target_applicability: Literal["affected", "not affected", "unknown"] = "unknown"
@@ -222,11 +223,23 @@ class FindingInput(Strict):
 
     @model_validator(mode="after")
     def cve(self):
-        if self.kind == "cve" and not self.cve_id:
+        if self.source == "cve" and not self.cve_id:
             raise ValueError("A CVE finding requires a CVE ID")
         if self.cve_id and not re.fullmatch(r"CVE-\d{4}-\d{4,}", self.cve_id):
             raise ValueError("Invalid CVE ID")
         return self
+
+
+class TransitionInput(Strict):
+    """An Operator action on a Finding (A11): Confirm, Dismiss or Mark remediated."""
+
+    state: Literal["confirmed", "dismissed", "remediated"]
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def strip(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 class AccountInput(Strict):

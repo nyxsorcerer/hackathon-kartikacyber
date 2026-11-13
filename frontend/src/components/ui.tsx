@@ -173,7 +173,7 @@ const tones: Record<string, string[]> = {
   good: [
     "ready",
     "succeeded",
-    "fixed",
+    "remediated",
     "complete",
     "completed",
     "confirmed",

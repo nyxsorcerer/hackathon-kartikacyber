@@ -503,6 +503,7 @@ def test_postgres_migration_maps_categories_to_verdicts(schema_url):
         reset = dict(db.execute(text("SELECT resource_id, data FROM actions WHERE resource_type = 'prompt'")).all())
         assert {name: (row["action"], row["previous"]) for name, row in reset.items()} == {
             name: ("reset", templates[name]["source"]) for name in ("commit_triage", "commit_analysis", "bundle")}
+    migrate(schema_url, "head")  # alembic check compares only a database at the head revision.
     drift = alembic(schema_url, "check", check=False)
     assert drift.returncode == 0, drift.stdout + drift.stderr
     alembic(schema_url, "downgrade", "8e6f7a92b1c6")
@@ -517,6 +518,75 @@ def test_postgres_migration_maps_categories_to_verdicts(schema_url):
         assert not {"verdict", "analysis_state"} & columns and "review_decision" in columns
         assert db.execute(text("SELECT data FROM settings WHERE id = 'prompts'")).scalar() == {"templates": templates}
         assert db.execute(text("SELECT count(*) FROM actions")).scalar() == 0
+    engine.dispose()
+
+
+def test_postgres_migration_moves_findings_to_sources_and_the_lifecycle(schema_url):
+    revision = "c" * 40
+    rows = {  # id: (kind, status, cve_id, data)
+        "f1": ("0day", "open", None, {"source_commit_id": "c1", "evidence": ["Seen"],
+                                       "_artifact_state": {"revision": "rev"}}),
+        "f2": ("0day", "fixed", None, {"evidence": []}),
+        "f3": ("cve", "open", "CVE-2026-1", {"source_analysis_id": "x1", "fixed_versions": ["2.0"]}),
+        "f4": ("cve", "fixed", "CVE-2026-1", {}),
+    }
+    migrate(schema_url, "9f7a8ba3c2d7")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_generation, monitor_interval_seconds, monitor_enabled, archived, config, cve_cursor)"
+            " VALUES ('a1', 'Site', 'https://example.com', 'plugin', 'Demo', 1, 300, true, false, '{}', '{}')"
+        ))
+        db.execute(text(
+            "INSERT INTO repositories (id, source_kind, source_url, source_generation, watched_branches, created_at)"
+            " VALUES ('r1', 'github', 'https://github.com/demo/plugin', 1, '{}', now())"
+        ))
+        db.execute(text(
+            "INSERT INTO commits (id, repository_id, source_generation, revision, data, triage_status,"
+            " review_decision) VALUES ('c1', 'r1', 1, :revision, '{}', 'disabled', 'pending')"
+        ), {"revision": revision})
+        db.execute(text("INSERT INTO cves (id, raw, record_hash, data) VALUES ('CVE-2026-1', '{}', 'h', '{}')"))
+        for ident, (kind, status, cve, data) in rows.items():
+            db.execute(text(
+                "INSERT INTO findings (id, application_id, kind, cve_id, title, status, data, artifact_revision,"
+                " created_at, updated_at) VALUES (:id, 'a1', :kind, :cve, :id, :status, CAST(:data AS json),"
+                " 'rev', now(), now())"
+            ), {"id": ident, "kind": kind, "cve": cve, "status": status, "data": json.dumps(data)})
+        db.execute(text(
+            "INSERT INTO artifacts (id, resource_type, resource_id, revision, path, storage_path, size, sha256,"
+            " content_type) VALUES ('art1', 'finding', 'f1', 'rev', 'report.md', 'rev/report.md', 3, 'h', 'text/markdown')"
+        ))
+        artifact = db.execute(text("SELECT * FROM artifacts")).one()
+    migrate(schema_url, "a08b9cb4d3e8")
+    refs = {"f1": revision[:7], "f2": None, "f3": "CVE-2026-1", "f4": "CVE-2026-1"}
+    sources = {"0day": "commit", "cve": "cve"}
+    statuses = {"open": "open", "fixed": "remediated"}
+    with engine.begin() as db:
+        found = {row[0]: tuple(row[1:]) for row in db.execute(text(
+            "SELECT id, source, status, cve_id, data, artifact_revision FROM findings"))}
+        assert found == {
+            ident: (sources[kind], statuses[status], cve,
+                    {**data, "cause": {"by": "numen"}, "source_ref": refs[ident]}, "rev")
+            for ident, (kind, status, cve, data) in rows.items()
+        }
+        assert db.execute(text("SELECT * FROM artifacts")).one() == artifact
+    migrate(schema_url, "head")  # alembic check compares only a database at the head revision.
+    drift = alembic(schema_url, "check", check=False)
+    assert drift.returncode == 0, drift.stdout + drift.stderr
+    alembic(schema_url, "downgrade", "9f7a8ba3c2d7")
+    with engine.begin() as db:
+        assert {row[0]: tuple(row[1:]) for row in db.execute(text(
+            "SELECT id, kind, status, cve_id, data FROM findings"))} == rows
+        assert db.execute(text("SELECT * FROM artifacts")).one() == artifact
+    migrate(schema_url, "a08b9cb4d3e8")
+    with engine.begin() as db:
+        db.execute(text("UPDATE findings SET status = 'dismissed' WHERE id = 'f3'"))
+    # Numen has no Dismissed or Confirmed state, so it cannot hold this Finding.
+    refused = alembic(schema_url, "downgrade", "9f7a8ba3c2d7", check=False)
+    assert refused.returncode != 0 and "Findings f3 " in refused.stderr, refused.stderr
+    with engine.begin() as db:
+        assert db.execute(text("SELECT source, status FROM findings WHERE id = 'f3'")).one() == ("cve", "dismissed")
     engine.dispose()
 
 
@@ -591,6 +661,23 @@ def test_postgres_automatic_analysis_caps_count_todays_automatic_jobs(postgres):
                 schedule(db)  # Re-checked under FOR UPDATE SKIP LOCKED: still waiting, no second event.
             assert state(client, over)["status"] == "waiting_for_cap" and len(cap_events(app)) == 1
             assert len(automatic_jobs(app)) == CAPS["application"] + 5
+    finally:
+        app.state.factory.kw["bind"].dispose()
+
+
+def test_postgres_findings_open_and_link_within_each_application(postgres):
+    """Opening, linking and the commit's Finding list use JSON paths and row locks on PostgreSQL."""
+    from test_findings import test_links_map_addresses_only_within_each_application as scenario
+
+    original, _ = postgres
+    config = replace(original, secret_key=Fernet.generate_key().decode(), test_mode=True)
+    app = create_app(config=config, admin_password="test-password-long")
+    try:
+        with TestClient(app) as client:
+            session = client.post("/api/auth/login", json={
+                "username": "admin", "password": "test-password-long"}).json()
+            client.headers["X-CSRF-Token"] = session["csrf_token"]
+            scenario((app, client, config))
     finally:
         app.state.factory.kw["bind"].dispose()
 

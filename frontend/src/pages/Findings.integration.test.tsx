@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
@@ -28,10 +28,13 @@ const application = {
 const summary = {
   id: "finding",
   application_id: "application",
-  kind: "0day",
+  source: "commit",
+  source_ref: "abc1234",
   cve_id: null,
   title: "Stored XSS in timezone settings",
   status: "open",
+  cause: { by: "operator", at: "2026-10-06T00:00:00Z" },
+  deployed_version: "unknown",
   affected_versions: [
     { product: "Example CMS", range: "<= 9.5.3", source: "Pinned source" },
   ],
@@ -130,7 +133,7 @@ it("renders structured ranges in the finding detail", async () => {
   expect(screen.getByText("Example CMS 9.5.4")).toBeInTheDocument();
 });
 
-it("preserves structured version evidence when editing the operator status", async () => {
+it("preserves structured version evidence and leaves the lifecycle alone when editing", async () => {
   let saved: Record<string, unknown> | undefined;
   vi.stubGlobal(
     "fetch",
@@ -158,10 +161,10 @@ it("preserves structured version evidence when editing the operator status", asy
     </MemoryRouter>,
   );
   const user = userEvent.setup();
-  await user.selectOptions(
-    await screen.findByLabelText("Operator status"),
-    "fixed",
-  );
+  const title = await screen.findByLabelText("Title");
+  await user.clear(title);
+  await user.type(title, "Reviewed title");
+  expect(screen.getByLabelText("Source")).toBeDisabled();
   expect(screen.getByLabelText("Affected versions (one per line)")).toHaveValue(
     "Example CMS <= 9.5.3",
   );
@@ -169,7 +172,9 @@ it("preserves structured version evidence when editing the operator status", asy
   expect(
     await screen.findByRole("heading", { name: "Saved finding" }),
   ).toBeInTheDocument();
-  expect(saved?.status).toBe("fixed");
+  expect(saved?.title).toBe("Reviewed title");
+  expect(saved?.source).toBe("commit");
+  expect(saved).not.toHaveProperty("status");
   expect(saved?.affected_versions).toEqual(summary.affected_versions);
   expect(saved?.fixed_versions).toEqual(summary.fixed_versions);
 });
@@ -293,4 +298,242 @@ it("deletes the selected findings together after confirmation", async () => {
     await screen.findByRole("heading", { name: "No findings recorded" }),
   ).toBeInTheDocument();
   expect(deletions).toEqual([{ ids: ["finding", "second"] }]);
+});
+
+it("lists each finding with its source, lifecycle state and cause", async () => {
+  const items = [
+    {
+      ...summary,
+      cause: {
+        by: "verdict",
+        verdict: "Vulnerability introduced",
+        confidence: "high",
+        at: "2026-10-06T00:00:00Z",
+      },
+    },
+    {
+      ...summary,
+      id: "cve",
+      source: "cve",
+      source_ref: "CVE-2026-1234",
+      cve_id: "CVE-2026-1234",
+      title: "Template injection",
+      status: "remediated",
+      cause: { by: "remediation_pr", at: "2026-10-07T00:00:00Z" },
+    },
+  ];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () => new Response(JSON.stringify({ items, next_cursor: null })),
+    ),
+  );
+  render(
+    <MemoryRouter>
+      <FindingsList />
+    </MemoryRouter>,
+  );
+  const opened = (
+    await screen.findByRole("link", { name: summary.title })
+  ).closest("tr")!;
+  expect(screen.getByRole("columnheader", { name: "State" })).toBeVisible();
+  expect(within(opened).getByText("Commit abc1234")).toBeInTheDocument();
+  expect(within(opened).getByText("Open")).toBeInTheDocument();
+  expect(
+    within(opened).getByText(
+      "Vulnerability introduced Verdict, high confidence",
+    ),
+  ).toBeInTheDocument();
+  const remediated = screen
+    .getByRole("link", { name: "Template injection" })
+    .closest("tr")!;
+  expect(within(remediated).getByText("CVE-2026-1234")).toBeInTheDocument();
+  expect(within(remediated).getByText("Remediated")).toBeInTheDocument();
+  expect(
+    within(remediated).getByText("Merged Remediation PR"),
+  ).toBeInTheDocument();
+});
+
+it("shows the lifecycle, the history of linked changes and the Deployed version separately", async () => {
+  const at = "2026-10-06T00:00:00Z";
+  const confirmed = {
+    ...detail,
+    source_commit_id: "commit-1",
+    status: "confirmed",
+    cause: { by: "operator", reason: "Reproduced by hand", at },
+    events: [
+      {
+        id: "e1",
+        created_at: at,
+        action: "opened",
+        source_ref: "abc1234",
+        cause: {
+          by: "verdict",
+          verdict: "Vulnerability fix",
+          confidence: "medium",
+          at,
+        },
+      },
+      {
+        id: "e2",
+        created_at: at,
+        action: "linked",
+        commit_id: "commit-2",
+        revision: "b".repeat(40),
+        analysis_id: "analysis-2",
+        verdict: "Vulnerability fix",
+      },
+      {
+        id: "e3",
+        created_at: at,
+        action: "transition",
+        from: "open",
+        to: "confirmed",
+        cause: { by: "operator", reason: "Reproduced by hand", at },
+      },
+      { id: "e4", created_at: at, action: "artifacts_uploaded" },
+    ],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async (url: string) =>
+        new Response(
+          JSON.stringify(
+            url.startsWith("/api/applications/") ? application : confirmed,
+          ),
+        ),
+    ),
+  );
+  render(
+    <MemoryRouter initialEntries={["/findings/finding"]}>
+      <Routes>
+        <Route path="/findings/:id" element={<FindingDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  const lifecycle = await screen.findByRole("region", { name: "Lifecycle" });
+  expect(within(lifecycle).getByText("Confirmed")).toBeInTheDocument();
+  expect(
+    within(lifecycle).getByText("Operator: Reproduced by hand"),
+  ).toBeInTheDocument();
+  const history = screen.getByRole("region", { name: "History" });
+  const [opened, linked, transition, uploaded] =
+    within(history).getAllByRole("listitem");
+  expect(opened).toHaveTextContent("Opened");
+  expect(opened).toHaveTextContent("Commit abc1234");
+  expect(opened).toHaveTextContent(
+    "Vulnerability fix Verdict, medium confidence",
+  );
+  expect(linked).toHaveTextContent("Vulnerability fix");
+  expect(within(linked).getByRole("link", { name: "bbbbbbb" })).toHaveAttribute(
+    "href",
+    "/commits/commit-2",
+  );
+  expect(transition).toHaveTextContent("Open → Confirmed");
+  expect(transition).toHaveTextContent("Operator: Reproduced by hand");
+  expect(uploaded).toHaveTextContent("Artifacts uploaded");
+  const deployed = screen.getByText("Deployed version").closest("div")!;
+  expect(deployed).toHaveTextContent("Unknown");
+  expect(
+    screen.getByText(
+      "A fix in the repository does not mean the Asset serves it.",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("Operator status")).not.toBeInTheDocument();
+});
+
+it("confirms, dismisses and marks a finding remediated with a reason", async () => {
+  let current: Record<string, unknown> = { ...detail };
+  const posted: { body: unknown; csrf: string | null }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith("/api/applications/"))
+        return new Response(JSON.stringify(application));
+      if (url === "/api/findings/finding/transitions") {
+        const body = JSON.parse(String(init?.body)) as {
+          state: string;
+          reason: string;
+        };
+        posted.push({
+          body,
+          csrf: new Headers(init?.headers).get("X-CSRF-Token"),
+        });
+        current = {
+          ...current,
+          status: body.state,
+          cause: { by: "operator", reason: body.reason },
+        };
+      }
+      return new Response(JSON.stringify(current));
+    }),
+  );
+  setCsrfToken("token");
+  const view = () =>
+    render(
+      <MemoryRouter initialEntries={["/findings/finding"]}>
+        <Routes>
+          <Route path="/findings/:id" element={<FindingDetail />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  const user = userEvent.setup();
+  const enabled = async (reason: string) => {
+    const lifecycle = await screen.findByRole("region", { name: "Lifecycle" });
+    await user.type(within(lifecycle).getByLabelText("Reason"), reason);
+    return ["Confirm", "Dismiss", "Mark remediated"].filter(
+      (name) =>
+        !within(lifecycle)
+          .getByRole("button", { name })
+          .hasAttribute("disabled"),
+    );
+  };
+  const { unmount } = view();
+  const lifecycle = await screen.findByRole("region", { name: "Lifecycle" });
+  // An empty reason blocks every action.
+  for (const name of ["Confirm", "Dismiss", "Mark remediated"])
+    expect(within(lifecycle).getByRole("button", { name })).toBeDisabled();
+  expect(await enabled("Reproduced in the lab")).toEqual([
+    "Confirm",
+    "Dismiss",
+    "Mark remediated",
+  ]);
+  await user.click(within(lifecycle).getByRole("button", { name: "Confirm" }));
+  expect(await within(lifecycle).findByText("Confirmed")).toBeInTheDocument();
+  expect(posted).toEqual([
+    {
+      body: { state: "confirmed", reason: "Reproduced in the lab" },
+      csrf: "token",
+    },
+  ]);
+  expect(await enabled("Patched upstream")).toEqual(["Mark remediated"]);
+  await user.click(
+    within(lifecycle).getByRole("button", { name: "Mark remediated" }),
+  );
+  expect(await within(lifecycle).findByText("Remediated")).toBeInTheDocument();
+  expect(posted[1].body).toEqual({
+    state: "remediated",
+    reason: "Patched upstream",
+  });
+  unmount();
+  current = { ...detail };
+  view();
+  await enabled("Not reachable");
+  await user.click(
+    within(await screen.findByRole("region", { name: "Lifecycle" })).getByRole(
+      "button",
+      { name: "Dismiss" },
+    ),
+  );
+  expect(
+    await within(screen.getByRole("region", { name: "Lifecycle" })).findByText(
+      "Dismissed",
+    ),
+  ).toBeInTheDocument();
+  expect(posted[2].body).toEqual({
+    state: "dismissed",
+    reason: "Not reachable",
+  });
+  expect(await enabled("Reopen")).toEqual([]);
 });

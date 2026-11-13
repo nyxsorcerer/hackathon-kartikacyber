@@ -28,7 +28,7 @@ def finding(client, ident):
         "/api/findings",
         json={
             "application_id": ident,
-            "kind": "0day",
+            "source": "commit",
             "title": "Fixture finding",
             "fixed_versions": ["2.0.0"],
             "target_applicability": "affected",
@@ -85,7 +85,9 @@ def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(sy
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == "succeeded", job
     row = client.get(f"/api/findings/{job['result']['finding_id']}").json()
-    assert row["kind"] == "cve" and row["cve_id"] == result["cve_id"]
+    assert row["source"] == "cve" and row["cve_id"] == result["cve_id"]
+    assert row["source_ref"] == result["cve_id"]
+    assert (row["cause"]["by"], row["cause"]["analysis_id"]) == ("cve_analysis", job["result"]["analysis_id"])
     assert row["source_analysis_id"] == job["result"]["analysis_id"]
     assert row["fixed_versions"] == ["2.0.0"] and row["status"] == "open"
     assert row["target_applicability"] == "unknown" and row["lab_runs"] == []
@@ -101,7 +103,8 @@ def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(sy
     assert analyses[0]["result"]["finding_id"] == row["id"]
     original_analysis_id = analyses[0]["id"]
     original_report = next(a for a in analyses[0]["artifacts"] if a["path"] == "report.md")
-    client.patch(f"/api/findings/{row['id']}", json={"status": "fixed", "title": "Reviewed title"})
+    client.post(f"/api/findings/{row['id']}/transitions", json={"state": "remediated", "reason": "Upgraded"})
+    client.patch(f"/api/findings/{row['id']}", json={"title": "Reviewed title"})
     again = client.post(
         f"/api/applications/{p['id']}/cves/{result['cve_id']}/analyses", json={}
     ).json()["job_id"]
@@ -109,10 +112,11 @@ def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(sy
         config,
         app.state.factory,
         FixtureBroker(result, {**bundle(), "report.md": b"# Updated report"}),
+        exclude=("notification",),
     )
     assert client.get(f"/api/jobs/{again}").json()["result"]["finding_id"] == row["id"]
     current = client.get(f"/api/findings/{row['id']}").json()
-    assert current["status"] == "fixed" and current["title"] == "Reviewed title"
+    assert current["status"] == "remediated" and current["title"] == "Reviewed title"
     assert (
         client.get(f"/api/artifacts/{original_report['id']}/content").content
         == bundle()["report.md"]
@@ -242,7 +246,7 @@ def test_cve_analysis_is_read_only(system):
         json={},
     ).json()["job_id"]
     second = FixtureBroker({"summary": "Partial"}, {"report.md": b"# Partial"})
-    run_once(config, app.state.factory, second)
+    run_once(config, app.state.factory, second, exclude=("notification",))
     assert "Build sandbox" not in second.calls[0]["prompt"]
     assert client.get(f"/api/jobs/{generation}").json()["status"] == "failed"
 
@@ -288,7 +292,7 @@ def test_finding_generation_uses_linked_cve_analysis_and_rejects_incomplete_outp
         f"/api/findings/{completed['finding_id']}/artifact-generations", json={}
     ).json()["job_id"]
     broker = FixtureBroker({"summary": "Missing PoC"}, {"report.md": b"# Partial generation"})
-    run_once(config, app.state.factory, broker)
+    run_once(config, app.state.factory, broker, exclude=("notification",))
     inputs = broker.calls[0]["files"]
     assert json.loads(inputs["analysis.json"])["result"]["cve_id"] == result["cve_id"]
     assert inputs["analysis-report.md"] == bundle()["report.md"]
@@ -312,7 +316,7 @@ def test_finding_generation_keeps_large_artifact_inventories_out_of_the_prompt(s
         row.data = {**row.data, "evidence": [{"source_notes": "evidence " * 40000}]}
     generation = client.post(f"/api/findings/{original['finding_id']}/artifact-generations", json={}).json()["job_id"]
     broker = FixtureBroker({"summary": "Regenerated bundle"}, bundle())
-    run_once(config, app.state.factory, broker)
+    run_once(config, app.state.factory, broker, exclude=("notification",))
     call = broker.calls[0]
     assert len(call["prompt"]) < 262144  # The actual runner's RunRequest prompt bound.
     assert "finding.json" in call["files"]
@@ -371,6 +375,15 @@ def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
     assert current["lab_runs"][0]["artifact_revision"] == complete["artifact_revision"]
     assert current["lab_runs"][0]["vulnerable_version"] == "1.0.0"
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
+    # A Proof that did not reproduce leaves the Finding Open; a reproduced one confirms it (A11).
+    assert current["status"] == "open" and current["cause"]["by"] == "operator"
+    client.post(f"/api/findings/{row['id']}/lab-runs", headers={"Idempotency-Key": "lab-twice"})
+    run_once(config, app.state.factory, FixtureBroker({"verified": True, "status": "verified", "exit_code": 0}))
+    current = client.get(f"/api/findings/{row['id']}").json()
+    assert current["lab_runs"][0]["status"] == "verified"
+    assert current["status"] == "confirmed"
+    assert {k: v for k, v in current["cause"].items() if k != "at"} == {
+        "by": "proof", "lab_run_id": current["lab_runs"][0]["id"]}
 
 
 def test_paths_archives_and_configured_secrets_rejected(system):
@@ -390,7 +403,7 @@ def test_paths_archives_and_configured_secrets_rejected(system):
     assert client.get(f"/api/findings/{row['id']}").json()["artifacts"] == []
 
 
-def test_webhook_failure_retry_retains_candidate_identity(system, monkeypatch):
+def test_webhook_failure_retry_retains_its_identity(system, monkeypatch):
     app, client, config = system
     assert (
         client.patch(
@@ -405,9 +418,12 @@ def test_webhook_failure_retry_retains_candidate_identity(system, monkeypatch):
     )
     import httpx
 
-    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: httpx.Response(401))
+    sent = []
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: sent.append(kwargs["json"]) or httpx.Response(401))
     queued = client.post("/api/settings/webhook/test").json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker())
+    # The test button uses the one Alert template.
+    assert sent == [{"content": "Asset Monitor: Webhook test\nhttp://localhost:8080/", "allowed_mentions": {"parse": []}}]
     note = client.get("/api/notifications").json()["items"][0]
     assert note["status"] == "failed" and note["error"]["code"] == "webhook_http_error"
     assert client.get(f"/api/jobs/{queued}").json()["result"]["status"] == "failed"

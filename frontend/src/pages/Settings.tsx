@@ -996,7 +996,7 @@ function Discord() {
                     <strong>
                       {typeof delivery.event_key === "string"
                         ? delivery.event_key
-                        : `Notification ${i + 1}`}
+                        : `Alert ${i + 1}`}
                     </strong>
                     <Badge>
                       {typeof delivery.status === "string"
@@ -1024,8 +1024,8 @@ function Discord() {
             </div>
           ) : (
             <Empty
-              title="No notification attempts"
-              description="Test deliveries and candidate/CVE events will be recorded here."
+              title="No Alert deliveries"
+              description="Test deliveries and Alerts are recorded here."
             />
           )}
         </DataState>
@@ -1048,7 +1048,7 @@ function DiscordEditor({
   return (
     <Panel
       title="Discord webhook"
-      description="Notifications link to authenticated review pages. Analysis still requires your dashboard decision."
+      description="Alerts link to the dashboard. They never carry commit messages or agent text, and never collect Approvals."
     >
       <form
         onSubmit={async (e) => {
@@ -1115,7 +1115,7 @@ function DiscordEditor({
               checked={enabled}
               onChange={(e) => setEnabled(e.target.checked)}
             />
-            Enable candidate and eligible CVE notifications
+            Send Alerts when a Finding opens or a cap is reached
           </label>
         </div>
         {error && <ErrorNote>{error}</ErrorNote>}
@@ -1126,7 +1126,7 @@ function DiscordEditor({
             onAction={() => queueJob("/settings/webhook/test")}
           >
             <Send size={15} />
-            Test notification
+            Send test Alert
           </ActionButton>
           <button className="primary" disabled={busy}>
             <Save size={15} />

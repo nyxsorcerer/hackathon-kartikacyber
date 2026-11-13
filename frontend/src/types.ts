@@ -259,14 +259,17 @@ export const commitSchema = z.object({
     .array(z.object({ rule: z.string(), paths: z.array(z.string()) }))
     .default([]),
   analyses: z.array(analysisSchema).default([]),
-  /** Findings recorded from this revision. */
+  /** Findings this revision opened (source) or was linked to (linked), in every Application. */
   findings: z
     .array(
       z.object({
         id: z.string(),
         title: z.string(),
         status: z.string(),
-        kind: z.string().optional(),
+        source: z.string().optional(),
+        application_id: z.string(),
+        application_name: z.string(),
+        relation: z.enum(["source", "linked"]).optional(),
       }),
     )
     .default([]),
@@ -356,10 +359,16 @@ export type CVE = z.infer<typeof cveSchema>;
 export const findingSchema = z.object({
   id: z.string(),
   application_id: z.string(),
-  kind: z.enum(["cve", "0day"]),
+  source: z.enum(["commit", "served_content", "advisory", "cve"]),
+  /** Short SHA, Watched page or advisory id of what opened the Finding. */
+  source_ref: z.string().nullable().optional(),
   cve_id: z.string().nullable(),
   title: z.string(),
-  status: z.enum(["open", "fixed"]),
+  status: z.enum(["open", "confirmed", "dismissed", "remediated"]),
+  /** Who or what set the current status, and when. */
+  cause: unknownRecord.nullable().optional(),
+  /** Shown apart from the lifecycle; unknown until a Deployed version check exists. */
+  deployed_version: z.string().default("unknown"),
   // Findings created by a commit analysis may not record version ranges yet.
   affected_versions: z.array(z.union([z.string(), unknownRecord])).default([]),
   fixed_versions: z.array(z.union([z.string(), unknownRecord])).default([]),
@@ -385,10 +394,13 @@ export const findingSummarySchema = findingSchema
   .pick({
     id: true,
     application_id: true,
-    kind: true,
+    source: true,
+    source_ref: true,
     cve_id: true,
     title: true,
     status: true,
+    cause: true,
+    deployed_version: true,
     affected_versions: true,
     fixed_versions: true,
     target_applicability: true,

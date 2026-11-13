@@ -378,6 +378,111 @@ On Docker Desktop (Engine 20.10, 8 GB):
 | `make test-ui` | 116 passed in 19 files |
 | `make test-journey` | passed (all 8 PASS lines, JOURNEY PASSED); the `asset-monitor-test` stack was then stopped |
 
+## Phase 3: Findings and Alerts (2026-11-13)
+
+Phase 3 (A11, A12), T1–T5. This section records each task, the acceptance mapping and the phase's verification.
+
+What each task changed:
+- **T1, sources, lifecycle and Operator actions (A11).**
+  - Migration `a08b9cb4d3e8` renames Finding `kind` to `source` (`0day` to `commit`, `cve` kept) and maps status `fixed` to `remediated` (`open` kept). It gives every row `data.cause: {by: numen}` and a `data.source_ref` (the commit's short SHA, else the CVE id), and leaves artifacts and other data untouched. Its downgrade is refused, naming the Finding ids, while any Finding is Confirmed or Dismissed or has a `served_content` or `advisory` source.
+  - `domain.transition_finding` is the only lifecycle move (`FINDING_TRANSITIONS`, `FINDING_CAUSES`). It locks the row, raises for a cause that cannot set that state, returns false from any other state, and records a `transition` action with the cause and its time.
+  - `POST /findings/{id}/transitions` (`{state, reason}`, CSRF-protected, 409 `invalid_transition`) gives the Operator Confirm, Dismiss and Mark remediated. `PATCH /findings/{id}` no longer takes `status` and refuses a source change with `immutable_source`.
+  - Responses add `source`, `source_ref`, `cause` and `deployed_version` (`unknown`). A verified Lab run confirms its Finding with `{by: proof, lab_run_id}`. Draft stays `artifact_state` only.
+- **T2, opening and linking (A11).**
+  - `domain.open_finding` opens one Finding for each affected Application (`domain.affected_applications`: link on and not removed, Application not archived), or returns the existing one unchanged in any state. A repeat Analysis therefore never duplicates a Finding and never reopens a Dismissed one.
+  - A Malicious change Verdict now opens a Finding. Its drafts stay with the Analysis.
+  - `domain.link_change` maps the Analysis `addresses` to the Application's Open or Confirmed Findings only. It records a `linked` action and leaves the Finding's state and cause unchanged.
+  - `domain.analysis_reaches` lets the other Applications' Findings reference a shared Upstream Analysis. Commit records list `findings` across Applications with `relation: source|linked`.
+- **T3, Alerts (A12).**
+  - `domain.notify` stores only `{application, account, source, verdict, link}`. The delivery is `{content, allowed_mentions: {parse: []}}` with no embeds.
+  - `open_finding` queues `finding:{id}:opened`, and the first `analysis_cap_reached` row of a scope and UTC day queues `cap:{scope}:{id}:{day}`.
+  - Numen's security-candidate (Triage), candidate-mark and eligible-CVE triggers and the `notified_hash` write are removed. The outbox, retry, AC-16 behaviour and the test button are kept.
+  - The journey's Discord step now checks one fixed-template test delivery and no Alert for a candidate mark.
+- **T4, UI.**
+  - The register shows each Finding's source and State with its cause. The Finding page has a Lifecycle panel with Confirm, Dismiss and Mark remediated and a required reason, a History panel (opened, linked and transition events), and a separate Deployed version row (Unknown).
+  - The commit pages link each Verdict to its Findings as `{State} finding · {Application}` (`Linked:` for a linked one). The commit review button that sets `confirmed` reads Confirm revision. Badge tones cover `remediated` and `dismissed`.
+- **T5, this sweep.**
+  - The contract now gives `POST /findings` (an Open Finding with cause `operator`, no Alert) and the `PATCH` refusals in the routes list. It defines the dashboard's `open_findings` and `security_reviews` counts, and its verified adjustments record the Phase 3 deviations below.
+  - README step 5 links Verdicts to Findings and explains Confirm revision. Step 7 covers the history, the Deployed version, Draft, mentions and hand-made Findings.
+  - Settings no longer uses the glossary's avoided term "notification": the button reads Send test Alert, the empty history No Alert deliveries, and an unnamed row `Alert n`. The Findings register heading is Finding register, where it said "Confirmed evidence" but also lists Open Findings.
+  - Two tests are renamed: `test_webhook_failure_retry_retains_its_identity` (was `…_retains_candidate_identity`) and `test_confirmed_commits_link_their_findings_without_an_alert` (was `…_without_a_candidate_notification`). The second now asserts that no Alert is queued at all, where it only checked for candidate ones, so it covers the hand-made Finding deviation below.
+
+Acceptance tests, all passing in the runs below:
+
+| Criterion | Tests |
+|---|---|
+| AC-A11: a linked fix shows both changes in the Finding's history and leaves the state unchanged | backend `test_a_linked_fix_shows_both_changes_in_the_history_and_leaves_the_state_unchanged`, `test_links_map_addresses_only_within_each_application`, `test_postgres_findings_open_and_link_within_each_application` (the same scenario on PostgreSQL); UI `Findings` "shows the lifecycle, the history of linked changes and the Deployed version separately", `CommitReview` "links a Verdict to the Findings it opened and was linked to" |
+| AC-A11: a Dismissed Finding is not reopened by the same Verdict on a repeat Analysis | `test_a_repeat_analysis_opens_no_duplicate_and_never_reopens_a_dismissed_finding` (the same and a different opening Verdict), `test_each_opened_finding_sends_one_alert_per_application` (a repeat sends no second Alert) |
+| AC-A11: a Remediated Finding records what remediated it | `test_a_remediated_finding_records_what_remediated_it` (Remediation PR, version bump, Baseline match, Deployed version), `test_operator_confirms_dismisses_and_remediates_with_a_reason`; UI `Findings` "confirms, dismisses and marks a finding remediated with a reason" |
+| A11 opening: Own and Upstream Verdicts, one Finding per affected Application, Malicious change, served content and advisory | `test_an_own_repository_verdict_opens_a_finding` (all three opening Verdicts), `test_a_shared_upstream_verdict_opens_a_finding_in_every_application_that_uses_it`, `test_malicious_change_opens_a_finding_and_keeps_its_drafts_with_the_analysis`, `test_open_finding_takes_served_content_and_advisory_sources`, `test_a_second_applications_finding_accepts_the_shared_analysis` |
+| A11 lifecycle: the transitions, their causes, Draft, the Operator actions | `test_internal_confirmations_apply_only_to_open_findings` (Proof, Detection rule, Advisory match), `test_operator_confirms_dismisses_and_remediates_with_a_reason` (reason trimmed and bounded, 409 `invalid_transition`, CSRF), `test_draft_is_an_artifact_state_not_a_lifecycle_state`, `test_bundle_draft_completion_immutable_revision_and_lab_failure` (a verified Lab run confirms with `{by: proof}`); UI `Findings` "lists each finding with its source, lifecycle state and cause", "preserves structured version evidence and leaves the lifecycle alone when editing" |
+| A11 migration: `open` to Open, `fixed` to Remediated, `0day` to commit, `cve` kept, data and artifacts kept | `test_postgres_migration_moves_findings_to_sources_and_the_lifecycle` (upgrade, refused downgrade, exact restore) |
+| AC-A12: a commit message containing `@everyone` and a link appears in no Alert | `test_an_alert_carries_only_application_generated_fields` (commit message, author, agent title and summary all carry `@everyone`, `@here` and a link; the one delivery is the fixed template with `allowed_mentions: {parse: []}`) |
+| AC-A12: Security hardening, Unrelated and Review queue entries send no Alert | `test_nothing_else_sends_an_alert` (also a Triage security candidate, single and batch candidate marks, an eligible CVE), `test_marking_candidates_sends_no_alert`, `test_confirmed_commits_link_their_findings_without_an_alert` (a hand-made Finding); journey Discord step |
+| AC-A12: not-exposed Verdicts send no Alert | Phase 7: Exposure is not computed yet, so every Upstream link counts as exposed. Phase 7 adds the filter in `domain.affected_applications` and this test |
+| AC-A12: delivery failure behaves as in Numen's AC-16 | `test_a_failed_alert_retries_with_its_identity_and_changes_no_finding`, `test_webhook_failure_retry_retains_its_identity` |
+| A12: Alerts when a Finding opens and when a cap is reached, fixed template, legacy rows | `test_each_opened_finding_sends_one_alert_per_application`, `test_a_cve_analysis_that_opens_a_finding_alerts_as_advisory`, `test_a_reached_cap_sends_one_alert_per_cap_per_day` (Application and account caps, once per day, again the next UTC day), `test_a_legacy_numen_notification_is_sent_without_its_text`; journey Discord step (`allowed_mentions`, no embeds) |
+| Plan Done-when: a commit message containing `@everyone` produces an Alert without it | `test_an_alert_carries_only_application_generated_fields` |
+
+Deviations from the plan, PRD and ADRs:
+- **Hand-made Findings.** A Finding the Operator creates by hand (`POST /findings`) sends no Alert. Only Findings the application opens do.
+- **CVE-analysis Findings.** A `cve`-source Finding (CVE analysis carried over from Numen) alerts as "Advisory" with the CVE id as its source.
+- **Account-cap Alerts.** An account-cap Alert carries the Provider account's label instead of an Application name, because an account cap belongs to no Application.
+- **Legacy outbox rows.** A legacy Numen row, if retried, sends only `Asset Monitor: Alert` and its link, never its stored title or detail.
+- **Exposure.** Exposure is computed in Phase 7. Until then every Upstream link counts as unknown, which counts as exposed, so an opening Verdict opens a Finding in every Application that uses the repository.
+- **Shared Analyses.** A shared Analysis row keeps the first Application's `application_id`. Findings in the other Applications reference it through `domain.analysis_reaches`, which relaxes Numen's same-Application rule for commit Analyses only. The drafted bundle is published once per affected Application, so storage grows with the number of Applications.
+- **De-duplication.** There is no database uniqueness on (Application, source, subject), because carried-over data holds duplicate manual Findings. The opening de-duplication is application code with `SELECT … FOR UPDATE`, so two concurrent Analyses of one commit can still race to a duplicate, as in Numen.
+- **Repeat Verdicts.** A repeat Analysis that returns a different opening Verdict reuses the Application's existing Finding for that commit and never reopens it. An Analysis of a commit that no in-use Application's repository holds opens no Finding.
+- **Linking by prefix.** Linking matches a short SHA (7 or more hex characters) as a prefix within one Application, so a very short, ambiguous prefix could link the wrong Finding of that Application. A change linked once is never opened later, even after the Finding is Remediated.
+- **Callers still to come.** A verified Lab run now confirms its Finding (cause `proof`); Phase 4 puts Labs behind Approval and must keep that call. The `deployed_version` caller (Phase 7) must restrict itself to Own-repository Vulnerability fix Findings, because `transition_finding` does not check the Verdict or the role.
+- **Review decisions and counts.** Numen's commit review decisions (`candidate`, `confirmed`, `dismissed`) stay separate from the Finding lifecycle, and the commit button that sets `confirmed` reads Confirm revision. The Open findings counts on the dashboard and the Application page count only `open`, not Confirmed.
+- **Downgrade.** The migration downgrade is refused while any Finding is Confirmed or Dismissed or has a `served_content` or `advisory` source, because Numen cannot represent them. This follows the existing refusal pattern.
+- **Linking in any state.** The phase brief maps `addresses` to Open or Confirmed Findings; the review fixes below link to the Application's Findings in any state, as A11's "an existing Finding" reads, so a fix addressing a Dismissed or Remediated Finding opens nothing new.
+
+**Review fixes.** After the T1–T5 review:
+- Only a Vulnerability fix is kept from opening by its `addresses`. A Vulnerability introduced or Malicious change always opens its own Finding and Alert and is also linked to the Findings it names, so an agent steered into listing an older SHA or CVE cannot hide it (`test_an_introducing_change_opens_its_own_finding_whatever_it_addresses`).
+- `domain.link_change` matches the Application's Findings in any state (the updated `test_links_map_addresses_only_within_each_application`: Blog's Dismissed X is linked, no new Finding and no Alert).
+- A drafted `vulnerable_ref` that fails validation no longer fails the job before opening: the Findings open and alert, no bundle is published, the job succeeds and the error is kept as `bundle_error` on the Analysis (`test_an_unrelated_vulnerable_revision_opens_the_finding_without_publishing_its_bundle`). This replaces Phase 2's "Invalid vulnerable revision" behaviour.
+- A repeat commit or CVE Analysis leaves a Dismissed or Remediated Finding's evidence, `source_analysis_id` and bundle as they were, and a commit Analysis no longer resets `target_applicability` (`test_a_repeat_analysis_opens_no_duplicate_and_never_reopens_a_dismissed_finding`). CVE analysis still refreshes an Open or Confirmed Finding's applicability from its computed facts, as in Numen.
+- `domain.notify` inserts under a savepoint and ignores the unique `event_key` conflict, so two workers reaching one cap at once no longer fail the second Triage transaction (`test_a_cap_alert_lost_to_a_concurrent_worker_keeps_the_transaction`).
+- `PATCH /findings/{id}` recomputes a commit Finding's `source_ref` from its `source_commit_id` (`test_editing_a_commit_findings_source_commit_updates_its_source_ref`).
+
+**Stale-reference sweep.** `git grep -n -i "0day\|kind.*cve\|status.*fixed\|Security candidate:\|candidate and eligible CVE\|embeds\|notified_hash\|opens no Finding"` over `backend`, `frontend`, `tests` and `docs/implementation-contract.md`, with migrations excluded, finds no stale text. The remaining hits are deliberate:
+- `kind.*cve` hits on job kinds (`cve_analysis`, `cve_sync`) in `domain.py`, `worker.py` and backend and UI tests; `source_kind` with `cve_selectors` in `test_repositories.py`; and the CVE/commit analysis prop of `AnalysisResult.tsx`. None is a Finding kind;
+- the migration test's legacy `0day` and `fixed` rows and its mapping (`test_postgres.py`);
+- `test_a_legacy_numen_notification_is_sent_without_its_text`, which seeds a legacy `Security candidate: @everyone` row to show that its text is never sent;
+- the journey's assertion that `embeds` is absent from the delivery;
+- in the contract: lines where an unrelated `status` or `kind` precedes "fixed" or "cve" (Jev's `change_kind`, the Transcript `kind: triage`, CVE `match_status`, `fixed_versions`, "the current fixed checkout", "prefixed `Linked:`"), the record of migration `a08b9cb4d3e8` (`0day` to `commit`, `fixed` to `remediated`), and "with no embeds" in the Alert delivery.
+
+The broader sweep for this phase's terms (`operator status`, `candidate notification`, "notification" in UI text) left only `/notifications` API paths, the `Notification` model and `notification` job kind, the internal `notify` helpers, and the CVE test "opens existing CVE notification links", which covers links in Numen's stored CVE rows. `docs/design/numen-design.md` and `docs/ui-spec/numen-ui-spec.md` still describe Numen's operator status and its Test notification button, because they document Numen.
+
+**Outside traffic.** No paid inference was made, and no request reached a real Asset, GitHub, Discord, a package registry or `herdr.dev`. Alert delivery is tested against a monkeypatched `httpx.post` in the backend suites and against the integration fixture server's webhook in the journey. Model providers are `FixtureBroker` or loopback fixtures. Numen's pre-existing gateway runtime test still opens one credential-free TCP tunnel to `api.openai.com:443` to prove that a provider host is allowed. It sends no TLS handshake and no request.
+
+On Docker Desktop (Engine 20.10, 8 GB):
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed (ruff, eslint, tsc, vite build); `npm run format:check` (Prettier) also passed |
+| `make test-unit` | backend 230 passed; runner 125 passed, 57 skipped |
+| `make test-integration` | 358 passed against PostgreSQL |
+| `make test-runtime` | 182 passed, 0 failed |
+| `make test-ui` | 120 passed in 19 files |
+| `make test-journey` | passed (its `make build` and all 8 PASS lines, including "fixed-template webhook test delivery, no Alert for a candidate mark", JOURNEY PASSED); the `asset-monitor-test` stack was then stopped with its volumes kept |
+| `pytest tests/test_commit_review.py tests/test_artifacts.py` and `ruff check` (backend-tests) | 73 passed; ruff clean. This reruns `test_commit_review.py`, whose assertion T5 tightened after the `make test-integration` image was built, with `test_artifacts.py` |
+
+After the review fixes, on the same machine:
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed (only Vite's existing chunk-size warning) |
+| `make test-unit` | backend 230 passed; runner 125 passed, 57 skipped |
+| `make test-integration` | 362 passed against PostgreSQL (the four new tests included; `test_postgres_findings_open_and_link_within_each_application` reruns the updated linking scenario) |
+| `make test-runtime` | 182 passed |
+| `make test-ui` | 120 passed in 19 files |
+| `make test-journey` | passed (all 8 PASS lines, JOURNEY PASSED); the `asset-monitor-test` stack was then stopped with its volumes kept |
+
 ## Commit review correction (2026-10-06)
 
 Program selection now precedes global review and only that program's records are fetched; switching programs clears the previous queue. New triage output includes a potential issue title and fix/hardening/introduction kind. Complete unrelated results are dismissed, incomplete evidence stays pending, and manual review actions after job submission take precedence. Jev's three typed questions follow its official contract; existing source messages and legacy reports remain readable without inventing classifications.

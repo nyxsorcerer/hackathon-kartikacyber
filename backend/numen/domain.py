@@ -1,7 +1,8 @@
 import json
+import re
 from urllib.parse import quote
 from datetime import timedelta
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from . import artifacts, cves
@@ -353,10 +354,17 @@ def in_use(application, link):
 
 def commit_application(db, commit):
     """The first Application that uses the commit's repository (not archived, link on and not
-    removed), else the first that ever linked it. Until Findings are per Application, it is the
-    context for commit pages and commit analysis."""
+    removed), else the first that ever linked it. It is the context of commit pages and owns the
+    commit's one Analysis; the Findings that Analysis opens are per affected Application."""
     rows = linked_applications(db, db.get(Repository, commit.repository_id))
     return next((a for a, link in rows if in_use(a, link)), rows[0][0] if rows else None)
+
+
+def affected_applications(db, repository):
+    """The Applications a Verdict on `repository` reaches: each one that uses it. Own links always
+    count, and Upstream links count because their Exposure is unknown, which counts as exposed."""
+    # ponytail: Exposure is not computed yet; Phase 7 adds the not-exposed filter here.
+    return [a for a, link in linked_applications(db, repository) if in_use(a, link)]
 
 
 def triage_application(db, repository):
@@ -411,7 +419,7 @@ def start_analysis(db, commit):
         previous = commit.analysis_state or {}
         since = previous.get("since") if previous.get("status") == "waiting_for_cap" else current.isoformat()
         commit.analysis_state = {"status": "waiting_for_cap", "since": since, "cap": cap}
-        # One event per scope and day, which Phase 3 turns into an Alert.
+        # One event and one Alert per scope and day (A12).
         resource = application.id if cap == "application" else profile["connection_id"]
         day = midnight.date().isoformat()
         if not db.scalar(select(Action.id).where(
@@ -422,6 +430,13 @@ def start_analysis(db, commit):
         ).limit(1)):
             db.add(Action(resource_type=cap, resource_id=resource,
                           data={"action": "analysis_cap_reached", "day": day, "limit": ANALYSIS_CAPS[cap]}))
+            # An account cap belongs to no Application, so its Alert names the Provider account.
+            where = (
+                {"application": application.asset_name, "link": f"/reviews?application={application.id}"}
+                if cap == "application"
+                else {"account": db.get(Account, resource).label, "link": "/settings?tab=accounts"}
+            )
+            notify(db, f"cap:{cap}:{resource}:{day}", verdict="Cap reached", **where)
         return None
     inputs = job_input(db, application, commit_id=commit.id, source_ref=commit.revision, automatic=True, shared=shared)
     job = enqueue(db, "commit_analysis", application, inputs, profile, key)
@@ -531,15 +546,6 @@ def queue_cve(db, application, cve, link, submitted=None, key=None, source_ref=N
 def refresh_cve_policy(db, application, cve, link):
     decision = cves.gate(application, cve, link)
     relevant_hash = cves.gate_hash(application, cve, link)
-    if decision["eligible"] and link.data.get("notified_hash") != relevant_hash:
-        notify(
-            db,
-            f"cve:{application.id}:{cve.id}:{relevant_hash}",
-            cve.id + " — " + cve.data["title"],
-            f"/cves?application_id={application.id}&cve_id={cve.id}",
-            "Eligible Base score " + str(decision["qualifying_score"]["base_score"]),
-        )
-        link.data = {**link.data, "notified_hash": relevant_hash}
     if decision["eligible"] and application.config.get("cve_auto_analyze") and not application.archived:
         key = f"cve-analysis:{application.id}:{cve.id}:{relevant_hash}"
         if not db.scalar(select(Job).where(Job.idempotency_key == key)):
@@ -707,16 +713,33 @@ def analysis_json(db, row, with_artifacts=True):
 
 
 def commit_findings(db, ids):
-    """The findings each commit produced, keyed by commit id."""
-    linked = {}
+    """The Findings each commit opened (relation source) or was linked to (relation linked), in
+    every Application, keyed by commit id."""
+    found = {}
     if not ids:
-        return linked
+        return found
+    ids = list(ids)
+    named = select(Finding, Application.asset_name).join(Application, Application.id == Finding.application_id)
     source = Finding.data["source_commit_id"].as_string()
-    for finding in db.scalars(select(Finding).where(source.in_(list(ids))).order_by(Finding.created_at)):
-        linked.setdefault(finding.data.get("source_commit_id"), []).append(
-            {"id": finding.id, "title": finding.title, "status": finding.status, "kind": finding.kind}
+    linked = Action.data["commit_id"].as_string()
+    rows = [
+        (finding.data.get("source_commit_id"), finding, name, "source")
+        for finding, name in db.execute(named.where(source.in_(ids)).order_by(Finding.created_at))
+    ] + [
+        (commit_id, finding, name, "linked")
+        for finding, name, commit_id in db.execute(
+            named.add_columns(linked)
+            .join(Action, Action.resource_id == Finding.id)
+            .where(Action.resource_type == "finding", Action.data["action"].as_string() == "linked", linked.in_(ids))
+            .order_by(Action.created_at)
         )
-    return linked
+    ]
+    for commit_id, finding, name, relation in rows:
+        found.setdefault(commit_id, []).append({
+            "id": finding.id, "title": finding.title, "status": finding.status, "source": finding.source,
+            "application_id": finding.application_id, "application_name": name, "relation": relation,
+        })
+    return found
 
 
 def commit_json(db, row, findings=None):
@@ -780,9 +803,138 @@ def cve_json(db, cve, link):
 FINDING_DEFAULTS = {"affected_versions": [], "fixed_versions": [], "evidence": [], "target_applicability": "unknown"}
 
 
+# The A11 lifecycle: the states each state can be reached from, and who or what may move a
+# Finding there. Draft is an artifact-completeness state (AC-12), never a lifecycle state.
+FINDING_TRANSITIONS = {"confirmed": ("open",), "dismissed": ("open",), "remediated": ("open", "confirmed")}
+FINDING_CAUSES = {
+    "confirmed": {"operator", "proof", "detection_rule", "advisory"},
+    "dismissed": {"operator"},
+    "remediated": {"operator", "remediation_pr", "version_bump", "baseline_match", "deployed_version"},
+}
+
+
+def transition_finding(db, finding, state, cause):
+    """Moves a Finding to `state`, recording `cause` ({by, ...refs}) and when. Returns False,
+    changing nothing, when the Finding's state cannot move there. Callers decide whether the
+    cause applies: a deployed_version cause is for Own-repository Vulnerability fix Findings only."""
+    if cause.get("by") not in FINDING_CAUSES[state]:
+        raise ValueError(f"{cause.get('by')!r} cannot make a Finding {state}")
+    db.refresh(finding, with_for_update=True)
+    if finding.status not in FINDING_TRANSITIONS[state]:
+        return False
+    cause = {**cause, "at": now().isoformat()}
+    db.add(Action(resource_type="finding", resource_id=finding.id, data={
+        "action": "transition", "from": finding.status, "to": state, "cause": cause}))
+    finding.status, finding.updated_at = state, now()
+    finding.data = {**finding.data, "cause": cause}
+    return True
+
+
+# The Verdicts that open a Finding (A11), on an Own repository or an exposed Upstream one.
+OPENING_VERDICTS = ("Vulnerability fix", "Vulnerability introduced", "Malicious change")
+# Where each source keeps its subject: the commit, the CVE record (the cve_id column), the
+# served-content change or the advisory.
+FINDING_SUBJECTS = {"commit": "source_commit_id", "cve": None, "served_content": "subject_id", "advisory": "subject_id"}
+
+
+def open_finding(db, application, source, subject, title, ref, cause):
+    """Opens the Application's Finding for `subject`, or returns the one it already has, in any
+    state and unchanged: a repeat Analysis never opens a duplicate and never reopens a Dismissed
+    or Remediated Finding. `ref` is the source shown (short SHA, Watched page or advisory id) and
+    `cause` what opened it. Opening queues the Finding's one Alert. Returns (finding, opened)."""
+    key = FINDING_SUBJECTS[source]
+    match = Finding.cve_id == subject if key is None else Finding.data[key].as_string() == subject
+    finding = db.scalar(
+        select(Finding)
+        .where(Finding.application_id == application.id, Finding.source == source, match)
+        .order_by(Finding.created_at.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    if finding:
+        return finding, False
+    cause = {**cause, "at": now().isoformat()}
+    finding = Finding(
+        application_id=application.id, source=source, status="open", title=title[:300],
+        cve_id=subject if source == "cve" else None,
+        data={**({key: subject} if key else {}), "source_ref": ref, "cause": cause},
+    )
+    db.add(finding)
+    db.flush()
+    db.add(Action(resource_type="finding", resource_id=finding.id,
+                  data={"action": "opened", "cause": cause, "source_ref": ref}))
+    notify(db, f"finding:{finding.id}:opened", application=application.asset_name, source=ref,
+           verdict=alert_verdict(cause), link=f"/findings/{finding.id}")
+    return finding, True
+
+
+def link_change(db, application, addresses, change):
+    """Links a change ({commit_id, revision, analysis_id, verdict}) to the Application's Findings,
+    in any state, that its Analysis says it addresses: a commit SHA, full or abbreviated, matches
+    the Finding's source commit, and any other id its CVE or advisory id. A fix addressing a
+    Dismissed or Remediated Finding is linked to it too, so it opens nothing new. It never looks
+    at another Application's Findings, and it leaves status and cause as they are. Returns the
+    linked Findings, which for a change linked before are the ones it was linked to then."""
+    mine = select(Finding).where(Finding.application_id == application.id)
+    earlier = list(db.scalars(mine.where(Finding.id.in_(
+        select(Action.resource_id).where(
+            Action.resource_type == "finding",
+            Action.data["action"].as_string() == "linked",
+            Action.data["commit_id"].as_string() == change["commit_id"],
+        )
+    ))))
+    if earlier or not addresses:
+        return earlier
+    shas = [a for a in addresses if re.fullmatch(r"[0-9a-f]{7,64}", a)]
+    ids = [a for a in addresses if a not in shas]
+    # ponytail: prefix match within one Application; a 7-character prefix shared by two of its
+    # source commits links both.
+    found = [
+        finding
+        for finding in db.scalars(
+            mine.outerjoin(Commit, Commit.id == Finding.data["source_commit_id"].as_string()).where(or_(
+                *(Commit.revision.startswith(sha) for sha in shas),
+                Finding.cve_id.in_(ids),
+                and_(Finding.source == "advisory", Finding.data["subject_id"].as_string().in_(ids)),
+            ))
+        )
+        if finding.data.get("source_commit_id") != change["commit_id"]
+    ]
+    for finding in found:
+        db.add(Action(resource_type="finding", resource_id=finding.id, data={"action": "linked", **change}))
+    return found
+
+
+def analysis_reaches(db, analysis, application_id):
+    """Whether a Finding of the Application may refer to `analysis`: the Analysis is the
+    Application's own, or it analysed a commit of a repository the Application links. A shared
+    Upstream commit is analysed once, under the first Application that uses it."""
+    if analysis.application_id == application_id:
+        return True
+    commit = db.get(Commit, analysis.subject_id) if analysis.kind == "commit_analysis" else None
+    return commit is not None and commit.repository_id in set(db.scalars(linked_repository_ids(application_id)))
+
+
 def finding_data(row):
-    data = {key: value for key, value in row.data.items() if key != "_artifact_state"}
+    # Keys starting with an underscore are application state, such as the artifact summary.
+    data = {key: value for key, value in row.data.items() if not key.startswith("_")}
     return {**FINDING_DEFAULTS, **{key: value for key, value in data.items() if value is not None}}
+
+
+def finding_fields(row):
+    """The identity and lifecycle fields that the full and summary views share."""
+    return {
+        "id": row.id,
+        "application_id": row.application_id,
+        "source": row.source,
+        "source_ref": row.data.get("source_ref"),
+        "cve_id": row.cve_id,
+        "title": row.title,
+        "status": row.status,
+        "cause": row.data.get("cause"),
+        # Phase 7's Deployed version check fills this in; it is shown apart from the lifecycle.
+        "deployed_version": "unknown",
+    }
 
 
 def set_finding_artifacts(db, row, revision, files):
@@ -826,12 +978,7 @@ def finding_summaries(db, rows, root):
     )
     return [
         {
-            "id": row.id,
-            "application_id": row.application_id,
-            "kind": row.kind,
-            "cve_id": row.cve_id,
-            "title": row.title,
-            "status": row.status,
+            **finding_fields(row),
             "affected_versions": row.data.get("affected_versions", []),
             "fixed_versions": row.data.get("fixed_versions", []),
             "target_applicability": row.data.get("target_applicability", "unknown"),
@@ -863,12 +1010,7 @@ def finding_json(db, row, root):
         )
     )
     return {
-        "id": row.id,
-        "application_id": row.application_id,
-        "kind": row.kind,
-        "cve_id": row.cve_id,
-        "title": row.title,
-        "status": row.status,
+        **finding_fields(row),
         **finding_data(row),
         "artifact_state": finding_artifact_state(db, row, root),
         "artifact_revision": row.artifact_revision,
@@ -963,7 +1105,7 @@ def job_subject(db, row, application):
         link = details.get("link")
         return {
             "type": "notification",
-            "label": (details.get("title") or "Removed notification").split("\n")[0],
+            "label": (details.get("verdict") or details.get("title") or "Removed notification").split("\n")[0],
             "ref": None,
             "link": link if isinstance(link, str) and link.startswith("/") else None,
         }
@@ -1027,22 +1169,38 @@ def job_json(db, row, with_events=True):
     return result
 
 
-def notify(db, event_key, title, link, detail):
+def alert_verdict(cause):
+    """What an opening Alert says about the Finding's cause: the Verdict and confidence, else
+    'Advisory' (an Advisory check match or a carried-over CVE analysis)."""
+    if cause.get("by") == "verdict":
+        return f"{cause['verdict']} · {cause['confidence']} confidence"
+    return "Advisory"
+
+
+def notify(db, event_key, *, verdict, link, application=None, account=None, source=None):
+    """Queues an Alert (A12), once per event_key. It stores only the fields the fixed template
+    shows, all application-generated: never commit messages, author names, agent text or Proofs."""
     if db.scalar(select(Notification).where(Notification.event_key == event_key)):
         return
-    row = Notification(
-        event_key=event_key,
-        data={"title": title[:240], "link": link, "detail": detail[:1000]},
-        status="pending",
-    )
-    db.add(row)
-    db.flush()
-    enqueue(
-        db,
-        "notification",
-        inputs={"notification_id": row.id},
-        idempotency_key=f"notification:{event_key}",
-    )
+    # Two workers reaching the same cap at once both pass the check above; the one that loses
+    # the unique event_key keeps its own transaction (a Triage result) and sends nothing.
+    try:
+        with db.begin_nested():
+            row = Notification(
+                event_key=event_key,
+                data={"application": application, "account": account, "source": source, "verdict": verdict, "link": link},
+                status="pending",
+            )
+            db.add(row)
+            db.flush()
+            enqueue(
+                db,
+                "notification",
+                inputs={"notification_id": row.id},
+                idempotency_key=f"notification:{event_key}",
+            )
+    except IntegrityError:
+        pass
 
 
 def schedule(db):

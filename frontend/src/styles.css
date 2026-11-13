@@ -796,6 +796,9 @@ main > .callout {
   font-weight: 600;
 }
 .callout-action {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   flex-shrink: 0;
   align-self: center;
 }

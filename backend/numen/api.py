@@ -71,6 +71,7 @@ from .schemas import (
     RepositoryPatch,
     ReviewInput,
     SessionInput,
+    TransitionInput,
     http_url,
 )
 from .security import (
@@ -612,14 +613,6 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     def record_review(db, row, decision):
         row.review_decision = decision
         action(db, "commit", row.id, {"action": "review", "decision": decision})
-        if decision == "candidate":
-            domain.notify(
-                db,
-                f"commit:{row.id}:candidate",
-                "Security candidate: " + row.data.get("message", "")[:120],
-                f"/commits/{row.id}",
-                "Operator nominated this change for security review",
-            )
 
     @router.post("/commits/review")
     def review_batch(body: BatchReviewInput, db=database_dependency):
@@ -966,7 +959,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             commit
             and commit.repository_id
             not in set(db.scalars(domain.linked_repository_ids(body.application_id)))
-        ) or (analysis and analysis.application_id != body.application_id):
+        ) or (analysis and not domain.analysis_reaches(db, analysis, body.application_id)):
             raise DomainError(
                 "invalid_reference", "Finding evidence must belong to the same Application", 422
             )
@@ -975,9 +968,15 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     def create_finding(body: FindingInput, db=database_dependency):
         validate_finding_refs(db, body)
         data = body.model_dump()
+        commit = db.get(Commit, body.source_commit_id) if body.source_commit_id else None
         row = Finding(
-            **{k: data.pop(k) for k in ("application_id", "kind", "cve_id", "title", "status")},
-            data=data,
+            **{k: data.pop(k) for k in ("application_id", "source", "cve_id", "title")},
+            status="open",
+            data={
+                **data,
+                "cause": {"by": "operator", "at": now().isoformat()},
+                "source_ref": commit.revision[:7] if commit else body.cve_id,
+            },
         )
         db.add(row)
         db.flush()
@@ -985,7 +984,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             db,
             "finding",
             row.id,
-            {"action": "created", "kind": row.kind, "cve_id": row.cve_id, "status": row.status},
+            {"action": "created", "source": row.source, "cve_id": row.cve_id, "status": row.status},
         )
         return domain.finding_json(db, row, config.artifact_root)
 
@@ -997,22 +996,28 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     def patch_finding(ident: str, body: dict, db=database_dependency):
         row = domain.get(db, Finding, ident)
         db.refresh(row, with_for_update=True)
-        old = {
+        current = {
             "application_id": row.application_id,
-            "kind": row.kind,
+            "source": row.source,
             "cve_id": row.cve_id,
             "title": row.title,
-            "status": row.status,
             **domain.finding_data(row),
         }
+        # Only editable fields: the lifecycle, its cause and private keys stay as they are.
+        old = {k: v for k, v in current.items() if k in FindingInput.model_fields}
         data = FindingInput.model_validate({**old, **body})
         validate_finding_refs(db, data)
         if data.application_id != row.application_id:
             raise DomainError("immutable_application", "A finding cannot move to another Application", 422)
-        values = data.model_dump()
-        for field in ("kind", "cve_id", "title", "status"):
-            setattr(row, field, values.pop(field))
-        values.pop("application_id")
+        if data.source != row.source:
+            raise DomainError("immutable_source", "A Finding's source cannot change", 422)
+        values = data.model_dump(exclude={"application_id", "source"})
+        row.cve_id, row.title = values.pop("cve_id"), values.pop("title")
+        if row.source == "cve":
+            values["source_ref"] = row.cve_id
+        elif row.source == "commit":  # As create_finding sets it.
+            commit = db.get(Commit, data.source_commit_id) if data.source_commit_id else None
+            values["source_ref"] = commit.revision[:7] if commit else row.cve_id
         row.data, row.updated_at = {**row.data, **values}, now()
         action(
             db,
@@ -1020,10 +1025,18 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             row.id,
             {
                 "action": "updated",
-                "previous": {"kind": old["kind"], "cve_id": old["cve_id"], "status": old["status"]},
+                "previous": {"source": old["source"], "cve_id": old["cve_id"]},
                 "changes": body,
             },
         )
+        return domain.finding_json(db, row, config.artifact_root)
+
+    @router.post("/findings/{ident}/transitions")
+    def finding_transition(ident: str, body: TransitionInput, db=database_dependency):
+        """The Operator's Confirm, Dismiss and Mark remediated, each with a reason (A11)."""
+        row = domain.get(db, Finding, ident)
+        if not domain.transition_finding(db, row, body.state, {"by": "operator", "reason": body.reason}):
+            raise DomainError("invalid_transition", f"A {row.status} Finding cannot be {body.state}", 409)
         return domain.finding_json(db, row, config.artifact_root)
 
     def finding_jobs(db, ids):
@@ -1048,7 +1061,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         action(db, "finding", row.id, {
             "action": "deleted",
             "title": row.title,
-            "kind": row.kind,
+            "source": row.source,
             "cve_id": row.cve_id,
             "status": row.status,
             "application_id": row.application_id,
@@ -1546,11 +1559,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             raise DomainError("webhook_unconfigured", "Configure and enable the webhook first", 422)
         note = Notification(
             event_key="test:" + secrets.token_hex(16),
-            data={
-                "title": "Numen webhook test",
-                "detail": "Delivery test from the authenticated operator",
-                "link": "/",
-            },
+            data={"verdict": "Webhook test", "link": "/"},
             status="pending",
         )
         db.add(note)

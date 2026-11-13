@@ -138,7 +138,7 @@ def test_an_oversized_context_keeps_its_entry_document_or_is_skipped(system, mon
     _, queued, _ = analyse(system, application_id, result)
     monkeypatch.setattr(workflows, "CONTEXT_BUDGET", 8)
     broker = FixtureBroker(result, bundle())
-    run_once(config, app.state.factory, broker)
+    run_once(config, app.state.factory, broker, exclude=("notification",))  # The first Finding's Alert stays queued.
     assert not any(path.startswith("context/") for path in broker.calls[0]["files"])
     assert events(app, queued, "audit_context_skipped")
 

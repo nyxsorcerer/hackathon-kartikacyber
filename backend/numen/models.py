@@ -246,7 +246,7 @@ class Finding(Base):
     __tablename__ = "findings"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
-    kind: Mapped[str] = mapped_column(String)
+    source: Mapped[str] = mapped_column(String)
     cve_id: Mapped[str | None] = mapped_column(ForeignKey("cves.id"), nullable=True)
     title: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="open")

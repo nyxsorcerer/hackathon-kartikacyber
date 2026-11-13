@@ -281,7 +281,7 @@ const decisionLabels: Record<string, string> = {
 /** Labels for the controls that set each decision. */
 const decisionActions: Record<string, string> = {
   candidate: "Mark for review",
-  confirmed: "Confirm finding",
+  confirmed: "Confirm revision",
   pending: "Leave pending",
   dismissed: "Dismiss",
 };
@@ -309,6 +309,15 @@ function createFindingHref(commit: Commit) {
     query.set("source_analysis_id", commit.analyses[0].id);
   return `/findings/new?${query}`;
 }
+/** A Finding the revision opened or was linked to, in the Application it belongs to. */
+function FindingLink({ finding }: { finding: Commit["findings"][number] }) {
+  return (
+    <Link to={`/findings/${finding.id}`} title={finding.title}>
+      {finding.relation === "linked" ? "Linked: " : ""}
+      {humanize(finding.status)} finding · {finding.application_name}
+    </Link>
+  );
+}
 /** The revision's findings, or what its decision still needs. */
 function FindingState({ commit }: { commit: Commit }) {
   return (
@@ -320,9 +329,7 @@ function FindingState({ commit }: { commit: Commit }) {
       )}
       {commit.findings.map((finding) => (
         <div className="table-subtitle" key={finding.id}>
-          <Link to={`/findings/${finding.id}`}>
-            Finding · {humanize(finding.status)}
-          </Link>
+          <FindingLink finding={finding} />
         </div>
       ))}
       {commit.review_decision === "confirmed" && !commit.findings.length && (
@@ -984,7 +991,7 @@ export function CommitList({
                 : filters.decision === "candidate"
                   ? "Nothing marked for review"
                   : filters.decision === "confirmed"
-                    ? "No confirmed findings"
+                    ? "No confirmed revisions"
                     : "No revisions match these filters"
             }
             description={
@@ -1500,6 +1507,7 @@ function CommitDetailBody({
   );
   const reason = triageField(commit, "reason");
   const confidence = triageConfidence(commit);
+  const opened = commit.findings.find((f) => f.relation !== "linked");
   return (
     <>
       <HistoryPager commit={commit} />
@@ -1574,13 +1582,7 @@ function CommitDetailBody({
               commit.findings.length ? (
                 <span className="finding-links">
                   {commit.findings.map((finding) => (
-                    <Link
-                      key={finding.id}
-                      to={`/findings/${finding.id}`}
-                      title={finding.title}
-                    >
-                      {humanize(finding.status)} finding
-                    </Link>
+                    <FindingLink key={finding.id} finding={finding} />
                   ))}
                 </span>
               ) : (
@@ -1589,12 +1591,18 @@ function CommitDetailBody({
             ],
           ]}
         />
-        {commit.review_decision === "candidate" &&
-          commit.findings.length > 0 && (
-            <Callout
-              tone="good"
-              title="Analysis produced a finding"
-              action={
+        {commit.review_decision === "candidate" && opened && (
+          <Callout
+            tone="good"
+            title="Analysis opened a Finding"
+            action={
+              <>
+                <Link
+                  className="secondary button"
+                  to={`/findings/${opened.id}`}
+                >
+                  Review finding
+                </Link>
                 <ActionButton
                   className="primary"
                   onAction={async () => {
@@ -1605,14 +1613,15 @@ function CommitDetailBody({
                     refresh();
                   }}
                 >
-                  Confirm finding
+                  Confirm revision
                 </ActionButton>
-              }
-            >
-              Review the report and artifacts, then confirm the finding or
-              dismiss the revision.
-            </Callout>
-          )}
+              </>
+            }
+          >
+            Review the Finding, its report and artifacts, then confirm or
+            dismiss the revision.
+          </Callout>
+        )}
         {commit.review_decision === "confirmed" && !commit.findings.length && (
           <Callout
             tone="warm"

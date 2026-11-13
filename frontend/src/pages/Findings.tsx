@@ -41,6 +41,7 @@ import {
   Empty,
   ErrorNote,
   Evidence,
+  humanize,
   JobLink,
   Modal,
   notify,
@@ -59,21 +60,63 @@ function labState(status: unknown) {
         tone: status === "failed" ? "danger" : "warm",
       };
 }
-function findingIdentifier(
-  finding: Pick<Finding, "id" | "cve_id" | "source_commit_id">,
-) {
-  return (
-    finding.cve_id ||
-    `${finding.source_commit_id ? "Commit finding" : "0day"} · ${finding.id.slice(0, 8)}`
-  );
+const sourceLabels: Record<Finding["source"], string> = {
+  commit: "Commit",
+  served_content: "Served content",
+  advisory: "Advisory",
+  cve: "CVE",
+};
+/** What opened the Finding: 'Commit abc1234', 'CVE-…', 'Advisory GHSA-…' or 'Watched page /path'. */
+function sourceLabel(finding: Pick<Finding, "source" | "source_ref">) {
+  const ref = finding.source_ref;
+  if (!ref) return sourceLabels[finding.source];
+  if (finding.source === "cve") return ref;
+  return `${finding.source === "served_content" ? "Watched page" : sourceLabels[finding.source]} ${ref}`;
 }
+const causeLabels: Record<string, string> = {
+  proof: "Reproduced Proof",
+  detection_rule: "Validated Detection rule",
+  advisory: "Advisory check",
+  cve_analysis: "CVE analysis",
+  remediation_pr: "Merged Remediation PR",
+  version_bump: "Version bump",
+  baseline_match: "Served content matches the Baseline",
+  deployed_version: "Deployed version serves the fix",
+  numen: "Carried over from Numen",
+};
+/** A string field of a stored record, such as a cause or a history event. */
+function text(record: unknown, key: string) {
+  const value: unknown =
+    record && typeof record === "object" ? Reflect.get(record, key) : undefined;
+  return typeof value === "string" ? value : undefined;
+}
+/** Who or what set a Finding's state (A11). */
+function causeLabel(cause: unknown) {
+  const field = (key: string) => text(cause, key);
+  const by = field("by") || "";
+  if (by === "verdict")
+    return `${field("verdict")} Verdict, ${field("confidence") || "unknown"} confidence`;
+  if (by === "operator")
+    return field("reason") ? `Operator: ${field("reason")}` : "Operator";
+  return causeLabels[by] || (by ? humanize(by) : "Unknown");
+}
+/** The Operator's lifecycle actions and the states each can leave (A11). */
+const transitions = [
+  { state: "confirmed", label: "Confirm", from: ["open"] },
+  { state: "dismissed", label: "Dismiss", from: ["open"] },
+  {
+    state: "remediated",
+    label: "Mark remediated",
+    from: ["open", "confirmed"],
+  },
+];
 export function Findings() {
   return (
     <>
       <PageHeading
-        eyebrow="Confirmed evidence"
+        eyebrow="Finding register"
         title="Findings"
-        description="Reproducible reports, operator decisions, and the deployed asset’s exposure."
+        description="Open, Confirmed, Dismissed and Remediated Findings, their causes, and the Deployed version."
         actions={
           <Link className="primary button" to="/findings/new">
             <Plus size={16} aria-hidden="true" />
@@ -206,7 +249,7 @@ export function FindingsList({ application }: { application?: Application }) {
                     </label>
                   </th>
                   <th scope="col">Finding</th>
-                  <th scope="col">Status</th>
+                  <th scope="col">State</th>
                   <th scope="col">Upstream fixed in</th>
                   <th scope="col">Target exposure</th>
                   <th scope="col">Artifacts</th>
@@ -245,11 +288,14 @@ export function FindingsList({ application }: { application?: Application }) {
                           {finding.title}
                         </Link>
                         <div className="table-subtitle mono">
-                          {findingIdentifier(finding)}
+                          {sourceLabel(finding)}
                         </div>
                       </td>
                       <td>
                         <Badge>{finding.status}</Badge>
+                        <div className="table-subtitle">
+                          {causeLabel(finding.cause)}
+                        </div>
                       </td>
                       <td>
                         {versionLabels(finding.fixed_versions).join(", ") || (
@@ -326,8 +372,8 @@ function FindingEditor({ finding }: { finding?: Finding }) {
   const [applicationId, setApplicationId] = useState(
     finding?.application_id || params.get("application_id") || "",
   );
-  const [kind, setKind] = useState(
-    finding?.kind || (params.has("cve_id") ? "cve" : "0day"),
+  const [source, setSource] = useState<Finding["source"]>(
+    finding?.source || (params.has("cve_id") ? "cve" : "commit"),
   );
   const [cveId, setCveId] = useState(
     finding?.cve_id || params.get("cve_id") || "",
@@ -335,7 +381,6 @@ function FindingEditor({ finding }: { finding?: Finding }) {
   const [title, setTitle] = useState(
     finding?.title || params.get("title") || "",
   );
-  const [status, setStatus] = useState(finding?.status || "open");
   const initialAffected = versionLabels(finding?.affected_versions).join("\n");
   const initialFixed = versionLabels(finding?.fixed_versions).join("\n");
   const [affected, setAffected] = useState(initialAffected);
@@ -369,10 +414,9 @@ function FindingEditor({ finding }: { finding?: Finding }) {
               findingSchema,
               {
                 application_id: applicationId,
-                kind,
+                source,
                 cve_id: cveId || null,
                 title,
-                status,
                 affected_versions:
                   finding && affected === initialAffected
                     ? finding.affected_versions
@@ -425,22 +469,31 @@ function FindingEditor({ finding }: { finding?: Finding }) {
               )}
             </label>
             <label>
-              Finding type
+              Source
               <select
-                value={kind}
+                value={source}
+                disabled={!!finding}
                 onChange={(e) => {
-                  if (e.target.value === "cve" || e.target.value === "0day")
-                    setKind(e.target.value);
+                  if (e.target.value === "cve" || e.target.value === "commit")
+                    setSource(e.target.value);
                 }}
               >
-                <option value="0day">0day — local identifier</option>
-                <option value="cve">CVE</option>
+                {(finding
+                  ? [finding.source]
+                  : (["commit", "cve"] as Finding["source"][])
+                ).map((value) => (
+                  <option value={value} key={value}>
+                    {sourceLabels[value]}
+                  </option>
+                ))}
               </select>
             </label>
             <label>
-              {kind === "cve" ? "CVE identifier" : "CVE identifier (optional)"}
+              {source === "cve"
+                ? "CVE identifier"
+                : "CVE identifier (optional)"}
               <input
-                required={kind === "cve"}
+                required={source === "cve"}
                 value={cveId}
                 pattern="CVE-[0-9]{4}-[0-9]{4,}"
                 onChange={(e) => setCveId(e.target.value)}
@@ -459,19 +512,6 @@ function FindingEditor({ finding }: { finding?: Finding }) {
                 onChange={(e) => setTitle(e.target.value)}
                 placeholder="Describe the affected behavior"
               />
-            </label>
-            <label>
-              Operator status
-              <select
-                value={status}
-                onChange={(e) => {
-                  if (e.target.value === "open" || e.target.value === "fixed")
-                    setStatus(e.target.value);
-                }}
-              >
-                <option value="open">Open</option>
-                <option value="fixed">Fixed — operator confirmed</option>
-              </select>
             </label>
             <label>
               Remote target exposure
@@ -566,7 +606,7 @@ function FindingBody({
     <>
       <PageHeading
         back={{ to: "/findings", label: "All findings" }}
-        eyebrow={findingIdentifier(finding)}
+        eyebrow={sourceLabel(finding)}
         title={finding.title}
         description={
           application.data && (
@@ -624,6 +664,7 @@ function FindingBody({
         }
         meta={
           <>
+            <Badge>{sourceLabels[finding.source]}</Badge>
             <Badge>{finding.status}</Badge>
             <span>
               Exposure <Badge>{finding.target_applicability}</Badge>
@@ -650,6 +691,7 @@ function FindingBody({
           is available once the bundle is complete.
         </Callout>
       )}
+      <Lifecycle finding={finding} refresh={refresh} />
       <div className="detail-columns even">
         <Panel
           title="Upstream remediation"
@@ -710,7 +752,7 @@ function FindingBody({
                   <span className="muted">Not observed</span>
                 ),
               ],
-              ["Operator status", <Badge>{finding.status}</Badge>],
+              ["Deployed version", <Badge>{finding.deployed_version}</Badge>],
               [
                 "Vulnerable lab version",
                 finding.artifact_state.vulnerable_version || (
@@ -720,9 +762,7 @@ function FindingBody({
             ]}
           />
           <p className="hint">
-            An upstream fix does not confirm the remote target is remediated.
-            New observations update exposure evidence and never change your
-            status.
+            A fix in the repository does not mean the Asset serves it.
           </p>
         </Panel>
       </div>
@@ -736,7 +776,7 @@ function FindingBody({
                 <CopyButton value={finding.id} label="Copy local identity" />
               </span>,
             ],
-            ["Type", finding.kind === "cve" ? "CVE" : "0day"],
+            ["Source", sourceLabels[finding.source]],
             ["Created", <Time value={finding.created_at} absolute />],
             ["Updated", <Time value={finding.updated_at} absolute />],
           ]}
@@ -764,12 +804,6 @@ function FindingBody({
             </p>
           )}
         </div>
-        {finding.events?.length ? (
-          <Evidence
-            value={finding.events}
-            label="Operator decisions & linkage history"
-          />
-        ) : null}
         {finding.artifact_state.limitations.length > 0 && (
           <Evidence
             value={finding.artifact_state.limitations}
@@ -777,6 +811,22 @@ function FindingBody({
           />
         )}
       </Panel>
+      {finding.events?.length ? (
+        <Panel
+          title="History"
+          description="When the Finding opened, the changes linked to it and each change of state."
+        >
+          <ol className="timeline">
+            {finding.events.map((event, index) => (
+              <HistoryEvent
+                key={text(event, "id") || index}
+                event={event}
+                finding={finding}
+              />
+            ))}
+          </ol>
+        </Panel>
+      ) : null}
       <Panel
         title="Reproducible artifacts"
         description="Report, Python PoC, and the pinned vulnerable application."
@@ -877,7 +927,7 @@ function FindingBody({
           operation="finding_artifacts"
           path={`/findings/${finding.id}/artifact-generations`}
           initialProfile={application.data?.config.profiles.finding_artifacts}
-          context={`${finding.title} · ${finding.cve_id || "0day"} · affected versions ${finding.affected_versions.join(", ") || "unknown"}`}
+          context={`${finding.title} · ${sourceLabel(finding)} · affected versions ${finding.affected_versions.join(", ") || "unknown"}`}
           onClose={() => setGenerate(false)}
           onSubmitted={refresh}
         />
@@ -890,6 +940,126 @@ function FindingBody({
         />
       )}
     </>
+  );
+}
+/** The Finding's lifecycle state, its cause and the Operator's actions on it (A11). */
+function Lifecycle({
+  finding,
+  refresh,
+}: {
+  finding: Finding;
+  refresh: () => void;
+}) {
+  const [reason, setReason] = useState("");
+  const at = text(finding.cause, "at");
+  return (
+    <Panel
+      title="Lifecycle"
+      description="Every change of state records its cause and when it happened."
+      padded
+    >
+      <DetailGrid
+        items={[
+          ["State", <Badge>{finding.status}</Badge>],
+          [
+            "Cause",
+            <>
+              {causeLabel(finding.cause)}
+              {at && (
+                <span className="muted">
+                  {" "}
+                  · <Time value={at} absolute />
+                </span>
+              )}
+            </>,
+          ],
+        ]}
+      />
+      <label>
+        Reason
+        <textarea
+          required
+          maxLength={2000}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Why the Finding changes state"
+        />
+      </label>
+      <div className="form-actions">
+        {transitions.map(({ state, label, from }) => (
+          <ActionButton
+            key={state}
+            className="secondary"
+            disabled={!from.includes(finding.status) || !reason.trim()}
+            onAction={async () => {
+              await mutate(
+                `/findings/${finding.id}/transitions`,
+                findingSchema,
+                {
+                  state,
+                  reason,
+                },
+              );
+              notify(`Finding ${state}.`);
+              setReason("");
+              refresh();
+            }}
+          >
+            {label}
+          </ActionButton>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+/** One entry of a Finding's history: opened, linked, a transition, or a Numen record. */
+function HistoryEvent({
+  event,
+  finding,
+}: {
+  event: Record<string, unknown>;
+  finding: Finding;
+}) {
+  const action = text(event, "action") || "event";
+  const commitId = text(event, "commit_id");
+  const revision = (text(event, "revision") || "").slice(0, 7);
+  const [title, detail] =
+    action === "opened"
+      ? [
+          "Opened",
+          `${sourceLabel({ source: finding.source, source_ref: text(event, "source_ref") })} · ${causeLabel(event.cause)}`,
+        ]
+      : action === "linked"
+        ? [
+            "Linked change",
+            <>
+              {commitId ? (
+                <Link className="mono" to={`/commits/${commitId}`}>
+                  {revision}
+                </Link>
+              ) : (
+                <span className="mono">{revision}</span>
+              )}
+              {` · ${text(event, "verdict") || "No Verdict"}`}
+            </>,
+          ]
+        : action === "transition"
+          ? [
+              `${humanize(text(event, "from") || "")} → ${humanize(text(event, "to") || "")}`,
+              causeLabel(event.cause),
+            ]
+          : [humanize(action), undefined];
+  return (
+    <li className="timeline-item">
+      <span className="timeline-marker neutral" aria-hidden="true" />
+      <div className="timeline-body">
+        <div className="timeline-title">
+          <strong>{title}</strong>
+          <Time value={text(event, "created_at")} absolute />
+        </div>
+        {detail && <small>{detail}</small>}
+      </div>
+    </li>
   );
 }
 function ArtifactUpload({

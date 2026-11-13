@@ -94,7 +94,10 @@ def test_supported_commit_finding_publishes_a_linked_immutable_bundle(system, ve
     finding = client.get(f"/api/findings/{job['result']['finding_id']}").json()
     assert finding["source_commit_id"] == ident
     assert finding["source_analysis_id"] == job["result"]["analysis_id"]
-    assert finding["title"] == assessment()["title"] and finding["kind"] == "0day"
+    assert finding["title"] == assessment()["title"] and finding["source"] == "commit"
+    assert finding["source_ref"] == client.get(f"/api/commits/{ident}").json()["revision"][:7]
+    assert {k: v for k, v in finding["cause"].items() if k != "at"} == {
+        "by": "verdict", "verdict": verdict, "confidence": "high", "analysis_id": job["result"]["analysis_id"], "commit_id": ident}
     assert finding["artifact_state"]["status"] == "complete" and finding["lab_runs"] == []
     # A commit finding records no version ranges, but still presents every finding field.
     assert finding["affected_versions"] == [] and finding["fixed_versions"] == []
@@ -102,12 +105,13 @@ def test_supported_commit_finding_publishes_a_linked_immutable_bundle(system, ve
     original = client.get(f"/api/analyses/{job['result']['analysis_id']}/download")
     with zipfile.ZipFile(io.BytesIO(original.content)) as archive:
         assert {"report.md", "poc.py", "vulnerable-app/Dockerfile", "manifest.json"} <= set(archive.namelist())
-    client.patch(f"/api/findings/{finding['id']}", json={"title": "Operator-reviewed title", "status": "fixed"})
+    client.patch(f"/api/findings/{finding['id']}", json={"title": "Operator-reviewed title"})
+    client.post(f"/api/findings/{finding['id']}/transitions", json={"state": "remediated", "reason": "Patched"})
     again = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    run_once(config, app.state.factory, FixtureBroker(assessment(verdict, ref=ref), {**pinned_bundle(ref), "report.md": b"# Updated review"}))
+    run_once(config, app.state.factory, FixtureBroker(assessment(verdict, ref=ref), {**pinned_bundle(ref), "report.md": b"# Updated review"}), exclude=("notification",))
     assert client.get(f"/api/jobs/{again}").json()["result"]["finding_id"] == finding["id"]
     current = client.get(f"/api/findings/{finding['id']}").json()
-    assert current["title"] == "Operator-reviewed title" and current["status"] == "fixed"
+    assert current["title"] == "Operator-reviewed title" and current["status"] == "remediated"
     assert len(client.get("/api/findings").json()["items"]) == 1
     with zipfile.ZipFile(io.BytesIO(client.get(f"/api/analyses/{job['result']['analysis_id']}/download").content)) as archive:
         assert archive.read("report.md") == pinned_bundle()["report.md"]
@@ -132,15 +136,20 @@ def test_nonfinding_commit_analysis_retains_report_without_creating_findings(sys
     assert client.get("/api/findings").json()["items"] == []
 
 
-def test_commit_finding_cannot_publish_an_unrelated_vulnerable_revision(system):
+def test_an_unrelated_vulnerable_revision_opens_the_finding_without_publishing_its_bundle(system):
     app, client, config = system
     _, ident, _ = prepared(system)
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker(assessment(ref="e" * 40), pinned_bundle("e" * 40)))
     job = client.get(f"/api/jobs/{queued}").json()
-    assert job["status"] == "failed" and job["error"]["code"] == "invalid_finding_revision"
-    assert client.get("/api/findings").json()["items"] == []
-    assert client.get(f"/api/commits/{ident}").json()["analyses"]
+    assert job["status"] == "succeeded", job
+    assert job["result"]["bundle_error"]["code"] == "invalid_finding_revision"
+    (finding,) = client.get("/api/findings").json()["items"]
+    assert (finding["id"], finding["status"]) == (job["result"]["finding_id"], "open")
+    assert finding["artifact_revision"] is None and finding["artifact_state"]["status"] == "draft"
+    (analysis,) = client.get(f"/api/commits/{ident}").json()["analyses"]
+    assert analysis["result"]["bundle_error"]["code"] == "invalid_finding_revision"
+    assert [j["kind"] for j in client.get("/api/jobs").json()["items"]].count("notification") == 1
 
 
 def test_finding_regeneration_uses_the_validated_vulnerable_parent(system, monkeypatch):
@@ -157,7 +166,7 @@ def test_finding_regeneration_uses_the_validated_vulnerable_parent(system, monke
     monkeypatch.setattr(Sources, "snapshot_github", snapshot)
     generation = client.post(f"/api/findings/{finding_id}/artifact-generations", json={}).json()["job_id"]
     broker = FixtureBroker({"summary": "Regenerated from parent"}, pinned_bundle())
-    run_once(config, app.state.factory, broker)
+    run_once(config, app.state.factory, broker, exclude=("notification",))
     assert client.get(f"/api/jobs/{generation}").json()["status"] == "succeeded"
     assert requested == ["f" * 40]
     assert broker.calls[0]["files"]["source/main.py"] == b"# Real pinned before-fix source fixture"
@@ -226,14 +235,16 @@ def test_batch_review_with_an_unknown_commit_changes_nothing(system):
     assert client.post("/api/commits/review", json={"ids": [], "decision": "dismissed"}).status_code == 422
 
 
-def test_batch_candidates_each_record_a_notification(system):
+def test_marking_candidates_sends_no_alert(system):
     app, client, _ = system
     monitored, first, _ = prepared(system)
-    second = source_snapshot(app, monitored["id"], "b" * 40)
-    assert client.post("/api/commits/review", json={"ids": [first, second], "decision": "candidate"}).status_code == 200
+    second, third = (source_snapshot(app, monitored["id"], r * 40) for r in "bc")
+    assert client.post(f"/api/commits/{first}/review", json={"decision": "candidate"}).status_code == 200
+    assert client.post("/api/commits/review", json={"ids": [second, third], "decision": "candidate"}).status_code == 200
     with app.state.factory.begin() as db:
-        keys = set(db.scalars(select(Notification.event_key)))
-    assert {f"commit:{first}:candidate", f"commit:{second}:candidate"} <= keys
+        assert db.scalars(select(Notification)).all() == []
+        decisions = {a.resource_id: a.data["decision"] for a in db.scalars(select(Action).where(Action.resource_type == "commit"))}
+    assert decisions == {ident: "candidate" for ident in (first, second, third)}
 
 
 def test_late_batch_review_is_not_overwritten_by_triage(system):
@@ -273,17 +284,18 @@ def test_jobs_name_their_subject_and_application_without_exposing_raw_input(syst
     }
 
 
-def test_confirmed_commits_link_their_findings_without_a_candidate_notification(system):
+def test_confirmed_commits_link_their_findings_without_an_alert(system):
     app, client, _ = system
     monitored, ident, _ = prepared(system)
     second = source_snapshot(app, monitored["id"], "b" * 40)
     assert client.get(f"/api/commits/{ident}").json()["findings"] == []
     finding = client.post("/api/findings", json={
-        "application_id": monitored["id"], "kind": "0day", "title": "Path traversal in template selection",
+        "application_id": monitored["id"], "source": "commit", "title": "Path traversal in template selection",
         "source_commit_id": ident,
     })
     assert finding.status_code in (200, 201), finding.text
-    linked = {"id": finding.json()["id"], "title": "Path traversal in template selection", "status": "open", "kind": "0day"}
+    linked = {"id": finding.json()["id"], "title": "Path traversal in template selection", "status": "open",
+              "source": "commit", "application_id": monitored["id"], "application_name": "Site", "relation": "source"}
     assert client.get(f"/api/commits/{ident}").json()["findings"] == [linked]
     listed = {c["id"]: c for c in client.get(f"/api/applications/{monitored['id']}/commits").json()["items"]}
     assert listed[ident]["findings"] == [linked] and listed[second]["findings"] == []
@@ -293,7 +305,7 @@ def test_confirmed_commits_link_their_findings_without_a_candidate_notification(
     with app.state.factory.begin() as db:
         keys = set(db.scalars(select(Notification.event_key)))
         decisions = [a.data["decision"] for a in db.scalars(select(Action).where(Action.resource_type == "commit"))]
-    assert not any(key.endswith(":candidate") for key in keys)
+    assert keys == set()  # Neither the hand-made Finding nor the review decisions send an Alert.
     assert decisions == ["confirmed", "confirmed"]
     # Awaiting review counts only candidates, so confirmed work leaves the badge.
     assert client.get("/api/dashboard").json()["security_reviews"] == 0
@@ -480,7 +492,7 @@ def test_findings_are_deleted_together_and_any_blocked_one_deletes_none(system):
     run_once(config, app.state.factory, FixtureBroker(assessment(), pinned_bundle()))
     analyzed = client.get(f"/api/jobs/{queued}").json()["result"]["finding_id"]
     manual = [
-        client.post("/api/findings", json={"application_id": monitored["id"], "kind": "0day", "title": f"Duplicate {n}"}).json()["id"]
+        client.post("/api/findings", json={"application_id": monitored["id"], "source": "commit", "title": f"Duplicate {n}"}).json()["id"]
         for n in range(2)
     ]
     ids = [analyzed, *manual]

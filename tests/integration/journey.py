@@ -187,16 +187,21 @@ def main():
     candidate = next(row for row in commits if row['revision'] == 'b' * 40)
     client.request('POST', f'/api/commits/{candidate["id"]}/review', {'decision': 'candidate'})
     client.request('GET', f'/api/commits/{candidate["id"]}')
+    client.request('POST', '/api/settings/webhook/test', expect=(202,))
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
-        if fixture.request('GET', '/admin/state')['notifications']:
+        if notifications := fixture.request('GET', '/admin/state')['notifications']:
             break
         time.sleep(0.5)
     else:
-        raise AssertionError('Candidate notification was not delivered to fixture webhook')
+        raise AssertionError('Webhook test was not delivered to fixture webhook')
+    # The candidate mark sends no Alert, so the test delivery is the only one.
+    (delivery,) = notifications
+    assert delivery['content'].startswith('Asset Monitor: Webhook test')
+    assert delivery['allowed_mentions'] == {'parse': []} and 'embeds' not in delivery
     assert not [job for job in items(client.request('GET', '/api/jobs')) if job.get('application_id') == github['id'] and job['kind'] == 'commit_analysis']
     client.request('POST', f'/api/commits/{candidate["id"]}/analyses', {}, expect=(409, 422))
-    print('PASS captured Discord delivery and explicit analysis/profile prerequisite')
+    print('PASS fixed-template webhook test delivery, no Alert for a candidate mark, and explicit analysis/profile prerequisite')
 
     client.wait(client.request('POST', f'/api/applications/{github["id"]}/cve-sync', {}, expect=(202,)))
     cves = items(client.request('GET', f'/api/cves?application_id={github["id"]}'))
@@ -216,8 +221,8 @@ def main():
     print('PASS inclusive CVSS gate, missing-score rejection, and modified-record refresh')
 
     finding = client.request('POST', '/api/findings', {
-        'application_id': github['id'], 'kind': '0day', 'title': f'Fixture metadata boundary {suffix}',
-        'status': 'open', 'source_commit_id': candidate['id'],
+        'application_id': github['id'], 'source': 'commit', 'title': f'Fixture metadata boundary {suffix}',
+        'source_commit_id': candidate['id'],
         'affected_versions': ['1.2.0'], 'fixed_versions': ['1.2.1'],
     }, expect=(200, 201))
     assert finding['status'] == 'open'

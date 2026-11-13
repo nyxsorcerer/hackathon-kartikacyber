@@ -53,7 +53,7 @@ from .sources import Sources, release_branch_candidates
 EVIDENCE_SCHEMA = {"type": "array", "items": {"type": "object"}}
 # A commit SHA (abbreviated or full), a CVE, a GHSA, or another advisory database's id.
 ADDRESS = r"^(?:[0-9a-f]{7,64}|CVE-\d{4}-\d{4,}|GHSA(?:-[0-9a-z]{4}){3}|[A-Z][A-Z0-9]*-[A-Za-z0-9._:-]{1,80})$"
-# The Verdicts that open a 0day Finding with a drafted Proof bundle.
+# The opening Verdicts whose Findings get the drafted Proof bundle.
 FINDING_VERDICTS = ("Vulnerability fix", "Vulnerability introduced")
 # Each Verdict's review decision. Insufficient context stays pending: the Review queue.
 VERDICT_REVIEW = {
@@ -89,7 +89,7 @@ SCHEMAS = {
             "confidence": {"enum": list(CONFIDENCES)},
             "title": {"type": "string", "minLength": 1, "maxLength": 300},
             "vulnerable_ref": {"type": ["string", "null"]},
-            # Commits or advisories the change addresses, for linking to Findings (Phase 3).
+            # Commits or advisories the change addresses, which link it to their Findings.
             "addresses": {"type": "array", "maxItems": 50, "items": {"type": "string", "pattern": ADDRESS}},
             "summary": {"type": "string"},
             "evidence": EVIDENCE_SCHEMA,
@@ -1021,14 +1021,6 @@ class Workflows:
             },
         )
         self.set_commit_decision(db, job, commit, {"security_candidate": "candidate", "unrelated": "dismissed", "insufficient_context": "pending"}[result["decision"]])
-        if result["decision"] == "security_candidate":
-            domain.notify(
-                db,
-                f"commit:{commit.id}:candidate",
-                "Security candidate: " + result["title"][:120],
-                f"/commits/{commit.id}",
-                result["reason"],
-            )
         if result["decision"] in ("security_candidate", "insufficient_context"):
             # A flagged change is analysed automatically, after the changes already waiting for a
             # cap; an incomplete diff is never left unjudged.
@@ -1369,7 +1361,10 @@ class Workflows:
                 # perform source I/O. Finish them before holding the publication fence.
                 vulnerable_ref = self.commit_finding_ref(db, repository, commit, result, outputs)
             except DomainError as exc:
+                # The Verdict still opens its Findings; only the drafted bundle, pinned to a
+                # revision that fails validation, is not published. The error stays on the Analysis.
                 revision_error = exc
+                result = {**result, "bundle_error": exc.as_dict()}
         self.context.fence(db)
         db.refresh(commit, with_for_update=True)
         analysis = Analysis(
@@ -1400,28 +1395,31 @@ class Workflows:
         commit.verdict = verdict
         commit.analysis_state = {"status": "completed", "analysis_id": analysis.id}
         response = {"analysis_id": analysis.id, "commit_id": commit.id, **result}
-        # A Malicious change opens no Finding yet (Phase 3); its drafts stay with the analysis.
-        if verdict not in FINDING_VERDICTS:
-            return response
-        if revision_error:
-            self.context.fence(db).result = response
-            db.commit()  # Keep the report and invalid proposal inspectable, without a finding.
-            raise revision_error
-        finding = db.scalar(select(Finding).where(
-            Finding.application_id == application.id, Finding.kind == "0day",
-            Finding.data["source_commit_id"].as_string() == commit.id,
-        ).order_by(Finding.created_at.desc()).with_for_update())
-        if finding is None:
-            finding = Finding(application_id=application.id, kind="0day", title=result["title"], status="open", data={})
-            db.add(finding)
-            db.flush()
-        finding.data = {**finding.data, "source_commit_id": commit.id, "source_analysis_id": analysis.id,
-                        "evidence": result["evidence"], "target_applicability": "unknown"}
-        analysis.result = {**result, "finding_id": finding.id}
-        # Nothing was run, so an incomplete drafted bundle is still published, as a draft.
-        return self.publish_finding_bundle(
-            db, job, application, finding, vulnerable_ref, outputs, response, require_complete=False
-        )
+        # Each Application the change reaches gets its own Finding (A11). A fix that addresses one
+        # of that Application's Findings is linked to them instead; a Vulnerability introduced or
+        # Malicious change fixes nothing, so its 'addresses' never keep it from opening its own.
+        change = {"commit_id": commit.id, "revision": commit.revision, "analysis_id": analysis.id, "verdict": verdict}
+        cause = {"by": "verdict", "verdict": verdict, "confidence": result["confidence"],
+                 "analysis_id": analysis.id, "commit_id": commit.id}
+        findings = {}
+        for target in domain.affected_applications(db, repository):
+            linked = domain.link_change(db, target, result.get("addresses", []), change)
+            if verdict not in domain.OPENING_VERDICTS or (linked and verdict == "Vulnerability fix"):
+                continue
+            finding, _ = domain.open_finding(db, target, "commit", commit.id, result["title"], commit.revision[:7], cause)
+            findings[target.id] = {"finding_id": finding.id}
+            if finding.status not in ("open", "confirmed"):
+                continue  # A closed Finding keeps the evidence and bundle it was closed with.
+            finding.data = {**finding.data, "source_analysis_id": analysis.id, "evidence": result["evidence"]}
+            # Nothing was run, so an incomplete drafted bundle is still published, as a draft. A
+            # Malicious change's drafts stay with the Analysis until Phase 5.
+            if verdict in FINDING_VERDICTS and not revision_error:
+                findings[target.id] = self.publish_finding_bundle(
+                    db, job, target, finding, vulnerable_ref, outputs, {}, require_complete=False
+                )
+        own = findings.get(application.id, {"finding_id": None})
+        analysis.result = {**result, "finding_id": own["finding_id"]}
+        return {**response, **own, "finding_ids": [f["finding_id"] for f in findings.values()]}
 
     def commit_finding_ref(self, db, repository, commit, result, outputs):
         ref = result["vulnerable_ref"]
@@ -2193,31 +2191,10 @@ class Workflows:
             },
         )
         db.add(analysis)
-        finding = db.scalar(
-            select(Finding)
-            .where(Finding.application_id == application.id, Finding.kind == "cve", Finding.cve_id == row.id)
-            .order_by(Finding.created_at.desc())
-            .with_for_update()
+        finding, _ = domain.open_finding(
+            db, application, "cve", row.id, row.data.get("title") or result["summary"] or row.id, row.id,
+            {"by": "cve_analysis", "analysis_id": analysis.id},
         )
-        if finding is None:
-            finding = Finding(
-                id=uid(),
-                application_id=application.id,
-                kind="cve",
-                cve_id=row.id,
-                title=(row.data.get("title") or result["summary"] or row.id)[:300],
-                status="open",
-                data={},
-            )
-            db.add(finding)
-        finding.data = {
-            **finding.data,
-            "source_analysis_id": analysis.id,
-            "affected_versions": result["affected_versions"],
-            "fixed_versions": result["fixed_versions"],
-            "evidence": result["evidence"],
-            "target_applicability": facts["applicability"],
-        }
         analysis.result = {**analysis.result, "finding_id": finding.id}
         artifacts.publish(
             db,
@@ -2228,6 +2205,17 @@ class Workflows:
             {**facts, "profile": job.profile},
             all_secrets(db, self.vault),
         )
+        if finding.status not in ("open", "confirmed"):
+            # A closed Finding keeps the evidence and bundle it was closed with.
+            return {"analysis_id": analysis.id, **result, "finding_id": finding.id}
+        finding.data = {
+            **finding.data,
+            "source_analysis_id": analysis.id,
+            "affected_versions": result["affected_versions"],
+            "fixed_versions": result["fixed_versions"],
+            "evidence": result["evidence"],
+            "target_applicability": facts["applicability"],
+        }
         return self.publish_finding_bundle(
             db, job, application, finding, snapshot.source_ref, outputs, {"analysis_id": analysis.id, **result}
         )
@@ -2237,7 +2225,7 @@ class Workflows:
         cve = domain.get(db, CVE, finding.cve_id) if finding.cve_id else None
         analysis_id = finding.data.get("source_analysis_id")
         analysis = domain.get(db, Analysis, analysis_id) if analysis_id else None
-        if analysis and analysis.application_id != application.id:
+        if analysis and not domain.analysis_reaches(db, analysis, application.id):
             raise DomainError("invalid_reference", "Finding analysis belongs to another Application", 422)
         if analysis and analysis.kind == "commit_analysis" and analysis.result.get("vulnerable_ref") and not job.input.get("source_ref"):
             origin = domain.get(db, Commit, analysis.subject_id)
@@ -2255,7 +2243,7 @@ class Workflows:
         files["finding.json"] = json.dumps({
             "id": finding.id,
             "application_id": finding.application_id,
-            "kind": finding.kind,
+            "source": finding.source,
             "cve_id": finding.cve_id,
             "title": finding.title,
             "status": finding.status,
@@ -2281,7 +2269,7 @@ class Workflows:
         facts = {
             "finding_id": finding.id,
             "title": finding.title,
-            "kind": finding.kind,
+            "source": finding.source,
             "cve_id": finding.cve_id,
             "evidence_file": "finding.json",
             "source_ref": snapshot.source_ref,
@@ -2379,6 +2367,8 @@ class Workflows:
             "vulnerable_version": complete["vulnerable_version"],
             "artifact_revision": row.artifact_revision,
         }
+        if row.status == "verified":  # A reproduced Proof confirms an Open Finding (A11).
+            domain.transition_finding(db, finding, "confirmed", {"by": "proof", "lab_run_id": row.id})
         if outputs:
             artifacts.publish(
                 db,
@@ -2648,17 +2638,16 @@ class Workflows:
             or not parsed.path.startswith("/api/webhooks/")
         ):
             raise DomainError("unsafe_webhook", "Use a Discord HTTPS webhook URL", 422)
+        # The one Alert template (A12), built only from the stored application-generated fields; a
+        # legacy Numen row's title and detail are never sent.
+        lines = [f"Asset Monitor: {row.data.get('verdict') or 'Alert'}"]
+        for label, key in (("Application", "application"), ("Provider account", "account"), ("Source", "source")):
+            if row.data.get(key):
+                lines.append(f"{label}: {row.data[key]}")
         link = setting.data.get("dashboard_url", "").rstrip("/") + row.data["link"]
-        payload = {
-            "allowed_mentions": {"parse": []},
-            "embeds": [
-                {
-                    "title": row.data["title"],
-                    "description": row.data["detail"],
-                    "url": link if link.startswith("http") else None,
-                }
-            ],
-        }
+        if link.startswith("http"):
+            lines.append(link)
+        payload = {"content": "\n".join(lines), "allowed_mentions": {"parse": []}}
         row.attempts += 1
         try:
             response = httpx.post(url, params={"wait": "true"}, json=payload, timeout=15)

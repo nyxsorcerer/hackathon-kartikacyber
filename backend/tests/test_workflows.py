@@ -212,8 +212,8 @@ def test_explicit_commit_analysis_retains_report_and_verdict(system):
     )
     client.get(f"/api/commits/{commit_id}")
     assert all(j["kind"] != "commit_analysis" for j in client.get("/api/jobs").json()["items"])
-    # Delivering or failing the candidate notification does not submit analysis.
-    run_once(config, app.state.factory, FixtureBroker())
+    # Marking a candidate submits no Analysis.
+    assert not run_once(config, app.state.factory, FixtureBroker())
     queued = client.post(f"/api/commits/{commit_id}/analyses", json={"profile": profile}).json()[
         "job_id"
     ]
@@ -966,9 +966,6 @@ def test_nvd_incomplete_pages_and_updates_preserve_completed_cursor(system, monk
     client.post(f"/api/jobs/{queued}/retry")
     run_once(config, app.state.factory, FixtureBroker())
     assert all(row["eligible"] for row in client.get("/api/cves").json()["items"])
-    # Drain disabled notifications before the next synchronization.
-    while run_once(config, app.state.factory, FixtureBroker()):
-        pass
     state["score"] = 6.9
     client.post(f"/api/applications/{p['id']}/cve-sync")
     run_once(config, app.state.factory, FixtureBroker())
@@ -1200,9 +1197,6 @@ def test_auto_analysis_waits_for_the_baseline_source_check(system, monkeypatch):
         monitored = db.get(Application, p["id"])
         link = db.scalar(select(ApplicationCVE).where(ApplicationCVE.application_id == monitored.id))
         domain.refresh_cve_policy(db, monitored, db.get(CVE, raw["id"]), link)
-    # Drain disabled notifications; nothing else may be queued before the source check.
-    while run_once(config, app.state.factory, FixtureBroker()):
-        pass
 
     def analyses():
         return [j for j in client.get("/api/jobs").json()["items"] if j["kind"] == "cve_analysis"]
