@@ -12,6 +12,7 @@ OPERATIONS = (
     "audit_context",
     "cve_analysis",
     "finding_artifacts",
+    "patch_drafting",
 )
 VERDICTS = (
     "Vulnerability fix",
@@ -35,6 +36,8 @@ CODEX_REFUSED = {
     "commit_triage": ("triage_codex_unsupported", TRIAGE_CODEX),
     "commit_analysis": ("analysis_codex_unsupported", ANALYSIS_CODEX),
     "cve_analysis": ("analysis_codex_unsupported", ANALYSIS_CODEX),
+    # Patch drafting writes only its outputs (A08), so it gets no shell either.
+    "patch_drafting": ("patch_codex_unsupported", "Patch drafting on Codex is refused until a Codex mode without a shell has been verified"),
 }
 # Monitoring intervals in seconds: at least 5 minutes, at most 10 years.
 MIN_INTERVAL, MAX_INTERVAL = 300, 3650 * 86400
@@ -244,7 +247,7 @@ class TransitionInput(Strict):
 
 class AccountInput(Strict):
     label: str = Field(min_length=1, max_length=200)
-    provider: Literal["deepseek", "commandcode", "openai", "claude", "jev", "github", "nvd"]
+    provider: Literal["deepseek", "commandcode", "openai", "claude", "jev", "github", "github_write", "nvd"]
     auth_type: Literal["api_key", "native_oauth"]
     api_key: str | None = Field(default=None, max_length=20000)
 
@@ -260,6 +263,10 @@ class AccountInput(Strict):
             )
         if self.auth_type == "native_oauth" and self.api_key:
             raise ValueError("Native login does not accept an API key")
+        # Decision 7: only a fine-grained token can be limited to the Own repositories.
+        if self.provider == "github_write" and self.api_key and not self.api_key.startswith("github_pat_"):
+            raise ValueError("The GitHub write token must be a fine-grained personal access token (github_pat_…) "
+                             "limited to the Own repositories")
         return self
 
 
@@ -371,3 +378,15 @@ class LoginInput(Strict):
 class ApprovalInput(Strict):
     # Empty by default: a missing password is refused exactly like a wrong one (A15).
     password: str = Field(default="", max_length=1024, repr=False)
+
+
+class RemediationDraftInput(Strict):
+    """The Operator drafts a patch or a revert by hand (A08), the retry of a failed draft."""
+    action: Literal["patch", "revert"]
+    profile: Profile | None = None
+
+
+class RemediationApprovalInput(ApprovalInput):
+    """An Approval of one draft Remediation PR (A08, A15): the password, and the SHA-256 of the
+    diff the Operator reviewed, so a draft that changed since is never approved."""
+    diff_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")

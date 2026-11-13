@@ -53,6 +53,7 @@ const providerLabels: Record<string, string> = {
   deepseek: "DeepSeek",
   jev: "Jev",
   github: "GitHub",
+  github_write: "GitHub write token (Remediation PRs)",
   nvd: "NVD",
 };
 function providerLabel(provider: string) {
@@ -122,7 +123,8 @@ function Accounts({ integrations = false }: { integrations?: boolean }) {
   const [cacheImport, setCacheImport] = useState<Account>();
   const [inspected, setInspected] = useState<Account>();
   const items = resource.data?.items.filter(
-    (a) => ["github", "nvd"].includes(a.provider) === integrations,
+    (a) =>
+      ["github", "github_write", "nvd"].includes(a.provider) === integrations,
   );
   return (
     <>
@@ -130,7 +132,7 @@ function Accounts({ integrations = false }: { integrations?: boolean }) {
         title={integrations ? "Source integrations" : "Provider connections"}
         description={
           integrations
-            ? "GitHub and optional NVD credentials belong to source collection."
+            ? "A GitHub read token and optional NVD credentials collect sources. A separate GitHub write token (fine-grained; Contents and Pull requests: read and write; Own repositories only) is used only to open Remediation PRs."
             : "API access and native subscription login are distinct connections."
         }
         actions={
@@ -459,7 +461,7 @@ function AccountEditor({
               }}
             >
               {(integrations
-                ? ["github", "nvd"]
+                ? ["github", "github_write", "nvd"]
                 : ["deepseek", "commandcode", "openai", "claude", "jev"]
               ).map((p) => (
                 <option key={p} value={p}>

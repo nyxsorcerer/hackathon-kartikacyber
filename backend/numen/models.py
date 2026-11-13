@@ -289,6 +289,35 @@ class LabRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class RemediationPR(Base):
+    """A Remediation PR (A08), from its draft diff through its Approval to the pull request opened
+    from that diff. (application_id, subject, action) is ADR-0004's idempotency key: approving
+    twice or recovering a crashed job finds this row and opens at most one pull request."""
+
+    __tablename__ = "remediation_prs"
+    __table_args__ = (UniqueConstraint("application_id", "subject", "action"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    finding_id: Mapped[str] = mapped_column(ForeignKey("findings.id"))
+    # The Own repository, the only one a Remediation PR is opened on.
+    repository_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"))
+    # The Commit's id; a vulnerability for an Advisory check.
+    subject: Mapped[str] = mapped_column(String)
+    # patch, revert, pin or bump
+    action: Mapped[str] = mapped_column(String)
+    # drafting, waiting_for_cap, draft_failed, ready, approved, failed, open, merged or closed
+    status: Mapped[str] = mapped_column(String, default="drafting")
+    # The revision the diff applies to.
+    base_ref: Mapped[str | None] = mapped_column(String, nullable=True)
+    diff: Mapped[str | None] = mapped_column(Text, nullable=True)
+    diff_sha256: Mapped[str | None] = mapped_column(String, nullable=True)
+    # revision, summary, paths, flags, error, job_id, dependency, branch, pull_number, pull_url,
+    # head_sha, merge_commit_sha
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Job(Base):
     __tablename__ = "jobs"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)

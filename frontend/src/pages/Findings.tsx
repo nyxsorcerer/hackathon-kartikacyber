@@ -8,6 +8,7 @@ import {
 import {
   Download,
   FlaskConical,
+  GitPullRequest,
   PencilLine,
   Trash2,
   Plus,
@@ -16,6 +17,7 @@ import {
   Target,
   Upload,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { z } from "zod";
 import { mutate, request } from "../api";
 import { useResource } from "../hooks";
@@ -31,6 +33,7 @@ import type {
   Finding,
   Application,
   CleanupReport,
+  RemediationPR,
   StaticProof,
 } from "../types";
 import { versionLabels } from "../versions";
@@ -43,7 +46,9 @@ import {
   Callout,
   CopyButton,
   DataState,
+  describeError,
   DetailGrid,
+  DiffView,
   Empty,
   ErrorNote,
   Evidence,
@@ -947,6 +952,7 @@ function FindingBody({
           )}
         </Panel>
       )}
+      <RemediationPRs finding={finding} refresh={refresh} />
       {generate && (
         <JobLaunch
           operation="finding_artifacts"
@@ -965,8 +971,12 @@ function FindingBody({
         />
       )}
       {approve && (
-        <LabApproval
-          finding={finding}
+        <Approval
+          title="Approve the Lab"
+          description="Asset Monitor builds the vulnerable application and runs the Proof in a disposable Lab. Enter your password to approve this Lab."
+          path={`/findings/${finding.id}/lab-runs`}
+          success="Lab started after Approval."
+          icon={FlaskConical}
           onClose={() => setApprove(false)}
           refresh={refresh}
         />
@@ -1273,8 +1283,23 @@ function HistoryEvent({
               causeLabel(event.cause),
             ]
           : action === "approved"
-            ? ["Approved · Lab", undefined]
-            : [humanize(action), undefined];
+            ? text(event, "approved") === "remediation_pr"
+              ? [
+                  "Approved · Remediation PR",
+                  `${humanize(text(event, "remediation") || "")} · diff SHA-256 ${text(event, "diff_sha256") || "unknown"}`,
+                ]
+              : ["Approved · Lab", undefined]
+            : action === "remediation_pr_opened"
+              ? [
+                  "Remediation PR opened",
+                  `${humanize(text(event, "remediation") || "")} · ${text(event, "branch") || ""}`,
+                ]
+              : action === "remediation_pr_merged"
+                ? [
+                    "Remediation PR merged",
+                    `${humanize(text(event, "remediation") || "")} · merge commit ${(text(event, "merge_commit_sha") || "").slice(0, 7)}`,
+                  ]
+                : [humanize(action), undefined];
   return (
     <li className="timeline-item">
       <span className="timeline-marker neutral" aria-hidden="true" />
@@ -1288,13 +1313,23 @@ function HistoryEvent({
     </li>
   );
 }
-/** The Approval that starts a Lab (A15): the Operator's password, checked on this request. */
-function LabApproval({
-  finding,
+/** An Approval (A15): the Operator's password, checked on this request alone, then one job. */
+function Approval({
+  title,
+  description,
+  path,
+  body = {},
+  success,
+  icon: Icon,
   onClose,
   refresh,
 }: {
-  finding: Finding;
+  title: string;
+  description: string;
+  path: string;
+  body?: Record<string, unknown>;
+  success: string;
+  icon: LucideIcon;
   onClose: () => void;
   refresh: () => void;
 }) {
@@ -1302,23 +1337,14 @@ function LabApproval({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   return (
-    <Modal
-      title="Approve the Lab"
-      description="Asset Monitor builds the vulnerable application and runs the Proof in a disposable Lab. Enter your password to approve this Lab."
-      onClose={onClose}
-    >
+    <Modal title={title} description={description} onClose={onClose}>
       <form
         onSubmit={async (e) => {
           e.preventDefault();
           setBusy(true);
           setError(undefined);
           try {
-            await queueJob(
-              `/findings/${finding.id}/lab-runs`,
-              { password },
-              undefined,
-              "Lab started after Approval.",
-            );
+            await queueJob(path, { ...body, password }, undefined, success);
             refresh();
             onClose();
           } catch (err) {
@@ -1345,12 +1371,179 @@ function LabApproval({
             Cancel
           </button>
           <button className="primary" disabled={busy || !password}>
-            <FlaskConical size={15} aria-hidden="true" />
+            <Icon size={15} aria-hidden="true" />
             {busy ? "Approving…" : "Approve"}
           </button>
         </div>
       </form>
     </Modal>
+  );
+}
+const remediationTones: Record<string, string> = {
+  drafting: "info",
+  waiting_for_cap: "warm",
+  draft_failed: "danger",
+  approved: "info",
+  open: "info",
+  merged: "good",
+};
+// A new draft of an action is refused while one is drafting or past its Approval.
+const remediationBusy = ["drafting", "approved", "open", "merged", "closed"];
+// Bidi controls and zero-width characters make a diff read differently from what it does
+// ("Trojan Source"), so the Approval screen shows each one as a visible escape.
+const hiddenCharacters =
+  /[\u061C\u200B-\u200F\u2028-\u202E\u2060-\u2069\uFEFF]/g;
+const revealHidden = (text: string) =>
+  text.replace(
+    hiddenCharacters,
+    (c) =>
+      `⟨U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}⟩`,
+  );
+/** A pull request link only for an http(s) URL. */
+function pullLink(pr: RemediationPR) {
+  return pr.pull_url && /^https?:\/\//.test(pr.pull_url) ? (
+    <a href={pr.pull_url} target="_blank" rel="noreferrer">
+      Pull request #{pr.pull_number}
+    </a>
+  ) : null;
+}
+/** The Finding's Remediation PRs (A08): each validated diff as text with its SHA-256, approved
+ * with the Operator's password, then opened as a draft pull request on the Own repository. */
+function RemediationPRs({
+  finding,
+  refresh,
+}: {
+  finding: Finding;
+  refresh: () => void;
+}) {
+  const [approving, setApproving] = useState<RemediationPR>();
+  const rows = finding.remediation_prs;
+  return (
+    <Panel
+      title="Remediation PRs"
+      description="Draft pull requests on the Own repository. Each opens only after your Approval of its exact diff, and you merge it."
+      actions={finding.remediation_actions.map((action) => (
+        <ActionButton
+          key={action}
+          className="secondary"
+          disabled={rows.some(
+            (r) => r.action === action && remediationBusy.includes(r.status),
+          )}
+          onAction={async () => {
+            await queueJob(
+              `/findings/${finding.id}/remediation-prs`,
+              { action },
+              undefined,
+              `${humanize(action)} draft queued.`,
+            );
+            refresh();
+          }}
+        >
+          <GitPullRequest size={15} aria-hidden="true" />
+          Draft {action}
+        </ActionButton>
+      ))}
+    >
+      {!finding.own_repository && (
+        <Empty
+          icon={GitPullRequest}
+          title="No Own repository: Remediation PR steps are skipped."
+          description="Link an Own repository to the Application to draft patches and reverts."
+        />
+      )}
+      {finding.own_repository && !rows.length && (
+        <Empty
+          icon={GitPullRequest}
+          title="No Remediation PR drafted"
+          description={
+            finding.remediation_actions.length
+              ? "A Vulnerability introduced or Malicious change Verdict drafts one automatically, or draft one here."
+              : "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a patch or revert."
+          }
+        />
+      )}
+      {rows.length > 0 && (
+        <div className="row-list">
+          {rows.map((pr) => (
+            <article className="lab-run" key={pr.id}>
+              <div className="analysis-header">
+                <strong>{humanize(pr.action)}</strong>
+                <Badge tone={remediationTones[pr.status]}>{pr.status}</Badge>
+                <span className="analysis-time">
+                  <Time value={pr.updated_at} absolute />
+                </span>
+                {pr.job_id && <JobLink id={pr.job_id} />}
+                {["ready", "failed"].includes(pr.status) && pr.diff && (
+                  <button className="primary" onClick={() => setApproving(pr)}>
+                    <GitPullRequest size={15} aria-hidden="true" />
+                    Approve
+                  </button>
+                )}
+              </div>
+              {pr.summary && <p className="readable-copy">{pr.summary}</p>}
+              {describeError(pr.error) && (
+                <ErrorNote>{describeError(pr.error)}</ErrorNote>
+              )}
+              {pr.flags.includes("workflows") && (
+                <Callout tone="warm" title="CI workflow change">
+                  This diff changes .github/workflows. Review it closely; the
+                  write token needs the Workflows permission to push it.
+                </Callout>
+              )}
+              <DetailGrid
+                items={[
+                  [
+                    "Base revision",
+                    <span className="mono">
+                      {pr.base_ref?.slice(0, 12) || "Not drafted yet"}
+                    </span>,
+                  ],
+                  [
+                    "Branch",
+                    pr.branch ? (
+                      <span className="mono">{pr.branch}</span>
+                    ) : (
+                      <span className="muted">Not opened</span>
+                    ),
+                  ],
+                  [
+                    "Pull request",
+                    pullLink(pr) || <span className="muted">Not opened</span>,
+                  ],
+                ]}
+              />
+              {pr.diff && revealHidden(pr.diff) !== pr.diff && (
+                <Callout tone="warm" title="Hidden characters">
+                  This diff holds bidirectional or zero-width characters, which
+                  can make code read differently from what it does. Each is
+                  shown as ⟨U+…⟩.
+                </Callout>
+              )}
+              {pr.diff && (
+                <div className="field-block">
+                  <span className="field-label with-copy">
+                    Diff SHA-256 <span className="mono">{pr.diff_sha256}</span>
+                  </span>
+                  <DiffView diff={revealHidden(pr.diff)} />
+                </div>
+              )}
+            </article>
+          ))}
+        </div>
+      )}
+      {approving?.diff_sha256 && (
+        <Approval
+          title={`Approve the ${approving.action} Remediation PR`}
+          description={`Asset Monitor opens one draft pull request on the Own repository from exactly the diff with SHA-256 ${approving.diff_sha256}. It never merges. Enter your password to approve it.`}
+          path={`/findings/${finding.id}/remediation-prs/${approving.id}/approvals`}
+          body={{ diff_sha256: approving.diff_sha256 }}
+          success="Remediation PR approved: opening the draft pull request."
+          icon={GitPullRequest}
+          onClose={() => setApproving(undefined)}
+          refresh={refresh}
+        />
+      )}
+    </Panel>
   );
 }
 function ArtifactUpload({

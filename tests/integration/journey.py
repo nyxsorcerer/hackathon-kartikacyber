@@ -261,7 +261,53 @@ def main():
     assert [e for e in finding['events'] if e.get('action') == 'approved' and e.get('job_id') == lab['id']]
     print('PASS Approval refuses a wrong password, then a Lab on the real Engine reproduces the Proof and confirms the Finding')
 
-    for application in [github, wordpress]:
+    # A08: a Remediation PR on an Own repository, through the fixture GitHub API with the write token.
+    write_token = 'github_pat_fixture-write-token'
+    if not [a for a in items(client.request('GET', '/api/accounts')) if a['provider'] == 'github_write' and a['credential_configured']]:
+        client.request('POST', '/api/accounts', {
+            'label': 'Fixture GitHub write token', 'provider': 'github_write', 'auth_type': 'api_key',
+            'api_key': write_token,
+        }, expect=(201,))
+    own_repo = f'numen/fixture-{uuid.uuid4().hex[:8]}'
+    own = client.request('POST', '/api/applications', {
+        **common, 'asset_name': f'Own fixture {suffix}', 'product_kind': 'CMS',
+    }, expect=(200, 201))
+    client.request('POST', f'/api/applications/{own["id"]}/repositories', {
+        'role': 'own', 'source_kind': 'github', 'source_url': f'https://github.com/{own_repo}', 'source_ref': 'main',
+    }, expect=(201,))
+    check_now(client, own)
+    (link,) = client.request('GET', f'/api/applications/{own["id"]}')['repositories']
+    assert link['baseline_revision'] == 'b' * 40
+    client.wait(client.request('POST', f'/api/applications/{own["id"]}/repositories/{link["repository_id"]}/backfills', {'count': 1}, expect=(202,)))
+    (change,) = items(client.request('GET', f'/api/applications/{own["id"]}/commits'))
+    assert change['revision'] == 'b' * 40
+    own_finding = client.request('POST', '/api/findings', {
+        'application_id': own['id'], 'source': 'commit', 'title': f'Fixture Own change {suffix}',
+        'source_commit_id': change['id'],
+    }, expect=(200, 201))
+    client.wait(client.request('POST', f'/api/findings/{own_finding["id"]}/remediation-prs', {'action': 'revert'}, expect=(202,)))
+    (draft,) = client.request('GET', f'/api/findings/{own_finding["id"]}')['remediation_prs']
+    assert (draft['status'], draft['paths']) == ('ready', ['VERSION']), draft
+    assert '-1.2.1\n+1.2.0\n' in draft['diff']
+    approvals = f'/api/findings/{own_finding["id"]}/remediation-prs/{draft["id"]}/approvals'
+    refused = client.request('POST', approvals, {'password': 'wrong-' + suffix, 'diff_sha256': draft['diff_sha256']}, expect=(403,))
+    assert refused['code'] == 'approval_refused' and fixture.request('GET', '/admin/state')['writes'] == []
+    opened = client.wait(client.request('POST', approvals, {'password': password, 'diff_sha256': draft['diff_sha256']}, expect=(202,)))
+    (pr,) = client.request('GET', f'/api/findings/{own_finding["id"]}')['remediation_prs']
+    assert (pr['status'], pr['pull_number'], pr['branch']) == ('open', 1, 'asset-monitor/bbbbbbb-revert'), pr
+    again = client.request('POST', approvals, {'password': password, 'diff_sha256': draft['diff_sha256']}, expect=(202,))
+    assert again['job_id'] == opened['id']
+    state = fixture.request('GET', '/admin/state')
+    (pull,) = state['pulls']
+    assert (pull['draft'], pull['head']['ref'], pull['base']['ref']) == (True, 'asset-monitor/bbbbbbb-revert', 'main')
+    # Every write went to the Own repository (the fixture refuses any write to main).
+    assert state['writes'] and all(w['path'].startswith(f'/repos/{own_repo}/') for w in state['writes'])
+    for job in items(client.request('GET', f'/api/jobs?application_id={own["id"]}')):
+        seen = [client.request('GET', f'/api/jobs/{job["id"]}'), client.request('GET', f'/api/jobs/{job["id"]}/events')]
+        assert write_token not in json.dumps(seen), job['kind']
+    print('PASS Remediation PR Approval refuses a wrong password, then opens exactly one draft pull request on the Own repository')
+
+    for application in [github, wordpress, own]:
         client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})
     client.request('POST', '/api/auth/logout', {})
     client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(401,), raw=True)

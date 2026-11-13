@@ -25,7 +25,7 @@ from .models import (
 from .security import DomainError, Vault
 from .queue import ExecutionContext, claim, runtime_phases, stop_runs
 from .workflows import Workflows, all_secrets
-from .domain import enqueue, event
+from .domain import enqueue, event, remediation_job_ended
 
 log = logging.getLogger("numen.worker")
 # Agent, lab, Detection rule and interactive login work that can occupy a slot for minutes or hours.
@@ -38,6 +38,8 @@ LONG_KINDS = (
     "detection_rule",
     "finding_artifacts",
     "lab_run",
+    "patch_drafting",
+    "remediation_draft",
     "version_recipe",
 )
 # Attempts at one Triage of a change; retry n waits n minutes.
@@ -228,6 +230,7 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                     lab = db.scalar(select(LabRun).where(LabRun.job_id == row.id))
                     if lab:
                         lab.status, lab.data = row.status, {"error": error}
+                remediation_job_ended(db, row, error)
                 event(
                     db,
                     row,

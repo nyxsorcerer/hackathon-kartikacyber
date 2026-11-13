@@ -30,6 +30,11 @@ class FixtureState:
         self.modified_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec='milliseconds')
         self.notifications: list[dict] = []
         self.requests: list[str] = []
+        # The Remediation PR GitHub API (A08): what was written, never a header value.
+        self.writes: list[dict] = []
+        self.refs: dict[str, str] = {}
+        self.commits: dict[str, dict] = {}
+        self.pulls: list[dict] = []
 
 
 STATE = FixtureState()
@@ -95,16 +100,26 @@ def commit(sha: str) -> dict:
     }
 
 
-def archive(sha: str) -> bytes:
-    files = {
+def source_files(sha: str) -> dict[str, bytes]:
+    return {
         'app.py': b'def authorized(request):\n    return request.get("operator", False)\n\ndef metadata(request):\n    return request.get("data", {})\n',
         'README.md': b'# Fixture application\nPinned controlled source for Numen tests.\n',
         'assets/app.js': SHARED_ASSET,
         'VERSION': b'1.2.0\n' if sha == BASE_SHA else b'1.2.1\n',
     }
+
+
+def git_sha(value: object) -> str:
+    """A blob's git object id, as GitHub lists it; a JSON body's stand-in id otherwise."""
+    if isinstance(value, bytes):
+        return hashlib.sha1(b'blob %d\0' % len(value) + value).hexdigest()
+    return hashlib.sha1(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def archive(sha: str) -> bytes:
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode='w:gz') as bundle:
-        for path, content in files.items():
+        for path, content in source_files(sha).items():
             entry = tarfile.TarInfo(f'numen-fixture-{sha[:7]}/{path}')
             entry.size = len(content)
             entry.mode = 0o644
@@ -192,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({'ok': True})
         if path == '/admin/state':
             with STATE.lock:
-                return self.json({'generation': STATE.generation, 'version': STATE.version, 'score': STATE.score, 'notifications': STATE.notifications, 'requests': STATE.requests})
+                return self.json({'generation': STATE.generation, 'version': STATE.version, 'score': STATE.score, 'notifications': STATE.notifications, 'requests': STATE.requests, 'pulls': STATE.pulls, 'writes': STATE.writes})
         if path in ('/target', '/'):
             return self.send(200, f'<html><head><meta name="generator" content="Numen Fixture {version}"></head><body><script src="/assets/app.js"></script></body></html>'.encode(), 'text/html', {'X-Product-Version': version})
         if path == '/assets/app.js':
@@ -217,9 +232,40 @@ class Handler(BaseHTTPRequestHandler):
             sha = path.rsplit('/', 1)[1]
             if sha in (BASE_SHA, FIX_SHA, OLD_DATED_SHA):
                 return self.json(commit(sha))
-        if path.startswith('/repos/numen/fixture/git/ref'):
+        if path == '/repos/numen/fixture':
+            return self.json({'full_name': 'numen/fixture', 'default_branch': 'main'})
+        if path == '/repos/numen/fixture/git/ref/heads/main':
             sha = BASE_SHA if generation == 0 else FIX_SHA
             return self.json({'ref': 'refs/heads/main', 'object': {'type': 'commit', 'sha': sha}})
+        if path.startswith('/repos/numen/fixture/git/ref/heads/'):
+            ref = path.removeprefix('/repos/numen/fixture/git/ref/')
+            with STATE.lock:
+                sha = STATE.refs.get(ref)
+            if sha:
+                return self.json({'ref': f'refs/{ref}', 'object': {'type': 'commit', 'sha': sha}})
+        # A seeded commit's tree shares its sha and holds its archive's files.
+        if path.startswith('/repos/numen/fixture/git/commits/'):
+            sha = path.rsplit('/', 1)[1]
+            if sha in (BASE_SHA, FIX_SHA, OLD_DATED_SHA):
+                seeded = commit(sha)
+                return self.json({'sha': sha, 'tree': {'sha': sha}, 'message': seeded['commit']['message'], 'parents': seeded['parents']})
+            with STATE.lock:
+                created = STATE.commits.get(sha)
+            if created:
+                return self.json(created)
+        if path.startswith('/repos/numen/fixture/git/trees/'):
+            sha = path.rsplit('/', 1)[1]
+            if sha in (BASE_SHA, FIX_SHA, OLD_DATED_SHA):
+                entries = [{'path': name, 'mode': '100644', 'type': 'blob', 'sha': git_sha(content)} for name, content in source_files(sha).items()]
+                return self.json({'sha': sha, 'tree': entries, 'truncated': False})
+        if path == '/repos/numen/fixture/pulls':
+            with STATE.lock:
+                return self.json([pull for pull in STATE.pulls if 'numen:' + pull['head']['ref'] in query.get('head', [])])
+        if path.startswith('/repos/numen/fixture/pulls/'):
+            number = int(path.rsplit('/', 1)[1])
+            with STATE.lock:
+                if 0 < number <= len(STATE.pulls):
+                    return self.json(STATE.pulls[number - 1])
         if path.startswith('/repos/numen/fixture/compare/'):
             comparison = path.rsplit('/', 1)[1].split('...', 1)
             identical = len(comparison) == 2 and comparison[0] == comparison[1]
@@ -237,7 +283,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.json({'message': 'Fixture route not found', 'path': path}, 404)
 
     def do_POST(self) -> None:
-        path = urlparse(self.path).path.rstrip('/')
+        original = urlparse(self.path).path.rstrip('/')
+        path = re.sub(r'^/repos/numen/fixture-[0-9a-f]+(?=/|$)', '/repos/numen/fixture', original)
         length = int(self.headers.get('Content-Length', '0'))
         if length > 1_000_000:
             return self.json({'message': 'Fixture request too large'}, 413)
@@ -264,12 +311,49 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.modified_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec='milliseconds')
                 STATE.notifications.clear()
                 STATE.requests.clear()
+                STATE.writes.clear()
+                STATE.refs.clear()
+                STATE.commits.clear()
+                STATE.pulls.clear()
             return self.json({'ok': True})
+        if path.startswith('/repos/numen/fixture/'):
+            return self.github_write(original, path.removeprefix('/repos/numen/fixture'), data)
         if path.startswith('/webhooks/') or path.startswith('/api/webhooks/'):
             with STATE.lock:
                 STATE.notifications.append(data)
                 message_id = str(len(STATE.notifications))
             return self.json({'id': message_id, 'channel_id': 'fixture', 'content': data.get('content', '')})
+        return self.json({'message': 'Fixture route not found'}, 404)
+
+    def github_write(self, original: str, path: str, data: dict) -> None:
+        """The git data and pull request writes of a Remediation PR (A08), kept in memory."""
+        with STATE.lock:
+            STATE.writes.append({'method': 'POST', 'path': original})
+            if path in ('/git/blobs', '/git/trees'):
+                return self.json({'sha': git_sha(data)}, 201)
+            if path == '/git/commits':
+                sha = git_sha(data)
+                STATE.commits[sha] = {'sha': sha, 'tree': {'sha': data['tree']}, 'message': data['message'], 'parents': [{'sha': p} for p in data['parents']]}
+                return self.json(STATE.commits[sha], 201)
+            if path == '/git/refs':
+                ref = data['ref'].removeprefix('refs/')
+                if ref == 'heads/main' or ref in STATE.refs:
+                    return self.json({'message': 'Reference already exists'}, 422)
+                STATE.refs[ref] = data['sha']
+                return self.json({'ref': data['ref'], 'object': {'type': 'commit', 'sha': data['sha']}}, 201)
+            if path == '/pulls':
+                head = STATE.refs.get('heads/' + data['head'])
+                if not head:
+                    return self.json({'message': 'Validation Failed'}, 422)
+                number = len(STATE.pulls) + 1
+                repo = original.removeprefix('/repos/').removesuffix('/pulls')
+                STATE.pulls.append({
+                    'number': number, 'html_url': f'https://github.com/{repo}/pull/{number}', 'state': 'open',
+                    'draft': bool(data.get('draft')), 'title': data['title'], 'body': data['body'],
+                    'head': {'ref': data['head'], 'sha': head}, 'base': {'ref': data['base']},
+                    'merged': False, 'merge_commit_sha': None,
+                })
+                return self.json(STATE.pulls[-1], 201)
         return self.json({'message': 'Fixture route not found'}, 404)
 
 

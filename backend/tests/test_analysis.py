@@ -37,8 +37,10 @@ def analyze(system, ident, result, outputs):
     app, client, config = system
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     broker = FixtureBroker(result, outputs)
-    # Alerts and the Detection rule validations a Malicious change queues stay queued.
-    run_once(config, app.state.factory, broker, exclude=("notification", "detection_rule"))
+    # Alerts, the Detection rule validations a Malicious change queues and the Remediation PR drafts
+    # an Own-repository Verdict queues stay queued.
+    run_once(config, app.state.factory, broker,
+             exclude=("notification", "detection_rule", "patch_drafting", "remediation_draft"))
     return client.get(f"/api/jobs/{queued}").json(), broker
 
 

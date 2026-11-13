@@ -9,8 +9,9 @@ from numen import domain
 from numen.models import Account, Commit, Job, JobAttempt, JobEvent, Application, Transcript
 from numen.queue import ExecutionContext, claim
 from numen.security import DomainError
+from numen.sources import Sources
 from numen.worker import run_once
-from numen.workflows import ISSUE_TYPES
+from numen.workflows import ISSUE_TYPES, all_secrets
 
 
 @pytest.mark.parametrize("agent", ["pi", "claude"])
@@ -748,3 +749,50 @@ def test_runtime_events_reach_the_timeline_with_application_owned_messages(syste
     again = client.get(f"/api/jobs/{job_id}/events").json()["items"]
     assert [e["kind"] for e in again].count("lab_build") == 2
     assert client.get("/api/dashboard").text.count("lab_build") == 0
+
+
+def test_the_github_write_token_is_write_only_and_never_polls(system, monkeypatch):
+    app, client, config = system
+    token = "github_pat_fixture_write_token"
+    refused = client.post("/api/accounts", json={"label": "Write", "provider": "github_write", "auth_type": "native_oauth"})
+    assert refused.status_code == 422
+    # A classic token's repo scope reaches every repository, Upstream forks included (decision 7).
+    classic = client.post("/api/accounts", json={
+        "label": "Write", "provider": "github_write", "auth_type": "api_key", "api_key": "ghp_classic_token"})
+    assert classic.status_code == 422 and "fine-grained" in classic.text and "ghp_classic_token" not in classic.text
+    created = client.post("/api/accounts", json={
+        "label": "Remediation PRs", "provider": "github_write", "auth_type": "api_key", "api_key": token})
+    assert created.status_code == 201, created.text
+    account = created.json()
+    assert account["credential_configured"] and account["supported_agents"] == [] and token not in created.text
+    listed = client.get("/api/accounts")
+    assert token not in listed.text and listed.json()["items"][0]["credential_configured"]
+    with app.state.factory() as db:
+        row = db.get(Account, account["id"])
+        assert token not in row.credential and app.state.vault.decrypt(row.credential) == {"api_key": token}
+        # Every Account credential is a secret: refused in agent inputs, redacted from Transcripts.
+        assert token in all_secrets(db, app.state.vault)
+    # The write token is not a polling token.
+    p = application(client)
+    with app.state.factory.begin() as db:
+        domain.schedule(db)
+    links = client.get(f"/api/applications/{p['id']}").json()["repositories"]
+    assert links[0]["last_error"]["code"] == "github_token_required"
+    # Its connection check asks GitHub who the token belongs to.
+    monkeypatch.setenv("NUMEN_GITHUB_API_URL", "http://github.fixture")
+    requests = []
+    original = Sources.__init__
+
+    def setup(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.client = httpx.Client(transport=httpx.MockTransport(
+            lambda request: requests.append(request) or httpx.Response(200, json={"login": "operator"})))
+
+    monkeypatch.setattr(Sources, "__init__", setup)
+    assert client.post(f"/api/accounts/{account['id']}/check").status_code == 202
+    while run_once(config, app.state.factory, FixtureBroker()):
+        pass
+    assert [(r.method, str(r.url), r.headers["authorization"]) for r in requests] == [
+        ("GET", "http://github.fixture/user", f"Bearer {token}")]
+    assert client.get("/api/accounts").json()["items"][0]["status"] == "ready"
+    assert token not in client.get("/api/jobs").text

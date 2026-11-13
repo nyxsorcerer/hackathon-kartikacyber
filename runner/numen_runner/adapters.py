@@ -5,14 +5,16 @@ from pathlib import Path
 PI_BASE = ["pi", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"]
 CODEX_TRIAGE = "Triage on Codex is refused until a no-tools restriction is verified for it"
 CODEX_ANALYSIS = "Analysis and CVE analysis on Codex are refused until a Codex mode without a shell is verified"
+CODEX_PATCH = "Patch drafting on Codex is refused until a Codex mode without a shell is verified"
 # Codex has no flag that removes its shell, so it cannot run the operations whose tools exclude one (ADR-0004).
-CODEX_REFUSED = {"commit_triage": CODEX_TRIAGE, "commit_analysis": CODEX_ANALYSIS, "cve_analysis": CODEX_ANALYSIS}
+CODEX_REFUSED = {"commit_triage": CODEX_TRIAGE, "commit_analysis": CODEX_ANALYSIS, "cve_analysis": CODEX_ANALYSIS,
+                 "patch_drafting": CODEX_PATCH}
 
 
 def agent_argv(profile, schema_path="/workspace/schema.json", output_path="/workspace/final.json"):
     """Each operation's tools are fixed here by the flags that decide which tools exist, never by an
     approval list (ADR-0004): Triage gets no tools, Pi and Claude get no shell tool, Codex (whose
-    shell no flag removes) is refused for Triage, Analysis and CVE analysis, every other operation
+    shell no flag removes) is refused for Triage, Analysis, CVE analysis and patch drafting, every other operation
     writes only under outputs/, and only version_recipe reaches the target."""
     agent, model, effort = profile["agent"], profile["model_id"], profile.get("reasoning_effort")
     if agent == "codex" and profile.get("operation") in CODEX_REFUSED:

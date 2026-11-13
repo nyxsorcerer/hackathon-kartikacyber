@@ -97,6 +97,13 @@ def test_templates_list_their_sections_and_the_operations_using_them(system):
     assert items["commit_analysis"]["includes"] == ["attack-path", "bundle", "detection-rule", "rules"]
     assert items["detection-rule"]["used_by"] == ["commit_analysis"]
     assert items["audit-context"]["used_by"] == ["cve_analysis", "finding_artifacts"]
+    # Patch drafting (A08) starts from the shared rules only and renders within the runner's bound.
+    assert (items["patch_drafting"]["kind"], items["patch_drafting"]["includes"]) == ("operation", ["rules"])
+    patch = default("patch_drafting")
+    assert len(patch) < prompts.RENDERED_LIMIT
+    for part in ("/workspace/outputs/patch.diff", "a/ and b/ paths", "never anything under .git/",
+                 "set workflows to true", "Build and run nothing"):
+        assert part in patch, part
     assert not any(item["customized"] for item in items.values())
     # Sections come first, then operations.
     kinds = [item["kind"] for item in body["items"]]

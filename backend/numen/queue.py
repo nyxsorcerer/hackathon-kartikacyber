@@ -4,7 +4,7 @@ from datetime import timedelta
 from sqlalchemy import select, update
 from .models import AuditContext, Job, JobAttempt, JobEvent, VersionRecipe, now
 from .security import DomainError
-from .domain import event
+from .domain import event, remediation_job_ended
 
 # Runtime lifecycle milestones surfaced on the job timeline. A runtime event only selects which
 # of these messages is recorded: the wording is the application's own, because a workload reports
@@ -418,6 +418,9 @@ def recover(factory, broker):
             row.finished_at = now() if row.status in ("failed", "cancelled") else None
             if row.error and row.error.get("reconciliation_pending"):
                 row.error = {**row.error, "reconciliation_pending": False}
+            if row.finished_at:
+                remediation_job_ended(db, row, row.error or {
+                    "code": "cancelled", "message": "The job was cancelled", "retryable": False})
             row.progress = {"stage": "reconciled"}
             row.lease_owner, row.lease_until = None, None
             row.broker_run_id = None

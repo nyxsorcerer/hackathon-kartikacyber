@@ -913,3 +913,282 @@ it("offers no Lab and no generation for a Malicious change Finding", async () =>
     screen.queryByRole("region", { name: "Static Proof" }),
   ).not.toBeInTheDocument();
 });
+
+// A08: a ready patch whose diff carries markup, the Approval it needs, and the PR it opened.
+const hash = "d".repeat(64);
+const diff = [
+  "diff --git a/src/view.js b/src/view.js",
+  "index 1111111..2222222 100644",
+  "--- a/src/view.js",
+  "+++ b/src/view.js",
+  "@@ -1 +1 @@",
+  "-render('<script>alert(1)</script>');",
+  "+render(escape('<script>alert(1)</script>'));",
+  "",
+].join("\n");
+const draft = {
+  id: "rpr-1",
+  action: "patch",
+  status: "ready",
+  base_ref: "a".repeat(40),
+  diff,
+  diff_sha256: hash,
+  paths: ["src/view.js"],
+  flags: [],
+  summary: "Escape the rendered value",
+  error: null,
+  job_id: "job-draft",
+  created_at: at,
+  updated_at: at,
+};
+const remediable = {
+  ...detail,
+  source_commit_id: "commit-1",
+  own_repository: true,
+  remediation_actions: ["patch", "revert"],
+  remediation_prs: [draft],
+};
+function serveRemediation(
+  finding: Record<string, unknown>,
+  approve: () => Response,
+) {
+  const posted: { url: string; body: unknown }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith("/api/applications/"))
+        return new Response(JSON.stringify(application));
+      if (init?.method === "POST") {
+        posted.push({ url, body: JSON.parse(String(init.body)) });
+        return approve();
+      }
+      return new Response(JSON.stringify(finding));
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={["/findings/finding"]}>
+      <Routes>
+        <Route path="/findings/:id" element={<FindingDetail />} />
+        <Route path="*" element={<p>Navigated away</p>} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  return posted;
+}
+const accepted = () =>
+  new Response(
+    JSON.stringify({ job_id: "job-pr", status_url: "/api/jobs/job-pr" }),
+    { status: 202 },
+  );
+
+it("shows a draft Remediation PR diff as text with its hash and approves it with the password", async () => {
+  const opened = {
+    ...draft,
+    id: "rpr-2",
+    action: "revert",
+    status: "open",
+    flags: ["workflows"],
+    summary: null,
+    branch: "asset-monitor/aaaaaaa-revert",
+    pull_number: 7,
+    pull_url: "https://github.com/acme/portal/pull/7",
+  };
+  const posted = serveRemediation(
+    {
+      ...remediable,
+      remediation_prs: [draft, opened],
+      events: [
+        {
+          id: "e1",
+          created_at: at,
+          action: "approved",
+          approved: "remediation_pr",
+          remediation: "revert",
+          diff_sha256: hash,
+        },
+        {
+          id: "e2",
+          created_at: at,
+          action: "remediation_pr_opened",
+          remediation: "revert",
+          branch: "asset-monitor/aaaaaaa-revert",
+          pull_number: 7,
+          pull_url: "https://github.com/acme/portal/pull/7",
+        },
+        {
+          id: "e3",
+          created_at: at,
+          action: "remediation_pr_merged",
+          remediation: "revert",
+          merge_commit_sha: "e".repeat(40),
+        },
+      ],
+    },
+    accepted,
+  );
+  const panel = await screen.findByRole("region", { name: "Remediation PRs" });
+  const [patch, revert] = within(panel).getAllByRole("article");
+  // The diff is text exactly as it will be pushed: nothing in it is markup.
+  expect(patch.querySelector("pre")?.textContent).toBe(diff);
+  expect(document.querySelector("script")).toBeNull();
+  expect(within(patch).getByText(hash)).toBeInTheDocument();
+  expect(within(patch).getByText("Ready")).toBeInTheDocument();
+  expect(
+    within(patch).getByText("Escape the rendered value"),
+  ).toBeInTheDocument();
+  expect(
+    within(revert).getByText(/changes \.github\/workflows/),
+  ).toBeInTheDocument();
+  expect(
+    within(revert).getByText("asset-monitor/aaaaaaa-revert"),
+  ).toBeInTheDocument();
+  const link = within(revert).getByRole("link", { name: /Pull request #7/ });
+  expect(link).toHaveAttribute("href", "https://github.com/acme/portal/pull/7");
+  expect(link).toHaveAttribute("rel", "noreferrer");
+  // An opened PR is not approved again.
+  expect(
+    within(revert).queryByRole("button", { name: "Approve" }),
+  ).not.toBeInTheDocument();
+  const history = screen.getByRole("region", { name: "History" });
+  expect(
+    within(history).getByText("Approved · Remediation PR"),
+  ).toBeInTheDocument();
+  expect(
+    within(history).getByText("Remediation PR opened"),
+  ).toBeInTheDocument();
+  expect(
+    within(history).getByText("Remediation PR merged"),
+  ).toBeInTheDocument();
+
+  const user = userEvent.setup();
+  await user.click(within(patch).getByRole("button", { name: "Approve" }));
+  const dialog = await screen.findByRole("dialog");
+  expect(dialog).toHaveTextContent(hash);
+  const password = within(dialog).getByLabelText("Password");
+  expect(password).toHaveAttribute("type", "password");
+  await user.type(password, "test-password-long");
+  await user.click(within(dialog).getByRole("button", { name: "Approve" }));
+  await vi.waitFor(() =>
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+  );
+  expect(posted).toEqual([
+    {
+      url: "/api/findings/finding/remediation-prs/rpr-1/approvals",
+      body: { password: "test-password-long", diff_sha256: hash },
+    },
+  ]);
+});
+
+it("a refused Remediation PR Approval keeps the dialog", async () => {
+  const posted = serveRemediation(
+    remediable,
+    () =>
+      new Response(
+        JSON.stringify({
+          code: "approval_refused",
+          message: "The password is incorrect; nothing was approved",
+        }),
+        { status: 403 },
+      ),
+  );
+  const panel = await screen.findByRole("region", { name: "Remediation PRs" });
+  const user = userEvent.setup();
+  await user.click(within(panel).getByRole("button", { name: "Approve" }));
+  const dialog = await screen.findByRole("dialog");
+  await user.type(within(dialog).getByLabelText("Password"), "wrong-password");
+  await user.click(within(dialog).getByRole("button", { name: "Approve" }));
+  expect(
+    await within(dialog).findByText(
+      "The password is incorrect; nothing was approved",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  expect(screen.queryByText("Navigated away")).not.toBeInTheDocument();
+  expect(posted).toHaveLength(1);
+});
+
+it("without an Own repository Remediation PRs are skipped", async () => {
+  showFinding({
+    ...detail,
+    own_repository: false,
+    remediation_actions: [],
+    remediation_prs: [],
+  });
+  const panel = await screen.findByRole("region", { name: "Remediation PRs" });
+  expect(
+    within(panel).getByText(
+      "No Own repository: Remediation PR steps are skipped.",
+    ),
+  ).toBeInTheDocument();
+  expect(within(panel).queryAllByRole("button")).toEqual([]);
+});
+
+it("drafts a Remediation PR by hand and shows why a step failed", async () => {
+  const posted = serveRemediation(
+    {
+      ...remediable,
+      remediation_prs: [
+        {
+          ...draft,
+          status: "failed",
+          error: {
+            code: "github_write_token_required",
+            message: "Add a GitHub write token under Settings, Integrations.",
+          },
+        },
+        {
+          ...draft,
+          id: "rpr-2",
+          action: "revert",
+          status: "drafting",
+          diff: null,
+          diff_sha256: null,
+          base_ref: null,
+          paths: [],
+        },
+      ],
+    },
+    accepted,
+  );
+  const panel = await screen.findByRole("region", { name: "Remediation PRs" });
+  const [failed] = within(panel).getAllByRole("article");
+  expect(
+    within(failed).getByText(
+      "Add a GitHub write token under Settings, Integrations.",
+    ),
+  ).toBeInTheDocument();
+  // A failed PR step is approved again; a revert still drafting is not drafted twice.
+  expect(within(failed).getByRole("button", { name: "Approve" })).toBeEnabled();
+  expect(
+    within(panel).getByRole("button", { name: "Draft revert" }),
+  ).toBeDisabled();
+  await userEvent
+    .setup()
+    .click(within(panel).getByRole("button", { name: "Draft patch" }));
+  await vi.waitFor(() =>
+    expect(posted).toEqual([
+      {
+        url: "/api/findings/finding/remediation-prs",
+        body: { action: "patch" },
+      },
+    ]),
+  );
+});
+
+it("shows a diff's bidi and zero-width characters as visible escapes", async () => {
+  // Trojan Source: the comment's right-to-left override hides where the code really ends.
+  const tricky = "+check(user); /* \u202E } \u2066if (admin)\u2069 \u202C */\u200B\n";
+  serveRemediation(
+    { ...remediable, remediation_prs: [{ ...draft, diff: diff + tricky }] },
+    accepted,
+  );
+  const panel = await screen.findByRole("region", { name: "Remediation PRs" });
+  const text = panel.querySelector("pre")?.textContent ?? "";
+  expect(text).toContain(
+    "/* ⟨U+202E⟩ } ⟨U+2066⟩if (admin)⟨U+2069⟩ ⟨U+202C⟩ */⟨U+200B⟩",
+  );
+  expect(text).not.toMatch(/[\u200B\u202C\u202E\u2066\u2069]/);
+  expect(within(panel).getByText("Hidden characters")).toBeInTheDocument();
+  // The hash, and so the Approval, is still of the diff's own bytes.
+  expect(within(panel).getByText(hash)).toBeInTheDocument();
+});

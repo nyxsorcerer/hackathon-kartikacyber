@@ -395,9 +395,16 @@ export function Jobs() {
   );
 }
 function JobActions({ job, refresh }: { job: Job; refresh: () => void }) {
-  // A Lab is never retried: a new one needs a new Approval from its Finding.
+  // A Lab or Remediation PR is never retried: it needs a new Approval, and a
+  // draft is drafted again, from its Finding.
   const retryable =
-    ["failed", "cancelled"].includes(job.status) && job.kind !== "lab_run";
+    ["failed", "cancelled"].includes(job.status) &&
+    ![
+      "lab_run",
+      "remediation_pr",
+      "patch_drafting",
+      "remediation_draft",
+    ].includes(job.kind);
   return (
     <div className="inline-actions">
       {["queued", "running"].includes(job.status) && (

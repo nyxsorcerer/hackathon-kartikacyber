@@ -28,6 +28,7 @@ OPERATIONS = (
     "audit_orientation",
     "audit_function",
     "audit_synthesis",
+    "patch_drafting",
 )
 VARIABLES = {
     "operation": "The operation's name, such as commit_analysis.",
@@ -50,6 +51,7 @@ DESCRIPTIONS = {
     "audit_orientation": "Selects the significant functions an audit examines.",
     "audit_function": "Analyzes one selected function.",
     "audit_synthesis": "Combines the function analyses into the audit report.",
+    "patch_drafting": "Drafts the smallest fix for an Own-repository weakness as a diff, writing only to its outputs.",
 }
 SOURCE_LIMIT = 100_000
 # The runner accepts a prompt of 262144 characters, facts included.

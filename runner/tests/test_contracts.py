@@ -149,3 +149,14 @@ def test_codex_triage_is_refused():
             RunRequest(attempt_token="one", kind="agent", profile={**profile, "operation": operation})
     assert RunRequest(attempt_token="one", kind="agent", profile={**profile, "operation": "version_recipe"})
     assert RunRequest(attempt_token="one", kind="agent", profile={**profile, "agent": "pi", "provider_id": "deepseek"})
+
+
+def test_patch_drafting_refuses_codex():
+    """Patch drafting writes only its outputs and runs nothing (A08, ADR-0004), so Codex, whose shell
+    no flag removes, never runs it; Pi does, with a deadline."""
+    profile = {"agent": "codex", "operation": "patch_drafting", "model_id": "m", "credential": {"api_key": "k"}}
+    with pytest.raises(ValueError, match="Patch drafting on Codex is refused until a Codex mode without a shell is verified"):
+        RunRequest(attempt_token="one", kind="agent", profile=profile)
+    pi = RunRequest(attempt_token="one", kind="agent", limits={"timeout_seconds": 1200},
+                    profile={**profile, "agent": "pi", "provider_id": "deepseek"})
+    assert pi.bounds["timeout_seconds"] == 1200

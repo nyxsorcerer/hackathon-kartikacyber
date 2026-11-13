@@ -1,7 +1,9 @@
 import base64
 import hashlib
+import json
 from pathlib import Path
 
+import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
@@ -223,3 +225,154 @@ class FixtureBroker:
 
     def delete_credential(self, run_id):
         self.ingress_deleted.append(run_id)
+
+
+class Crash(BaseException):
+    """A worker that dies mid-request: run_once's `except Exception` never records it."""
+
+
+class FakeGitHub:
+    """The recorded GitHub API fixture at NUMEN_GITHUB_API_URL=http://github.fixture: the git data,
+    ref, pull request and commit listing endpoints of one repository, with in-memory state. It records each
+    request as (method, path, bearer token) and raises Crash once after the request that
+    `crash_after` = (method, path suffix) names, so that request's answer is lost."""
+
+    def __init__(self, repo="acme/shop", default_branch="main"):
+        self.repo, self.default_branch, self.crash_after = repo, default_branch, None
+        self.requests, self.blobs, self.trees, self.commits, self.refs, self.pulls = [], {}, {}, {}, {}, []
+        self.history = []  # the default branch's commits that polling lists, newest first
+
+    def push(self, *shas):
+        """Puts commits on the default branch, oldest first."""
+        for sha in shas:
+            self.history.insert(0, sha)
+
+    def blob(self, data):
+        sha = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()  # git's object id
+        self.blobs[sha] = data
+        return sha
+
+    def tree(self, entries):
+        sha = hashlib.sha1(json.dumps(sorted(entries.items())).encode()).hexdigest()
+        self.trees[sha] = entries
+        return sha
+
+    def commit(self, sha, files, modes=None):
+        """Seeds commit `sha`, whose tree holds `files` ({path: bytes}) with mode 100644 unless
+        `modes` ({path: mode}) says otherwise."""
+        tree = self.tree({p: {"path": p, "mode": (modes or {}).get(p, "100644"), "type": "blob", "sha": self.blob(d)}
+                          for p, d in files.items()})
+        self.commits[sha] = {"sha": sha, "tree": {"sha": tree}, "message": "Base", "parents": []}
+
+    def files(self, sha):
+        """{path: (mode, bytes)} of commit `sha`'s tree."""
+        return {p: (e["mode"], self.blobs[e["sha"]]) for p, e in self.trees[self.commits[sha]["tree"]["sha"]].items()}
+
+    def writes(self):
+        return [(method, path) for method, path, _ in self.requests if method != "GET"]
+
+    def __call__(self, request):
+        self.requests.append((request.method, request.url.path,
+                              request.headers.get("authorization", "").removeprefix("Bearer ")))
+        prefix = f"/repos/{self.repo}"
+        path = request.url.path
+        response = (self.answer(request.method, path.removeprefix(prefix), request)
+                    if path == prefix or path.startswith(prefix + "/") else None)
+        if self.crash_after and request.method == self.crash_after[0] and path.endswith(self.crash_after[1]):
+            self.crash_after = None
+            raise Crash(f"worker died after {request.method} {path}")
+        return response if response is not None else httpx.Response(404, json={"message": "Not Found"})
+
+    def answer(self, method, path, request):
+        body = json.loads(request.content) if request.content else {}
+        if (method, path) == ("GET", ""):
+            return httpx.Response(200, json={"full_name": self.repo, "default_branch": self.default_branch})
+        if method == "GET" and path.startswith("/git/ref/"):
+            ref = path.removeprefix("/git/ref/")
+            if ref in self.refs:
+                return httpx.Response(200, json={"ref": f"refs/{ref}", "object": {"type": "commit", "sha": self.refs[ref]}})
+        if method == "GET" and path.startswith("/git/commits/"):
+            sha = path.removeprefix("/git/commits/")
+            if sha in self.commits:
+                return httpx.Response(200, json=self.commits[sha])
+        if method == "GET" and path.startswith("/git/trees/"):
+            sha = path.removeprefix("/git/trees/")
+            if sha in self.trees:
+                return httpx.Response(200, json={"sha": sha, "tree": list(self.trees[sha].values()), "truncated": False})
+        if (method, path) == ("POST", "/git/blobs"):
+            return httpx.Response(201, json={"sha": self.blob(base64.b64decode(body["content"]))})
+        if (method, path) == ("POST", "/git/trees"):
+            entries = dict(self.trees[body["base_tree"]])
+            for entry in body["tree"]:
+                if entry["sha"] is None:
+                    del entries[entry["path"]]
+                else:
+                    entries[entry["path"]] = entry
+            return httpx.Response(201, json={"sha": self.tree(entries)})
+        if (method, path) == ("POST", "/git/commits"):
+            sha = hashlib.sha1(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            self.commits[sha] = {"sha": sha, "tree": {"sha": body["tree"]}, "message": body["message"],
+                                 "parents": [{"sha": p} for p in body["parents"]]}
+            return httpx.Response(201, json=self.commits[sha])
+        if (method, path) == ("POST", "/git/refs"):
+            ref = body["ref"].removeprefix("refs/")
+            if ref in self.refs:
+                return httpx.Response(422, json={"message": "Reference already exists"})
+            self.refs[ref] = body["sha"]
+            return httpx.Response(201, json={"ref": body["ref"], "object": {"type": "commit", "sha": body["sha"]}})
+        if (method, path) == ("GET", "/pulls"):
+            owner = self.repo.split("/")[0]
+            return httpx.Response(200, json=[p for p in self.pulls
+                                             if f"{owner}:{p['head']['ref']}" == request.url.params.get("head")])
+        if method == "GET" and path.startswith("/pulls/"):
+            number = int(path.removeprefix("/pulls/"))
+            if 0 < number <= len(self.pulls):
+                return httpx.Response(200, json=self.pulls[number - 1])
+        # Polling the default branch: its commit list, a comparison and each commit's detail.
+        if (method, path) == ("GET", "/commits"):
+            etag = f'"{hashlib.sha1(json.dumps(self.history).encode()).hexdigest()}"'
+            if request.headers.get("if-none-match") == etag:
+                return httpx.Response(304)
+            return httpx.Response(200, headers={"etag": etag}, json=[{"sha": s} for s in self.history]
+                                  if request.url.params.get("page", "1") == "1" else [])
+        if method == "GET" and path.startswith("/compare/"):
+            base, head = path.removeprefix("/compare/").split("...")
+            unseen = self.history[self.history.index(head):self.history.index(base)][::-1]
+            return httpx.Response(200, json={"status": "ahead", "total_commits": len(unseen),
+                                             "commits": [{"sha": s} for s in unseen]})
+        if method == "GET" and path.startswith("/commits/") and path.removeprefix("/commits/") in self.history:
+            sha = path.removeprefix("/commits/")
+            older = self.history[self.history.index(sha) + 1:][:1]
+            return httpx.Response(200, json={
+                "sha": sha, "parents": [{"sha": p} for p in older],
+                "commit": {"message": "Change", "author": {"name": "Fixture"}, "committer": {"date": "2026-11-01T00:00:00Z"}},
+                "files": [{"filename": "main.py", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b"}]})
+        if (method, path) == ("POST", "/pulls"):
+            if f"heads/{body['head']}" not in self.refs:
+                return httpx.Response(422, json={"message": "Validation Failed"})
+            number = len(self.pulls) + 1
+            self.pulls.append({
+                "number": number, "html_url": f"https://github.com/{self.repo}/pull/{number}", "state": "open",
+                "draft": body.get("draft", False), "title": body["title"], "body": body["body"],
+                "head": {"ref": body["head"], "sha": self.refs[f"heads/{body['head']}"]},
+                "base": {"ref": body["base"]}, "merged": False, "merge_commit_sha": None,
+            })
+            return httpx.Response(201, json=self.pulls[-1])
+        return None
+
+
+@pytest.fixture
+def github(monkeypatch):
+    """FakeGitHub behind every Sources client the worker builds."""
+    from numen.sources import Sources
+
+    monkeypatch.setenv("NUMEN_GITHUB_API_URL", "http://github.fixture")
+    fake = FakeGitHub()
+    original = Sources.__init__
+
+    def setup(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.client = httpx.Client(transport=httpx.MockTransport(fake))
+
+    monkeypatch.setattr(Sources, "__init__", setup)
+    return fake

@@ -43,6 +43,15 @@ def github_token_required():
     )
 
 
+def github_write_token_required():
+    return DomainError(
+        "github_write_token_required",
+        "Add a GitHub write token (fine-grained; Contents and Pull requests: read and write; Own "
+        "repositories only) under Settings, Integrations. Remediation PRs are not opened without it.",
+        422,
+    )
+
+
 def release_branch_candidates(version):
     """The branch names that may carry the release line of `version`, in matching order."""
     match = re.match(r"v?(\d+)(?:\.(\d+))?", version)
@@ -161,11 +170,35 @@ class Sources:
         )
         return None if response is None else response.text
 
+    def send(self, method, url, body):
+        """One GitHub write request (A08), never retried: a lost answer is found again by its
+        branch name. Returns GitHub's JSON answer."""
+        self.heartbeat()
+        try:
+            response = self.client.request(method, url, json=body, headers=self.github_headers())
+        except httpx.HTTPError as exc:
+            raise DomainError("github_unavailable", "GitHub could not be reached; approve again to retry", 502,
+                              retryable=True) from exc
+        if response.status_code >= 400:
+            try:
+                detail = str(response.json().get("message") or "")[:300]
+            except (ValueError, AttributeError):
+                detail = ""
+            raise DomainError("github_write_failed", f"GitHub answered {method} {url.removeprefix(self.github)} "
+                              f"with HTTP {response.status_code}: {detail}", 502, retryable=response.status_code >= 500)
+        return response.json()
+
+    def npm_version(self, name, version):
+        """The npm registry's metadata of `version` (the latest without one), or None when the
+        registry does not have it."""
+        response = self.find(f"{self.npm}/{quote(name, safe='@')}/{quote(version or 'latest', safe='')}")
+        return None if response is None else response.json()
+
     def npm_repository(self, name, version):
         """The repository field of the npm metadata of `version` (the latest without one), ""
         when it has none, or None when the registry does not have it."""
-        response = self.find(f"{self.npm}/{quote(name, safe='@')}/{quote(version or 'latest', safe='')}")
-        return None if response is None else response.json().get("repository") or ""
+        data = self.npm_version(name, version)
+        return None if data is None else data.get("repository") or ""
 
     def packagist_repository(self, name, version):
         """source.url of the Packagist entry for `version` (else the newest), "" when it has none,

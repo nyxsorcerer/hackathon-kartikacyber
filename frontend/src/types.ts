@@ -13,6 +13,7 @@ export const operations = [
   "audit_context",
   "cve_analysis",
   "finding_artifacts",
+  "patch_drafting",
 ] as const;
 export type Operation = (typeof operations)[number];
 export const operationNames: Record<Operation, string> = {
@@ -22,6 +23,7 @@ export const operationNames: Record<Operation, string> = {
   audit_context: "Audit context",
   cve_analysis: "CVE analysis",
   finding_artifacts: "Finding artifacts",
+  patch_drafting: "Patch drafting",
 };
 const unknownRecord = z.record(z.string(), z.unknown());
 export const modelSchema = z.object({
@@ -405,6 +407,28 @@ export const cleanupReportSchema = z.object({
   secrets: z.array(z.string()),
 });
 export type CleanupReport = z.infer<typeof cleanupReportSchema>;
+/** A Remediation PR (A08): its validated draft diff, its Approval and the pull request it opened. */
+export const remediationPRSchema = z.object({
+  id: z.string(),
+  action: z.enum(["patch", "revert", "pin", "bump"]),
+  /** drafting, waiting_for_cap, draft_failed, ready, approved, failed, open, merged or closed */
+  status: z.string(),
+  base_ref: z.string().nullable().optional(),
+  branch: z.string().nullable().optional(),
+  diff: z.string().nullable().optional(),
+  diff_sha256: z.string().nullable().optional(),
+  paths: z.array(z.string()).default([]),
+  flags: z.array(z.string()).default([]),
+  summary: z.string().nullable().optional(),
+  error: z.unknown().optional(),
+  job_id: z.string().nullable().optional(),
+  pull_number: z.number().nullable().optional(),
+  pull_url: z.string().nullable().optional(),
+  merge_commit_sha: z.string().nullable().optional(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+export type RemediationPR = z.infer<typeof remediationPRSchema>;
 export const findingSchema = z.object({
   id: z.string(),
   application_id: z.string(),
@@ -439,6 +463,11 @@ export const findingSchema = z.object({
   malicious_change: z.boolean().default(false),
   static_proof: staticProofSchema.nullable().optional(),
   cleanup_report: cleanupReportSchema.nullable().optional(),
+  /** Without one, the Remediation PR steps are skipped (A06). */
+  own_repository: z.boolean().default(false),
+  /** The drafts the Operator may start by hand: patch and/or revert. */
+  remediation_actions: z.array(z.string()).default([]),
+  remediation_prs: z.array(remediationPRSchema).default([]),
   created_at: z.string(),
   updated_at: z.string(),
 });

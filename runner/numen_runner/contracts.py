@@ -36,7 +36,7 @@ HERDR_HOSTS = ["herdr.dev"]
 # bound to the PKCE verifier held by the login process, but are still never logged.
 LOGIN_CODE = r"[A-Za-z0-9._~+/=#-]{8,2048}"
 LOGIN_CODE_BYTES = 4096
-OPERATIONS = {"commit_triage", "commit_analysis", "version_recipe", "audit_context", "cve_analysis", "finding_artifacts"}
+OPERATIONS = {"commit_triage", "commit_analysis", "version_recipe", "audit_context", "cve_analysis", "finding_artifacts", "patch_drafting"}
 
 
 def safe_path(path: str) -> str:

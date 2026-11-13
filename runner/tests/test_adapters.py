@@ -91,6 +91,25 @@ def test_tool_profiles_are_fixed_per_operation_without_a_shell_or_allowed_tools(
     assert "--no-builtin-tools" in pi
 
 
+def test_patch_drafting_tools(tmp_path):
+    """Patch drafting reads the Own checkout and writes only outputs/patch.diff (A08): Pi and Claude get
+    the fixed non-Triage profile with no shell, and Codex is refused (ADR-0004)."""
+    schema = tmp_path / "schema.json"
+    schema.write_text('{"type":"object"}')
+    profile = {"model_id":"m","auth_type":"api_key","reasoning_effort":None,"operation":"patch_drafting","enabled_plugins":[]}
+    with pytest.raises(ValueError, match="Patch drafting on Codex is refused"):
+        agent_argv({**profile, "agent":"codex", "provider_id":"openai"}, str(schema))
+    claude = agent_argv({**profile, "agent":"claude", "provider_id":"claude"}, str(schema))
+    pi = agent_argv({**profile, "agent":"pi", "provider_id":"deepseek"}, str(schema))
+    for args in (claude, pi):
+        assert "--allowedTools" not in args and "--dangerously-skip-permissions" not in args
+        assert not any(word in arg for arg in args for word in ("Bash", "numen_shell", "target_fetch", "DOCKER_HOST"))
+    assert claude[claude.index("--tools") + 1] == "Read,Grep,Glob,Write,Edit"
+    assert json.loads(claude[claude.index("--settings") + 1]) == {"permissions": {"allow": ["Edit(//workspace/outputs/**)"]}}
+    assert "--restricted" in claude and "--bare" not in claude
+    assert pi[pi.index("--tools") + 1] == "numen_read,numen_list,numen_write" and "--no-builtin-tools" in pi
+
+
 def test_triage_is_offered_no_tools():
     """Triage is one print-mode call with no tools at all; application code validates its reply."""
     base = {"model_id":"m", "reasoning_effort":"high", "operation":"commit_triage", "enabled_plugins":[]}

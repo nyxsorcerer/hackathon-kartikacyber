@@ -15,7 +15,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from sqlalchemy import select
 from yaml import YAMLError
-from . import artifacts, cves, dependencies, detection, domain, prompts
+from . import artifacts, cves, dependencies, detection, domain, prompts, remediation
 from . import fingerprints as fingerprinting
 from .models import (
     Account,
@@ -35,6 +35,7 @@ from .models import (
     Application,
     ApplicationCVE,
     ApplicationRepository,
+    RemediationPR,
     Repository,
     Snapshot,
     Transcript,
@@ -47,7 +48,7 @@ from .schemas import (
 )
 from .security import DomainError, fingerprint, retry_delay
 from .prefilter import MANIFESTS, prefilter
-from .sources import Sources, release_branch_candidates
+from .sources import Sources, github_write_token_required, release_branch_candidates
 
 
 EVIDENCE_SCHEMA = {"type": "array", "items": {"type": "object"}}
@@ -66,6 +67,8 @@ VERDICT_REVIEW = {
 }
 # Analysis and CVE analysis deadline (A04). An expired one fails the job, never decides Unrelated.
 ANALYSIS_SECONDS = 1800
+# Patch drafting deadline (A08).
+PATCH_SECONDS = 1200
 SCHEMAS = {
     # Triage decides only whether a change deserves Analysis (A03).
     "commit_triage": {
@@ -179,6 +182,16 @@ SCHEMAS = {
         "type": "object",
         "required": ["summary", "open_questions"],
         "properties": {"summary": {"type": "string"}, "open_questions": {"type": "array"}},
+    },
+    # The patch itself is outputs/patch.diff, which application code validates (A08).
+    "patch_drafting": {
+        "type": "object",
+        "required": ["summary"],
+        "properties": {
+            "summary": {"type": "string", "minLength": 1, "maxLength": 4000},
+            # The fix is in .github/workflows, which a patch may change only when flagged.
+            "workflows": {"type": "boolean"},
+        },
     },
 }
 for _schema in SCHEMAS.values():
@@ -357,6 +370,20 @@ class Workflows:
             if account.credential:
                 keys[account.provider] = self.vault.decrypt(account.credential).get("api_key")
         client = Sources(self.config, keys.get("github"), keys.get("nvd"), self.context.heartbeat)
+        self.source_clients.append(client)
+        return client
+
+    def write_client(self, db):
+        """A GitHub client holding the write token (A08): the Remediation PR step's writes, and the
+        merge check's read of an open Remediation PR (a fine-grained read token cannot read pull
+        requests). It never lists commits or snapshots a repository, and never reaches an agent."""
+        account = db.scalars(select(Account).where(
+            Account.provider == "github_write", Account.credential.is_not(None))).first()
+        key = account and self.vault.decrypt(account.credential).get("api_key")
+        if not key:
+            raise github_write_token_required()
+        self.context.secrets.append(key)
+        client = Sources(self.config, key, None, self.context.heartbeat)
         self.source_clients.append(client)
         return client
 
@@ -625,7 +652,8 @@ class Workflows:
         )
         if (
             owner
-            and job.kind not in ("lab_run", "detection_rule")
+            # Their rows pin what they act on: the Finding's revision, or the draft's base_ref.
+            and job.kind not in ("lab_run", "detection_rule", "patch_drafting", "remediation_draft", "remediation_pr")
             and job.input.get("source_generation") != owner.source_generation
         ):
             raise DomainError(
@@ -687,6 +715,17 @@ class Workflows:
             polled[name] = source.github_commits(
                 repository, name, state.get("cursor"), state.get("etag")
             )
+        # Each open Remediation PR's state is read on every check (A08), with the write token: its
+        # merge commit may have arrived in an earlier poll whose read failed. A failed read is kept
+        # on its row and never fails the check.
+        opened = db.scalars(select(RemediationPR).where(
+            RemediationPR.repository_id == repository.id, RemediationPR.status == "open")).all()
+        pulls = {}
+        for row in opened:
+            try:
+                pulls[row.id] = remediation.pull_state(self.write_client(db), repository, row.data["pull_number"])
+            except DomainError as exc:
+                pulls[row.id] = {"error": exc.as_dict()}
         self.context.fence(db)
         db.refresh(repository, with_for_update=True)
         if job.input.get("source_generation") != repository.source_generation:
@@ -711,6 +750,8 @@ class Workflows:
         watched = {name: {"cursor": cursor, "etag": tag} for name, (cursor, _, tag) in polled.items()}
         if etag is not None and etag == captured_etag and watched == repository.watched_branches:
             # 304 Not Modified on every branch: nothing advances and nothing is queued.
+            for row in opened:
+                self.pull_request_state(db, repository, row, pulls[row.id])
             return {"source_ref": head, "imported": 0, "commit_ids": [], "baseline": False, "not_modified": True}
         # A revision already imported from another branch is skipped.
         imported = self.import_commits(db, repository, records)
@@ -718,6 +759,8 @@ class Workflows:
             imported += self.import_commits(
                 db, repository, [{**record, "branch": name} for record in branch_records]
             )
+        for row in opened:
+            self.pull_request_state(db, repository, row, pulls[row.id])
         repository.watched_branches = watched
         changed = repository.cursor != head
         repository.cursor, repository.etag = head, etag
@@ -1465,6 +1508,13 @@ class Workflows:
                 findings[target.id] = self.publish_finding_bundle(
                     db, job, target, finding, commit.revision, static, {}, require_complete=False
                 )
+            # The Own column's Remediation PR (A06, A08): a patch for Vulnerability introduced, the
+            # Cure's revert for a Malicious change. An Upstream Verdict drafts its pin or bump with
+            # Exposure (Phase 7).
+            action = ("revert" if verdict == "Malicious change"
+                      else "patch" if verdict == "Vulnerability introduced" and not malicious else None)
+            if action and getattr(domain.own_repository(db, target), "id", None) == repository.id:
+                domain.draft_remediation(db, target, finding, commit.id, action, commit.revision, automatic=True)
         own = findings.get(application.id, {"finding_id": None})
         analysis.result = {**result, "finding_id": own["finding_id"]}
         return {**response, **own, "finding_ids": [f["finding_id"] for f in findings.values()]}
@@ -2516,8 +2566,167 @@ class Workflows:
         return {"finding_id": finding.id, "artifact_revision": revision, "status": status, "checks": checks,
                 "current": current}
 
+    def patch_drafting(self, db, job, application):
+        """Drafts a patch Remediation PR (A08) in a one-shot agent run with the fixed tool profile:
+        it reads the Own repository at its default-branch head and writes only outputs/patch.diff.
+        The write token is never among its inputs: agent() refuses every stored credential."""
+        row = domain.get(db, RemediationPR, job.input["remediation_pr_id"])
+        finding = domain.get(db, Finding, row.finding_id)
+        commit = domain.get(db, Commit, row.subject)
+        repository = domain.get(db, Repository, row.repository_id)
+        base = repository.cursor or commit.revision
+        _, tree = self.snapshot(db, repository, base)
+        files = {**source_inputs(tree), **commit_inputs(db, commit)}
+        report = db.scalar(select(Artifact).where(
+            Artifact.resource_type == "analysis",
+            Artifact.resource_id == (finding.data.get("source_analysis_id") or ""),
+            Artifact.path == "report.md",
+        ))
+        if report:
+            files["analysis-report.md"] = artifacts.read_file(self.config.artifact_root, report)
+        result, outputs, _ = self.agent(db, job, "patch_drafting", files, {
+            "base_ref": base,
+            "commit_revision": commit.revision,
+            "verdict": commit.verdict,
+            "source_url": repository.source_url,
+            "source_path": repository.source_path,
+        }, limits={"timeout_seconds": PATCH_SECONDS})
+        if not outputs.get("patch.diff"):
+            raise DomainError("missing_patch", "Patch drafting completed without patch.diff", 422)
+        return self.draft_ready(db, job, row, repository, base, tree, outputs["patch.diff"],
+                                result.get("workflows", False), result["summary"])
+
+    def remediation_draft(self, db, job, application):
+        """Drafts a revert (the Cure's Remediation PR), pin or bump in application code (A08), on
+        the Own repository's default-branch head. No agent runs."""
+        row = domain.get(db, RemediationPR, job.input["remediation_pr_id"])
+        repository = domain.get(db, Repository, row.repository_id)
+        base = repository.cursor
+        _, head = self.snapshot(db, repository, base)
+        if row.action == "revert":
+            commit = domain.get(db, Commit, row.subject)
+            parents = commit.data.get("parent_revisions")
+            if parents is None:
+                parents = self.source_client(db).commit_parents(repository, commit.revision)
+            if not parents:
+                raise DomainError("revert_unavailable", "A root commit has no parent tree to revert to", 422)
+            commit_tree, parent_tree = (self.snapshot(db, repository, ref)[1] for ref in (commit.revision, parents[0]))
+            # A snapshot holds no binary media, symlinks or other non-regular files, so a change
+            # to one of them is never reverted: the draft fails rather than revert only part.
+            missed = sorted({p for f in commit.data.get("files", []) for p in (f.get("path"), f.get("previous_path"))
+                             if p and p not in commit_tree and p not in parent_tree})
+            if missed:
+                raise DomainError("revert_incomplete", "The revert cannot restore " + ", ".join(missed[:20])
+                                  + " (binary media, symlinks and other files snapshots leave out); revert the "
+                                  "commit by hand", 422)
+            # git's own diff from the commit's tree back to its first parent's. The revert is the
+            # fix, so a .github/workflows change is allowed and flagged.
+            diff = remediation.tree_diff(commit_tree, parent_tree)
+            summary = f"Reverts {commit.revision[:7]} to its parent {parents[0][:7]}" + (
+                f", in {repository.source_path} only: changes outside it are not reverted"
+                if repository.source_path else "")
+            return self.draft_ready(db, job, row, repository, base, head, diff, True, summary)
+        # A pin or bump; Phase 7 and 8 decide when, and record row.data.dependency.
+        dependency = row.data.get("dependency") or {}
+        ecosystem, name, version = dependency["ecosystem"], dependency["name"], dependency["version"]
+        root = (repository.source_path or "").strip("/")
+        at = root + "/" if root else ""
+        names = [remediation.MANIFESTS[ecosystem][0]] + (["package-lock.json"] if ecosystem == "npm" else [])
+        current = {f: head[at + f] for f in names if at + f in head}
+        dist = None
+        if ecosystem == "npm":
+            found = self.source_client(db).npm_version(name, version)
+            if found is None:
+                raise DomainError("dependency_version_unknown", f"The npm registry has no {name}@{version}", 422)
+            dist = found.get("dist")
+        edited = remediation.dependency_files(current, ecosystem, name, version, row.action, dist)
+        diff = remediation.tree_diff({at + p: d for p, d in current.items()}, {at + p: d for p, d in edited.items()})
+        summary = f"{'Pins' if row.action == 'pin' else 'Bumps'} {name} to {version}"
+        return self.draft_ready(db, job, row, repository, base, head, diff, False, summary)
+
+    def draft_ready(self, db, job, row, repository, base, tree, diff, workflows, summary):
+        """Validates a drafted diff against the base tree and keeps git's own diff of the result
+        as the draft to approve, so the approved diff is exactly what is pushed (A08). A diff that
+        fails is refused here, before any GitHub call, and the draft fails naming the check."""
+        if not diff:
+            raise DomainError("nothing_to_change", "The draft changes nothing on the default-branch head", 422)
+        applied = remediation.apply_diff(diff, tree, workflows=workflows, prefix=repository.source_path)
+        canonical = remediation.tree_diff({p: tree[p] for p in applied["paths"] if p in tree}, applied["changed"])
+        if not canonical:
+            raise DomainError("nothing_to_change", "The draft changes nothing on the default-branch head", 422)
+        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        self.context.fence(db)
+        db.refresh(row, with_for_update=True)
+        # A later draft replaced this one: its result stays on its job only.
+        current = row.status == "drafting" and row.data.get("job_id") == job.id
+        if current:
+            row.status, row.base_ref, row.diff, row.diff_sha256 = "ready", base, canonical, digest
+            row.data = {**row.data, "summary": summary, "paths": applied["paths"], "flags": applied["flags"],
+                        "error": None}
+            row.updated_at = now()
+        return {"remediation_pr_id": row.id, "action": row.action, "base_ref": base, "diff_sha256": digest,
+                "current": current}
+
+    def remediation_pr(self, db, job, application):
+        """Opens the approved Remediation PR (A08) as a draft pull request on the Own repository,
+        from exactly the approved diff, with the write token. Its title, body and commit message
+        are fixed application text: no agent output reaches GitHub."""
+        row = domain.get(db, RemediationPR, job.input["remediation_pr_id"])
+        repository = domain.get(db, Repository, row.repository_id)
+        if getattr(domain.own_repository(db, application), "id", None) != repository.id:
+            raise DomainError("not_own_repository", "A Remediation PR is opened only on the Application's Own "
+                              "repository", 409)
+        if row.status != "approved" or row.diff_sha256 != job.input["diff_sha256"]:
+            raise DomainError("input_changed", "The draft changed after its Approval; review it and approve again", 409)
+        # Applied again before the first GitHub request: a diff that no longer applies goes nowhere.
+        _, tree = self.snapshot(db, repository, row.base_ref)
+        applied = remediation.apply_diff(row.diff, tree, workflows="workflows" in (row.data.get("flags") or []),
+                                         prefix=repository.source_path)
+        revision = row.data["revision"]
+        title = f"Asset Monitor {row.action} of {revision[:7]}"
+        link = domain.settings(db).data.get("dashboard_url", "").rstrip("/") + f"/findings/{row.finding_id}"
+        body = (f"{title}, opened after the Operator's Approval of this exact diff. Review it before "
+                "merging: Asset Monitor never merges." + (f"\n\nFinding: {link}" if link.startswith("http") else ""))
+        message = f"{title}\n\nApproved diff SHA-256: {row.diff_sha256}"
+        opened = remediation.open_pull_request(self.write_client(db), repository,
+                                               remediation.branch_name(revision, row.action), row.base_ref,
+                                               tree, applied, title, body, message)
+        self.context.fence(db)
+        row.status, row.data, row.updated_at = "open", {**row.data, **opened, "error": None}, now()
+        db.add(Action(resource_type="finding", resource_id=row.finding_id, data={
+            "action": "remediation_pr_opened", "remediation": row.action, "remediation_pr_id": row.id,
+            "diff_sha256": row.diff_sha256, **opened}))
+        return {"remediation_pr_id": row.id, **opened}
+
+    def pull_request_state(self, db, repository, row, state):
+        """Applies an open Remediation PR's state, read by a source check, under its fence (A08).
+        Merged, once its merge commit (a merge, squash or last rebased commit) is a commit of this
+        repository's default branch, the row is merged and its Finding Remediated; closed without
+        merging, the row is closed and the Finding unchanged."""
+        db.refresh(row, with_for_update=True)
+        if row.status != "open":
+            return
+        merge = state.get("merged") and state.get("merge_commit_sha")
+        if merge and db.scalar(select(Commit.id).where(
+                Commit.repository_id == repository.id, Commit.source_generation == repository.source_generation,
+                Commit.revision == merge)):
+            row.status, row.updated_at = "merged", now()
+            row.data = {**row.data, "merge_commit_sha": merge, "error": None}
+            db.add(Action(resource_type="finding", resource_id=row.finding_id, data={
+                "action": "remediation_pr_merged", "remediation": row.action, "remediation_pr_id": row.id,
+                "pull_url": row.data["pull_url"], "merge_commit_sha": merge}))
+            # A Dismissed or Remediated Finding stays as it is.
+            domain.transition_finding(db, domain.get(db, Finding, row.finding_id), "remediated", {
+                "by": "remediation_pr", "remediation_pr_id": row.id, "pull_request": row.data["pull_url"],
+                "merge_commit": merge})
+        elif state.get("state") == "closed" and not state.get("merged"):
+            row.status, row.updated_at = "closed", now()
+            row.data = {**row.data, "error": None}
+        elif row.data.get("error") != state.get("error"):
+            row.data = {**row.data, "error": state.get("error")}
+
     def account_capabilities(self, db, job, application):
-        if domain.get(db, Account, job.input["account_id"]).provider in ("github", "nvd", "jev"):
+        if domain.get(db, Account, job.input["account_id"]).provider in ("github", "github_write", "nvd", "jev"):
             return self.account_check(db, job, application)
         account = domain.get(db, Account, job.input["account_id"])
         if account.revision != job.input["credential_revision"]:
@@ -2616,7 +2825,7 @@ class Workflows:
 
     def account_check(self, db, job, application):
         account = domain.get(db, Account, job.input["account_id"])
-        if account.provider not in ("github", "nvd", "jev"):
+        if account.provider not in ("github", "github_write", "nvd", "jev"):
             return self.account_capabilities(db, job, application)
         if not account.credential:
             raise DomainError(
@@ -2624,7 +2833,7 @@ class Workflows:
             )
         key = self.vault.decrypt(account.credential).get("api_key")
         source = self.source_client(db)
-        if account.provider == "github":
+        if account.provider in ("github", "github_write"):
             source.get(source.github + "/user", headers={"Authorization": f"Bearer {key}"})
         elif account.provider == "nvd":
             source.get(source.nvd, {"resultsPerPage": 1}, {"apiKey": key})

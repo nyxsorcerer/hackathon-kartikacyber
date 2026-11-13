@@ -264,6 +264,25 @@ function successSummary(job: Job): {
           }
         : { summary: "Detection rule validated", facts };
     }
+    case "patch_drafting":
+    case "remediation_draft": {
+      const hash = text(r, "diff_sha256");
+      if (hash) facts.push(`Diff SHA-256 ${hash.slice(0, 12)}…`);
+      return field(r, "current") === false
+        ? { summary: "Drafted; a later draft replaced it", facts }
+        : {
+            summary: `${humanize(text(r, "action") || "Remediation PR")} drafted: ready for Approval`,
+            facts,
+          };
+    }
+    case "remediation_pr": {
+      const branch = text(r, "branch");
+      if (branch) facts.push(`Branch ${branch}`);
+      return {
+        summary: `Opened draft pull request #${count(r, "pull_number") ?? "?"}`,
+        facts,
+      };
+    }
     case "notification": {
       const status = text(r, "status");
       return status === "delivered"
@@ -355,11 +374,17 @@ const failureHints: Record<string, string> = {
     "Triage cannot run on Codex. Choose Pi, Claude or Jev for Triage in the Application settings.",
   analysis_codex_unsupported:
     "Analysis and CVE analysis cannot run on Codex, which always has a shell. Choose Pi or Claude Code for this operation in the Application settings or the default profiles.",
+  github_write_token_required:
+    "Add a GitHub write token under Settings → Integrations, then approve again.",
   verdict_not_allowed:
     "Served content can only be Malicious change, Security hardening, Unrelated or Insufficient context. Retry the Analysis.",
 };
 const labFailure =
   "A Lab is not retried: fix the cause, then start a new Lab from its Finding with a new Approval.";
+const remediationFailure =
+  "A Remediation PR is not retried: fix the cause, then approve it again from its Finding.";
+const draftFailure =
+  "A draft is not retried: fix the cause, then draft it again from its Finding.";
 const analysisTimeout =
   "Analysis stopped at its 30-minute deadline. The change stays pending and is never read as Unrelated. Retry, or choose a faster model or lower reasoning effort.";
 const failureActions: Record<
@@ -403,6 +428,10 @@ const failureActions: Record<
           to: `/applications/${job.application_id}/edit`,
         }
       : undefined,
+  github_write_token_required: () => ({
+    label: "Open integrations",
+    to: "/settings?tab=integrations",
+  }),
   runtime_error: () => ({
     label: "Open connections",
     to: "/settings?tab=accounts",
@@ -453,12 +482,15 @@ export function jobOutcome(job: Job): JobOutcome {
     case "failed": {
       const code = text(job.error, "code") || "";
       const retryable = field(job.error, "retryable") === true;
-      // A Lab is never retried (A15): each one needs its own Approval.
+      // A Lab or Remediation PR is never retried (A15): each needs its own
+      // Approval. A Remediation PR draft is drafted again from its Finding.
       const lab = job.kind === "lab_run";
+      const pr = job.kind === "remediation_pr";
+      const draft = ["patch_drafting", "remediation_draft"].includes(job.kind);
       const facts = [
         ...(code ? [`Error code ${code}`] : []),
         ...(stage ? [`Stopped during ${humanize(stage).toLowerCase()}`] : []),
-        ...(lab
+        ...(lab || pr || draft
           ? []
           : [
               retryable
@@ -472,10 +504,12 @@ export function jobOutcome(job: Job): JobOutcome {
         hint:
           (lab
             ? labFailure
-            : job.kind === "commit_analysis" &&
-                ["timeout", "runtime_timeout"].includes(code)
-              ? analysisTimeout
-              : failureHints[code]) ||
+            : pr || draft
+              ? failureHints[code] || (pr ? remediationFailure : draftFailure)
+              : job.kind === "commit_analysis" &&
+                  ["timeout", "runtime_timeout"].includes(code)
+                ? analysisTimeout
+                : failureHints[code]) ||
           (retryable
             ? "This failure is temporary. Retry the job."
             : "Check the job's execution events for the cause before retrying."),

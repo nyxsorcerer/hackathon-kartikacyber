@@ -44,6 +44,7 @@ from .models import (
     Application,
     ApplicationCVE,
     ApplicationRepository,
+    RemediationPR,
     Repository,
     VersionRecipe,
     now,
@@ -68,6 +69,8 @@ from .schemas import (
     ApplicationInput,
     PromptInput,
     PromptPreviewInput,
+    RemediationApprovalInput,
+    RemediationDraftInput,
     RepositoryInput,
     RepositoryPatch,
     ReviewInput,
@@ -1058,9 +1061,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         )
 
     def remove_finding(db, row):
-        """Deletes the finding, its lab runs and their artifact records, keeping an audit record
-        of what was deleted. Returns the artifact revisions whose folders the caller removes once
-        the rows are gone."""
+        """Deletes the finding, its lab runs and their artifact records and its Remediation PRs,
+        keeping an audit record of what was deleted. Returns the artifact revisions whose folders
+        the caller removes once the rows are gone."""
         labs = list(db.scalars(select(LabRun.id).where(LabRun.finding_id == row.id)))
         owned = or_(
             and_(Artifact.resource_type == "finding", Artifact.resource_id == row.id),
@@ -1069,6 +1072,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         revisions = set(db.scalars(select(Artifact.revision).where(owned)))
         db.execute(delete(Artifact).where(owned))
         db.execute(delete(LabRun).where(LabRun.finding_id == row.id))
+        db.execute(delete(RemediationPR).where(RemediationPR.finding_id == row.id))
         action(db, "finding", row.id, {
             "action": "deleted",
             "title": row.title,
@@ -1214,6 +1218,63 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 key,
             )
         )
+
+    @router.post("/findings/{ident}/remediation-prs")
+    def draft_remediation_pr(ident: str, body: RemediationDraftInput, db=database_dependency):
+        """The Operator drafts a patch or revert Remediation PR by hand (A08), such as again after a
+        failed draft. Like a manual Analysis it is neither capped nor counted."""
+        finding = domain.get(db, Finding, ident)
+        application = domain.get(db, Application, finding.application_id)
+        actions = domain.remediation_actions(db, finding)
+        if body.action not in actions:
+            raise DomainError("remediation_unavailable", (
+                "No Own repository: Remediation PR steps are skipped"
+                if domain.own_repository(db, application) is None
+                else "A Malicious change gets a revert (the Cure), not a patch"
+                if actions
+                else "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a "
+                "patch or revert"
+            ), 422)
+        commit = db.get(Commit, finding.data["source_commit_id"])
+        row = domain.draft_remediation(db, application, finding, commit.id, body.action, commit.revision,
+                                       submitted=body.profile.model_dump() if body.profile else None)
+        return accepted(db.get(Job, row.data["job_id"]))
+
+    @router.post("/findings/{ident}/remediation-prs/{remediation_id}/approvals")
+    def approve_remediation_pr(
+        ident: str, remediation_id: str, request: Request, body: RemediationApprovalInput, db=database_dependency
+    ):
+        """The Approval of a draft Remediation PR (A08, A15): the Operator's password and the hash
+        of the diff they reviewed. Approving it again returns the same job, so one PR is opened."""
+        approval(request, db, body.password)
+        row = domain.get(db, RemediationPR, remediation_id)
+        db.refresh(row, with_for_update=True)
+        if row.finding_id != ident:
+            raise DomainError("not_found", "RemediationPR was not found", 404)
+        if row.status in ("approved", "open", "merged"):
+            return accepted(db.get(Job, row.data["job_id"]))
+        if row.status not in ("ready", "failed"):
+            raise DomainError("remediation_not_ready", f"This {row.action} is {row.status.replace('_', ' ')}; only a "
+                              "ready draft can be approved", 409)
+        if body.diff_sha256 != row.diff_sha256:
+            raise DomainError("diff_changed", "The draft changed since you reviewed it; review the new diff", 409)
+        application = domain.get(db, Application, row.application_id)
+        if getattr(domain.own_repository(db, application), "id", None) != row.repository_id:
+            raise DomainError("not_own_repository", "A Remediation PR is opened only on the Application's Own "
+                              "repository", 409)
+        # finding_id keeps the Finding from being deleted while the PR step runs.
+        job = domain.enqueue(db, "remediation_pr", application, {
+            "remediation_pr_id": row.id, "finding_id": row.finding_id, "diff_sha256": row.diff_sha256})
+        row.status, row.data, row.updated_at = "approved", {**row.data, "job_id": job.id, "error": None}, now()
+        action(db, "finding", row.finding_id, {
+            "action": "approved",
+            "approved": "remediation_pr",
+            "remediation": row.action,
+            "remediation_pr_id": row.id,
+            "diff_sha256": row.diff_sha256,
+            "job_id": job.id,
+        })
+        return accepted(job)
 
     @router.post("/findings/{ident}/lab-runs")
     def lab(
@@ -1426,6 +1487,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             raise DomainError("not_found", "Job was not found", 404)
         if row.status == "queued":
             row.status, row.finished_at = "cancelled", now()
+            domain.remediation_job_ended(db, row, {"code": "cancelled", "message": "The Operator cancelled the job",
+                                                   "retryable": False})
         elif row.status == "running":
             row.status = "cancelling"
         domain.event(db, row, "cancellation_requested", "Operator requested cancellation")
@@ -1443,6 +1506,15 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         if row.kind == "lab_run":
             raise DomainError(
                 "approval_required", "A Lab needs a new Approval: start it again from its Finding", 409
+            )
+        if row.kind == "remediation_pr":
+            raise DomainError(
+                "approval_required", "A Remediation PR needs a new Approval: approve it again from its Finding", 409
+            )
+        if row.kind in ("patch_drafting", "remediation_draft"):
+            # A retried draft would run again only to be discarded: its record is no longer drafting.
+            raise DomainError(
+                "job_not_retryable", "Draft the Remediation PR again from its Finding", 409
             )
         if row.input.get("finding_id") and db.get(Finding, row.input["finding_id"]) is None:
             raise DomainError(

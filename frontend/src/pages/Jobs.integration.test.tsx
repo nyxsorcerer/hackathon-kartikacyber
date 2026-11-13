@@ -502,6 +502,21 @@ it.each([
     "broker_unavailable",
     "A Lab is not retried: fix the cause, then start a new Lab from its Finding with a new Approval.",
   ],
+  [
+    "remediation_pr",
+    "github_write_token_required",
+    "Add a GitHub write token under Settings → Integrations, then approve again.",
+  ],
+  [
+    "remediation_pr",
+    "github_write_failed",
+    "A Remediation PR is not retried: fix the cause, then approve it again from its Finding.",
+  ],
+  [
+    "patch_drafting",
+    "diff_rejected",
+    "A draft is not retried: fix the cause, then draft it again from its Finding.",
+  ],
 ])("explains a %s failed with %s", async (kind, code, hint) => {
   serveJobs([
     {
@@ -519,7 +534,7 @@ it.each([
   ).toHaveTextContent(hint);
 });
 
-it("offers no Retry for a failed Lab: a new Lab needs a new Approval", async () => {
+it("offers no Retry for a failed Lab or Remediation PR: each needs a new Approval", async () => {
   const failed = {
     status: "failed",
     result: null,
@@ -539,6 +554,18 @@ it("offers no Retry for a failed Lab: a new Lab needs a new Approval", async () 
         link: "/findings/finding-1",
       },
     },
+    {
+      ...triage,
+      ...failed,
+      id: "job-pr",
+      kind: "remediation_pr",
+      subject: {
+        type: "finding",
+        label: "Stored XSS in timezone settings",
+        ref: null,
+        link: "/findings/finding-2",
+      },
+    },
   ]);
   render(
     <MemoryRouter initialEntries={["/jobs"]}>
@@ -556,6 +583,10 @@ it("offers no Retry for a failed Lab: a new Lab needs a new Approval", async () 
   const labRow = await row("Stored XSS in settings");
   expect(
     within(labRow).queryByRole("button", { name: "Retry" }),
+  ).not.toBeInTheDocument();
+  const prRow = await row("Stored XSS in timezone settings");
+  expect(
+    within(prRow).queryByRole("button", { name: "Retry" }),
   ).not.toBeInTheDocument();
 });
 

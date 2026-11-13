@@ -24,6 +24,7 @@ from .models import (
     Application,
     ApplicationCVE,
     ApplicationRepository,
+    RemediationPR,
     Repository,
     Setting,
     now,
@@ -376,8 +377,52 @@ def triage_application(db, repository):
     return None
 
 
-# Automatic Analyses per UTC day (A04). Manual Analyses are neither capped nor counted.
+# Automatic Analyses per UTC day (A04), automatic patch drafting included (A08). Manual runs are
+# neither capped nor counted.
 ANALYSIS_CAPS = {"application": 10, "account": 30}
+CAPPED_KINDS = ("commit_analysis", "patch_drafting")
+
+
+def over_cap(db, application, profile, shared):
+    """The cap ("application" or "account") that one more automatic run of the Application on
+    `profile` would pass today, else None. A shared Upstream commit counts only against the
+    account's. Over a cap it records the scope's one event and Alert of the day (A12)."""
+    midnight = now().replace(hour=0, minute=0, second=0, microsecond=0)
+    # Job rows are durable, so the counts survive restarts and reset at midnight on their own.
+    # ponytail: unlocked counts; concurrent flags can overrun a cap by the number of Triage
+    # workers. Lock the account row here if exact caps ever matter.
+    today = select(func.count(Job.id)).where(
+        Job.kind.in_(CAPPED_KINDS),
+        Job.created_at >= midnight,
+        Job.input["automatic"].as_boolean().is_(True),
+    )
+    used = {
+        "application": 0 if shared else db.scalar(today.where(
+            Job.application_id == application.id, Job.input["shared"].as_boolean().is_(False)
+        )),
+        "account": db.scalar(today.where(Job.profile["connection_id"].as_string() == profile["connection_id"])),
+    }
+    cap = next((scope for scope, limit in ANALYSIS_CAPS.items() if used[scope] >= limit), None)
+    if not cap:
+        return None
+    resource = application.id if cap == "application" else profile["connection_id"]
+    day = midnight.date().isoformat()
+    if not db.scalar(select(Action.id).where(
+        Action.resource_type == cap,
+        Action.resource_id == resource,
+        Action.data["action"].as_string() == "analysis_cap_reached",
+        Action.data["day"].as_string() == day,
+    ).limit(1)):
+        db.add(Action(resource_type=cap, resource_id=resource,
+                      data={"action": "analysis_cap_reached", "day": day, "limit": ANALYSIS_CAPS[cap]}))
+        # An account cap belongs to no Application, so its Alert names the Provider account.
+        where = (
+            {"application": application.asset_name, "link": f"/reviews?application={application.id}"}
+            if cap == "application"
+            else {"account": db.get(Account, resource).label, "link": "/settings?tab=accounts"}
+        )
+        notify(db, f"cap:{cap}:{resource}:{day}", verdict="Cap reached", **where)
+    return cap
 
 
 def start_analysis(db, commit):
@@ -398,45 +443,11 @@ def start_analysis(db, commit):
     except DomainError as exc:
         commit.analysis_state = {"status": "blocked", "error": exc.as_dict()}
         return None
-    current = now()
-    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
-    # Job rows are durable, so the counts survive restarts and reset at midnight on their own.
-    # ponytail: unlocked counts; concurrent flags can overrun a cap by the number of Triage
-    # workers. Lock the account row here if exact caps ever matter.
-    today =select(func.count(Job.id)).where(
-        Job.kind == "commit_analysis",
-        Job.created_at >= midnight,
-        Job.input["automatic"].as_boolean().is_(True),
-    )
-    used = {
-        "application": 0 if shared else db.scalar(today.where(
-            Job.application_id == application.id, Job.input["shared"].as_boolean().is_(False)
-        )),
-        "account": db.scalar(today.where(Job.profile["connection_id"].as_string() == profile["connection_id"])),
-    }
-    cap = next((scope for scope, limit in ANALYSIS_CAPS.items() if used[scope] >= limit), None)
+    cap = over_cap(db, application, profile, shared)
     if cap:
         previous = commit.analysis_state or {}
-        since = previous.get("since") if previous.get("status") == "waiting_for_cap" else current.isoformat()
+        since = previous.get("since") if previous.get("status") == "waiting_for_cap" else now().isoformat()
         commit.analysis_state = {"status": "waiting_for_cap", "since": since, "cap": cap}
-        # One event and one Alert per scope and day (A12).
-        resource = application.id if cap == "application" else profile["connection_id"]
-        day = midnight.date().isoformat()
-        if not db.scalar(select(Action.id).where(
-            Action.resource_type == cap,
-            Action.resource_id == resource,
-            Action.data["action"].as_string() == "analysis_cap_reached",
-            Action.data["day"].as_string() == day,
-        ).limit(1)):
-            db.add(Action(resource_type=cap, resource_id=resource,
-                          data={"action": "analysis_cap_reached", "day": day, "limit": ANALYSIS_CAPS[cap]}))
-            # An account cap belongs to no Application, so its Alert names the Provider account.
-            where = (
-                {"application": application.asset_name, "link": f"/reviews?application={application.id}"}
-                if cap == "application"
-                else {"account": db.get(Account, resource).label, "link": "/settings?tab=accounts"}
-            )
-            notify(db, f"cap:{cap}:{resource}:{day}", verdict="Cap reached", **where)
         return None
     inputs = job_input(db, application, commit_id=commit.id, source_ref=commit.revision, automatic=True, shared=shared)
     job = enqueue(db, "commit_analysis", application, inputs, profile, key)
@@ -880,6 +891,122 @@ def malicious_change(db, finding):
     return opened is not None and (opened.data.get("cause") or {}).get("verdict") == "Malicious change"
 
 
+def own_repository(db, application):
+    """The Application's Own repository (its Own link not removed), the only one a Remediation PR
+    is ever opened on, or None."""
+    return next((r for link, r in links(db, application) if link.role == "own" and link.removed_at is None), None)
+
+
+def remediation_actions(db, finding):
+    """The Remediation PRs the Operator may draft for the Finding (A06 Own column), on a commit of
+    the Own repository: a revert (the Cure) for a Malicious change; a patch or a revert for a
+    Vulnerability introduced, or for a commit with no Verdict yet (a Finding the Operator opened);
+    none for any other Verdict, so a Vulnerability fix is never reverted."""
+    own = own_repository(db, db.get(Application, finding.application_id))
+    commit = db.get(Commit, finding.data.get("source_commit_id") or "") if finding.source == "commit" else None
+    if own is None or commit is None or commit.repository_id != own.id:
+        return []
+    if malicious_change(db, finding):
+        return ["revert"]
+    return ["patch", "revert"] if commit.verdict in (None, "Vulnerability introduced") else []
+
+
+# A Remediation PR that a new draft leaves alone: it is drafting, or approved or opened.
+REMEDIATION_BUSY = ("drafting", "approved", "open", "merged", "closed")
+
+
+def draft_remediation(db, application, finding, subject, action, revision, automatic=False, dependency=None,
+                      submitted=None):
+    """Drafts the Application's Remediation PR for (subject, action) on its Own repository (A08),
+    or returns None when it has none: its Remediation PR steps are skipped (A06). A patch is a
+    one-shot agent run; an automatic one counts against the Analysis caps and waits over one. A
+    revert, pin or bump is application code. An automatic draft never raises: a profile or cap
+    problem is recorded on the row. A row that is drafting, approved or opened is left alone. A
+    commit's patch or revert is drafted only while that commit is of the Own repository."""
+    repository = own_repository(db, application)
+    query = select(RemediationPR).where(RemediationPR.application_id == application.id,
+                                        RemediationPR.subject == subject, RemediationPR.action == action)
+    commit = db.get(Commit, subject) if action in ("patch", "revert") else None
+    if repository is None or (commit is not None and commit.repository_id != repository.id):
+        # The Own link was removed or replaced while this draft waited for a cap: it fails, rather
+        # than waiting for good or drafting on another repository.
+        waiting = db.scalar(query.where(RemediationPR.status == "waiting_for_cap"))
+        if waiting:
+            waiting.status, waiting.updated_at = "draft_failed", now()
+            waiting.data = {**waiting.data, "error": DomainError(
+                "not_own_repository", "The Application's Own repository changed while this draft waited", 409
+            ).as_dict()}
+        return None
+    row, fresh = db.scalar(query), False
+    if row is None:
+        # As repository_for: a concurrent draft that creates the key first wins, and this one reads it.
+        try:
+            with db.begin_nested():
+                row = RemediationPR(application_id=application.id, finding_id=finding.id,
+                                    repository_id=repository.id, subject=subject, action=action, data={})
+                db.add(row)
+            fresh = True
+        except IntegrityError:
+            row = db.scalar(query)
+    db.refresh(row, with_for_update=True)
+    if not fresh and row.status in REMEDIATION_BUSY:
+        if automatic:
+            return row
+        raise DomainError("remediation_busy", f"This {action} is already {row.status}", 409)
+    data = {"revision": revision, "dependency": dependency or row.data.get("dependency")}
+    if action == "patch":
+        try:
+            profile = (automated_profile(db, application, "patch_drafting") if automatic
+                       else resolve_profile(db, application, "patch_drafting", submitted))
+        except DomainError as exc:
+            if not automatic:
+                raise
+            row.status, row.data, row.updated_at = "draft_failed", {**data, "error": exc.as_dict()}, now()
+            return row
+        cap = over_cap(db, application, profile, False) if automatic else None
+        if cap:
+            since = row.data.get("since") if row.status == "waiting_for_cap" else now().isoformat()
+            row.status, row.data, row.updated_at = "waiting_for_cap", {**data, "since": since, "cap": cap}, now()
+            return row
+        job = enqueue(db, "patch_drafting", application, {
+            "remediation_pr_id": row.id, "finding_id": finding.id, "automatic": automatic, "shared": False}, profile)
+    else:
+        job = enqueue(db, "remediation_draft", application, {"remediation_pr_id": row.id, "finding_id": finding.id})
+    # A new draft replaces the last one, so nothing stale can be approved while it runs.
+    row.finding_id, row.repository_id, row.status = finding.id, repository.id, "drafting"
+    row.base_ref, row.diff, row.diff_sha256 = None, None, None
+    row.data, row.updated_at = {**data, "job_id": job.id}, now()
+    return row
+
+
+def remediation_job_ended(db, job, error):
+    """A draft job that failed or was cancelled leaves its draft draft_failed, with no diff to
+    approve; a PR step leaves its approved draft failed, to approve again. The Finding is untouched."""
+    if job.kind not in ("patch_drafting", "remediation_draft", "remediation_pr"):
+        return
+    draft = db.get(RemediationPR, job.input.get("remediation_pr_id"))
+    pending, failed = ("approved", "failed") if job.kind == "remediation_pr" else ("drafting", "draft_failed")
+    if draft and draft.status == pending and draft.data.get("job_id") == job.id:
+        draft.status, draft.data, draft.updated_at = failed, {**draft.data, "error": error}, now()
+
+
+def remediation_json(row):
+    return {
+        "id": row.id,
+        "finding_id": row.finding_id,
+        "repository_id": row.repository_id,
+        "subject": row.subject,
+        "action": row.action,
+        "status": row.status,
+        "base_ref": row.base_ref,
+        "diff": row.diff,
+        "diff_sha256": row.diff_sha256,
+        **row.data,
+        "created_at": utc(row.created_at),
+        "updated_at": utc(row.updated_at),
+    }
+
+
 def link_change(db, application, addresses, change):
     """Links a change ({commit_id, revision, analysis_id, verdict}) to the Application's Findings,
     in any state, that its Analysis says it addresses: a commit SHA, full or abbreviated, matches
@@ -1062,6 +1189,12 @@ def finding_json(db, row, root):
             for a in labs
         ],
         "events": [{"id": a.id, "created_at": utc(a.created_at), **a.data} for a in actions],
+        # A06: without an Own repository the Remediation PR steps show "no Own repository".
+        "own_repository": own_repository(db, db.get(Application, row.application_id)) is not None,
+        "remediation_actions": remediation_actions(db, row),
+        "remediation_prs": [remediation_json(r) for r in db.scalars(
+            select(RemediationPR).where(RemediationPR.finding_id == row.id)
+            .order_by(RemediationPR.created_at, RemediationPR.id))],
         "created_at": utc(row.created_at),
         "updated_at": utc(row.updated_at),
     }
@@ -1296,3 +1429,10 @@ def start_waiting(db):
     )
     for commit in sorted(waiting, key=lambda c: c.analysis_state["since"]):
         start_analysis(db, commit)
+    # Then the automatic patch drafts waiting for a cap (A08), oldest first.
+    drafts = db.scalars(
+        select(RemediationPR).where(RemediationPR.status == "waiting_for_cap").with_for_update(skip_locked=True)
+    )
+    for row in sorted(drafts, key=lambda r: r.data["since"]):
+        draft_remediation(db, db.get(Application, row.application_id), db.get(Finding, row.finding_id),
+                          row.subject, row.action, row.data["revision"], automatic=True)
