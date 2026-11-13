@@ -720,6 +720,7 @@ def test_runtime_events_reach_the_timeline_with_application_owned_messages(syste
         "progress": 1,
         "run_id": "run-a",
         "events": [
+            {"type": "lab_dependencies", "message": forged},
             {"type": "lab_build", "message": forged},
             {"type": "lab_application_exited", "message": forged, "image": forged},
             {"type": "agent_chatter", "message": "unknown kinds are dropped"},
@@ -733,6 +734,7 @@ def test_runtime_events_reach_the_timeline_with_application_owned_messages(syste
     events = client.get(f"/api/jobs/{job_id}/events").json()["items"]
     kinds = [event["kind"] for event in events]
     assert kinds.count("lab_build") == 1 and kinds.count("lab_application_exited") == 1
+    assert kinds.count("lab_dependencies") == 1
     assert not {"agent_chatter", "build_daemon_started", "repository_ready"} & set(kinds)
     assert forged not in client.get(f"/api/jobs/{job_id}/events").text
     assert any(

@@ -107,8 +107,9 @@ class Broker:
         if kind == "agent":
             del defaults["timeout_seconds"]  # Agent runs have no deadline; operators cancel them.
         if kind == "lab":
-            # A lab run builds and boots a whole application, dependencies and database included.
-            defaults.update({"timeout_seconds": 7200, "memory_mb": 6144, "cpus": 2, "pids": 4096,
+            # ADR-0005: a Lab image is at most 4 GB, its build gets 15 minutes and its run 10.
+            defaults.update({"timeout_seconds": 600, "build_seconds": 900, "image_bytes": 4 * 1024**3,
+                             "memory_mb": 6144, "cpus": 2, "pids": 4096,
                              "output_bytes": 64 * 1024 * 1024, "input_bytes": MAX_SUBMISSION})
         return self.request(
             "POST",

@@ -493,7 +493,8 @@ class Workflows:
                 submitted["run_id"],
                 self.context.heartbeat,
                 progress or self.context.progress,
-                deadline=None if kind == "agent" else 900,
+                # A Lab gets 15 minutes to build and 10 to run, plus its staging (ADR-0005).
+                deadline=None if kind == "agent" else 1800 if kind == "lab" else 900,
             )
         except DomainError as exc:
             if exc.code in ("cancelled", "lease_lost"):
@@ -1340,6 +1341,10 @@ class Workflows:
                 "source_url": repository.source_url,
                 "source_kind": repository.source_kind,
                 "parent_revisions": commit.data.get("parent_revisions", []),
+                # An Own-repository Proof's Lab supplies the repository itself (A07).
+                "own_repository": any(
+                    link.role == "own" for _, link in domain.linked_applications(db, repository)
+                ),
                 "before_ref": before_ref,
                 "before_source_error": before_error,
                 "source_delta": "Source is pinned to the analyzed commit revision; its diff supplies before/after evidence.",
@@ -2330,6 +2335,12 @@ class Workflows:
         if not row:
             raise DomainError("missing_lab_run", "Lab metadata was not recorded", 422)
         finding = domain.get(db, Finding, row.finding_id)
+        if domain.malicious_change(db, finding):  # A later Verdict may have made it one.
+            raise DomainError(
+                "lab_not_allowed",
+                "A Malicious change never runs: its Proof is static, so it has no Lab",
+                409,
+            )
         files = artifacts.resource_files(
             db, self.config.artifact_root, "finding", finding.id, row.artifact_revision
         )
@@ -2340,14 +2351,32 @@ class Workflows:
                 "Complete and pin the vulnerable bundle before lab verification",
                 422,
             )
-        result, outputs, _ = self.run(
-            db,
-            job,
-            "lab",
-            files=files,
-            # A real vulnerable application installs its dependencies and boots a database.
-            limits={"timeout_seconds": 7200, "memory_mb": 6144, "cpus": 2, "pids": 4096},
+        source = {}
+        commit = (
+            db.get(Commit, finding.data.get("source_commit_id") or "")
+            if finding.source == "commit"
+            else None
         )
+        if commit and db.scalar(
+            select(ApplicationRepository.id).where(
+                ApplicationRepository.application_id == finding.application_id,
+                ApplicationRepository.repository_id == commit.repository_id,
+                ApplicationRepository.role == "own",
+            )
+        ):
+            # An Own-repository Proof builds the Own repository at the Verdict's commit, from its
+            # stored snapshot, and the bundle's own files win (A07). Upstream Proofs stay bundle-only.
+            # The repository's .dockerignore belongs to its own Dockerfile, which the bundle's
+            # replaces: it would keep the fetched node_modules out of `COPY . /app/`.
+            _, tree = self.snapshot(db, db.get(Repository, commit.repository_id), commit.revision)
+            own = {
+                "vulnerable-app/" + p: d
+                for p, d in tree.items()
+                if p not in ("manifest.json", ".dockerignore")
+            }
+            files = {**own, **files}
+            source = {"source_ref": commit.revision}
+        result, outputs, _ = self.run(db, job, "lab", files=files)
         if result.get("verified") is not True and result.get("status") not in (
             "verified",
             "not_reproduced",
@@ -2366,6 +2395,7 @@ class Workflows:
             **result,
             "vulnerable_version": complete["vulnerable_version"],
             "artifact_revision": row.artifact_revision,
+            **source,
         }
         if row.status == "verified":  # A reproduced Proof confirms an Open Finding (A11).
             domain.transition_finding(db, finding, "confirmed", {"by": "proof", "lab_run_id": row.id})

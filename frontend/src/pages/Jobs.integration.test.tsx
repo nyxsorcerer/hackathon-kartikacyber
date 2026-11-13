@@ -497,6 +497,11 @@ it.each([
     "timeout",
     "Analysis stopped at its 30-minute deadline. The change stays pending and is never read as Unrelated.",
   ],
+  [
+    "lab_run",
+    "broker_unavailable",
+    "A Lab is not retried: fix the cause, then start a new Lab from its Finding with a new Approval.",
+  ],
 ])("explains a %s failed with %s", async (kind, code, hint) => {
   serveJobs([
     {
@@ -512,4 +517,44 @@ it.each([
   expect(
     await screen.findByRole("region", { name: "Job outcome" }),
   ).toHaveTextContent(hint);
+});
+
+it("offers no Retry for a failed Lab: a new Lab needs a new Approval", async () => {
+  const failed = {
+    status: "failed",
+    result: null,
+    error: { code: "invalid_lab_result", message: "No result" },
+  };
+  serveJobs([
+    { ...triage, ...failed },
+    {
+      ...triage,
+      ...failed,
+      id: "job-lab",
+      kind: "lab_run",
+      subject: {
+        type: "finding",
+        label: "Stored XSS in settings",
+        ref: null,
+        link: "/findings/finding-1",
+      },
+    },
+  ]);
+  render(
+    <MemoryRouter initialEntries={["/jobs"]}>
+      <Routes>
+        <Route path="/jobs" element={<Jobs />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  const row = async (name: string) =>
+    (await screen.findByRole("link", { name })).closest("tr")!;
+  const triageRow = await row("Potential path traversal in template selection");
+  expect(
+    within(triageRow).getByRole("button", { name: "Retry" }),
+  ).toBeInTheDocument();
+  const labRow = await row("Stored XSS in settings");
+  expect(
+    within(labRow).queryByRole("button", { name: "Retry" }),
+  ).not.toBeInTheDocument();
 });

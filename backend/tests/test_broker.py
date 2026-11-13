@@ -107,3 +107,13 @@ def test_requested_agent_limits_refine_the_defaults(monkeypatch):
     assert sent["limits"]["timeout_seconds"] == 1800 and sent["limits"]["memory_mb"] == 1024
     broker.submit("token", "lab", limits={"timeout_seconds": 60})
     assert sent["limits"] == {"timeout_seconds": 60}  # other kinds name every bound they want
+
+
+def test_lab_runs_default_to_the_adr_0005_limits(monkeypatch):
+    """A Lab image is at most 4 GB, its build 15 minutes and its run 10 (ADR-0005)."""
+    sent = {}
+    broker = Broker(Config())
+    monkeypatch.setattr(broker, "request", lambda method, path, json=None: sent.update(json) or {"run_id": "r"})
+    broker.submit("token", "lab", files={"poc.py": b"x"})
+    assert sent["limits"]["timeout_seconds"] == 600 and sent["limits"]["build_seconds"] == 900
+    assert sent["limits"]["image_bytes"] == 4 * 1024**3 and sent["limits"]["memory_mb"] == 6144

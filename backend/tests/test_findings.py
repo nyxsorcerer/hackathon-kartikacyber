@@ -1,3 +1,4 @@
+import json
 from datetime import timedelta
 
 import pytest
@@ -5,10 +6,11 @@ from sqlalchemy import select
 
 from conftest import FixtureBroker, application, connection, source_snapshot
 from numen import artifacts, domain
+from numen.security import DomainError
 from numen.models import Application, ApplicationCVE, Artifact, Commit, Finding, Job, LabRun, Notification, now
 from numen.worker import run_once
 from test_analysis import analyze
-from test_artifacts import bundle, finding, queue_cve_analysis, upload
+from test_artifacts import APPROVAL, bundle, finding, queue_cve_analysis, upload
 from test_commit_review import assessment, pinned_bundle, prepared
 from test_workflows import cve_raw, seed_cve
 
@@ -149,7 +151,7 @@ def test_cached_summary_preserves_edits_and_integrity_is_checked_on_use(system, 
     )
     for endpoint, method in (
         (f"/api/findings/{row['id']}/download", client.get),
-        (f"/api/findings/{row['id']}/lab-runs", client.post),
+        (f"/api/findings/{row['id']}/lab-runs", lambda path: client.post(path, json=APPROVAL)),
         (f"/api/artifacts/{artifact_id}/content", client.get),
     ):
         response = method(endpoint)
@@ -318,8 +320,8 @@ def shared(system, *names):
     return apps, parented(app, apps[0]["id"], "a" * 40, "f" * 40)
 
 
-def parented(app, application_id, revision, parent):
-    ident = source_snapshot(app, application_id, revision)
+def parented(app, application_id, revision, parent, files=None):
+    ident = source_snapshot(app, application_id, revision, files=files)
     with app.state.factory.begin() as db:
         commit = db.get(Commit, ident)
         commit.data = {**commit.data, "parent_revisions": [parent]}
@@ -509,3 +511,97 @@ def test_editing_a_commit_findings_source_commit_updates_its_source_ref(system):
     assert edited.status_code == 200, edited.text
     assert edited.json()["source_ref"] == "bbbbbbb"
     assert client.patch(f"/api/findings/{row['id']}", json={"source_commit_id": None}).json()["source_ref"] is None
+
+
+# An Own-repository Proof's vulnerable app is the Own repository at the Verdict's commit (A07).
+OWN_SOURCE = {
+    "package.json": b'{"name":"shop","version":"1.0.0","private":true}\n',
+    "server.js": b'require("http").createServer((q,r)=>r.end(require("fs").readFileSync("."+q.url))).listen(8080);\n',
+    "Dockerfile": b"FROM node:latest\n",  # The repository's own: the bundle's wins.
+    ".dockerignore": b"node_modules\n",  # Its own Dockerfile's: it would drop the fetched deps.
+}
+
+
+def approved_commit_lab(system, role):
+    """A Vulnerability introduced Finding from a commit of the Application's `role` repository,
+    with its Lab approved: (Finding id, lab_run job id)."""
+    app, client, _ = system
+    connection(app)
+    shop = application(client, role=role, source_url="https://github.com/acme/shop")
+    ident = parented(app, shop["id"], "a" * 40, "f" * 40, OWN_SOURCE)
+    job, broker = analyze(system, ident, assessment("Vulnerability introduced", "a" * 40), pinned_bundle("a" * 40))
+    # The Analysis is told whether its Lab will supply the repository.
+    facts = json.loads(broker.calls[0]["prompt"].rsplit("\n\nFacts:\n", 1)[1])
+    assert facts["own_repository"] is (role == "own")
+    finding_id = job["result"]["finding_id"]
+    queued = client.post(f"/api/findings/{finding_id}/lab-runs", json=APPROVAL)
+    assert queued.status_code == 202, queued.text
+    return finding_id, queued.json()["job_id"]
+
+
+def run_lab(system, broker):
+    app, _, config = system
+    run_once(config, app.state.factory, broker, exclude=("notification",))  # Alerts stay queued.
+    return broker
+
+
+def test_an_approved_lab_builds_the_own_repository_at_the_verdicts_commit(system):
+    _, client, _ = system
+    finding_id, job_id = approved_commit_lab(system, "own")
+    broker = run_lab(system, FixtureBroker({"verified": True, "status": "verified", "exit_code": 0}))
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "succeeded"
+    ((kind, files),) = [(call["kind"], call["files"]) for call in broker.calls]
+    assert kind == "lab" and "manifest.json" in files
+    assert "vulnerable-app/manifest.json" not in files and "vulnerable-app/.dockerignore" not in files
+    for path in ("package.json", "server.js"):
+        assert files["vulnerable-app/" + path] == OWN_SOURCE[path], path
+    bundled = pinned_bundle("a" * 40)
+    for path in ("vulnerable-app/Dockerfile", "vulnerable-app/application.lock.json", "poc.py"):
+        assert files[path] == bundled[path], path
+    current = client.get(f"/api/findings/{finding_id}").json()
+    (lab,) = current["lab_runs"]
+    assert (lab["status"], lab["source_ref"]) == ("verified", "a" * 40)
+    assert current["status"] == "confirmed"
+    assert {k: v for k, v in current["cause"].items() if k != "at"} == {"by": "proof", "lab_run_id": lab["id"]}
+
+
+def test_an_upstream_proof_keeps_the_bundle_only_lab(system):
+    _, client, _ = system
+    finding_id, _ = approved_commit_lab(system, "upstream")
+    broker = run_lab(system, FixtureBroker({"verified": True, "status": "verified", "exit_code": 0}))
+    (call,) = broker.calls
+    assert set(call["files"]) == {*pinned_bundle(), "manifest.json"}
+    (lab,) = client.get(f"/api/findings/{finding_id}").json()["lab_runs"]
+    assert "source_ref" not in lab
+
+
+def test_a_lab_that_does_not_reproduce_stays_visible_and_changes_no_state(system):
+    _, client, _ = system
+    finding_id, job_id = approved_commit_lab(system, "own")
+    before = client.get(f"/api/findings/{finding_id}").json()
+    run_lab(system, FixtureBroker({"verified": False, "status": "not_reproduced", "exit_code": 1, "log": "no traversal"}))
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "succeeded"
+    current = client.get(f"/api/findings/{finding_id}").json()
+    (lab,) = current["lab_runs"]
+    assert (lab["status"], lab["source_ref"], lab["log"]) == ("not_reproduced", "a" * 40, "no traversal")
+    assert (current["status"], current["cause"]) == ("open", before["cause"])
+    assert not [e for e in current["events"] if e["action"] == "transition"]
+
+
+def test_a_lab_over_a_limit_fails_visibly_and_changes_no_state(system):
+    _, client, _ = system
+    finding_id, job_id = approved_commit_lab(system, "own")
+    limit = {"code": "lab_image_too_large", "message": "The Lab image is larger than its 4 GB limit and was removed."}
+
+    class OverLimit(FixtureBroker):
+        def wait(self, run_id, heartbeat, progress, deadline=900):
+            self.states[run_id].update(status="failed", error=limit)
+            raise DomainError(limit["code"], limit["message"], 502)
+
+    run_lab(system, OverLimit())
+    job = client.get(f"/api/jobs/{job_id}").json()
+    assert (job["status"], job["error"]["code"]) == ("failed", "lab_image_too_large")
+    current = client.get(f"/api/findings/{finding_id}").json()
+    (lab,) = current["lab_runs"]
+    assert lab["status"] == "failed" and {k: lab["error"][k] for k in limit} == limit
+    assert current["status"] == "open" and current["cause"]["by"] == "verdict"

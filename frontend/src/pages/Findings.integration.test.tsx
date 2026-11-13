@@ -537,3 +537,90 @@ it("confirms, dismisses and marks a finding remediated with a reason", async () 
   });
   expect(await enabled("Reopen")).toEqual([]);
 });
+
+it("starting a Lab asks for the Operator's password", async () => {
+  const posted: { body: unknown; key: string | null }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith("/api/applications/"))
+        return new Response(JSON.stringify(application));
+      if (url === "/api/findings/finding/lab-runs") {
+        posted.push({
+          body: JSON.parse(String(init?.body)),
+          key: new Headers(init?.headers).get("Idempotency-Key"),
+        });
+        return posted.length === 1
+          ? new Response(
+              JSON.stringify({
+                code: "approval_refused",
+                message: "The password is incorrect; nothing was approved",
+              }),
+              { status: 403 },
+            )
+          : new Response(
+              JSON.stringify({
+                job_id: "job-lab",
+                status_url: "/api/jobs/job-lab",
+              }),
+              { status: 202 },
+            );
+      }
+      return new Response(
+        JSON.stringify({
+          ...detail,
+          events: [
+            {
+              id: "approved",
+              action: "approved",
+              approved: "lab_run",
+              job_id: "job-lab",
+              created_at: "2026-10-06T00:00:00Z",
+            },
+          ],
+          lab_runs: [
+            {
+              id: "lab",
+              status: "not_reproduced",
+              created_at: "2026-10-06T00:00:00Z",
+            },
+          ],
+        }),
+      );
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={["/findings/finding"]}>
+      <Routes>
+        <Route path="/findings/:id" element={<FindingDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByText("Lab not reproduced")).toBeInTheDocument();
+  expect(screen.getByText("Not reproduced")).toBeInTheDocument();
+  expect(screen.getByText("Approved · Lab")).toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Start Lab" }));
+  const dialog = await screen.findByRole("dialog");
+  const password = within(dialog).getByLabelText("Password");
+  expect(password).toHaveAttribute("type", "password");
+  await user.type(password, "wrong-password");
+  await user.click(within(dialog).getByRole("button", { name: "Approve" }));
+  expect(
+    await within(dialog).findByText(
+      "The password is incorrect; nothing was approved",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("dialog")).toBeInTheDocument();
+  await user.clear(password);
+  await user.type(password, "test-password-long");
+  await user.click(within(dialog).getByRole("button", { name: "Approve" }));
+  await vi.waitFor(() =>
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+  );
+  expect(posted.map((p) => p.body)).toEqual([
+    { password: "wrong-password" },
+    { password: "test-password-long" },
+  ]);
+  expect(posted.every((p) => p.key)).toBe(true);
+});

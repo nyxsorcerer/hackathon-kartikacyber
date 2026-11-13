@@ -395,6 +395,9 @@ export function Jobs() {
   );
 }
 function JobActions({ job, refresh }: { job: Job; refresh: () => void }) {
+  // A Lab is never retried: a new one needs a new Approval from its Finding.
+  const retryable =
+    ["failed", "cancelled"].includes(job.status) && job.kind !== "lab_run";
   return (
     <div className="inline-actions">
       {["queued", "running"].includes(job.status) && (
@@ -415,7 +418,7 @@ function JobActions({ job, refresh }: { job: Job; refresh: () => void }) {
           Cancel
         </ActionButton>
       )}
-      {["failed", "cancelled"].includes(job.status) && (
+      {retryable && (
         <ActionButton
           className="secondary"
           onAction={async () => {

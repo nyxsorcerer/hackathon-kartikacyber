@@ -5,11 +5,13 @@ import os
 import secrets
 import socket
 import tarfile
+import tempfile
+import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import docker
-import requests
 from .contracts import HERDR_HOSTS, PROVIDERS, input_files
 
 LABEL = "org.pruferva.asset-monitor.run"
@@ -56,44 +58,81 @@ os.rename(temp,'/home/job/login-code')
 """
 
 
+# Lab phase one (A07): this fixed command, never the bundle's, copies the application and fetches
+# its dependencies with install scripts disabled. A bundled node_modules is never used.
+FETCH_DEPENDENCIES = """set -e
+app=/workspace/inputs/bundle/vulnerable-app
+[ -d "$app" ] || app=/workspace/inputs/vulnerable-app
+cp -R "$app" /opt/lab/app
+chmod -R u+w /opt/lab/app
+rm -rf /opt/lab/app/node_modules
+cd /opt/lab/app
+if [ -f package-lock.json ]; then npm ci --ignore-scripts --no-audit --no-fund
+else npm install --ignore-scripts --no-audit --no-fund; fi
+"""
+
+
 class RuntimeFailure(Exception):
     def __init__(self, code, message):
         self.code, self.safe_message = code, message
         super().__init__(message)
 
 
-# A vulnerable application is built, not merely assembled: dependencies are installed and a
-# database is initialised, so executable build steps are accepted. What a bundle still may not do
-# is reach the host or float its base, because a reproduction has to stay reproducible.
+# A vulnerable application is built, not merely assembled, so executable build steps are accepted.
+# The build is offline (ADR-0005), so a bundle may build only on the bundled Lab base, which carries
+# pinned Node, or scratch: the Engine would fetch any other base, or a URL source, outside
+# --network none, and a fetched base would outlive the run.
 LAB_DIRECTIVES = frozenset({"FROM", "RUN", "COPY", "ADD", "WORKDIR", "USER", "ENV", "ARG", "EXPOSE",
                             "CMD", "ENTRYPOINT", "LABEL", "VOLUME", "STOPSIGNAL", "SHELL", "HEALTHCHECK"})
-LAB_BASE = re.compile(
-    r"(?:asset-monitor-lab:0\.1\.0|scratch|[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64})"
-    r"(?: AS [a-zA-Z][a-zA-Z0-9_-]*)?"
-)
+LAB_BASE = re.compile(r"(?:asset-monitor-lab:0\.1\.0|scratch)(?: AS [a-zA-Z][a-zA-Z0-9_-]*)?")
+
+
+def instructions(text):
+    """The Dockerfile's instructions as the Engine reads them (Engine 20.10): a comment line is
+    dropped before continuations are joined, so a trailing backslash never continues it, and blank
+    or comment lines inside a continuation are skipped. A parser directive could change the escape
+    character, so none is accepted. artifacts.dockerfile_instructions in the backend mirrors this."""
+    result, current = [], None
+    for line in text.removeprefix("\ufeff").split("\n"):
+        line = line.rstrip("\r")
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            if re.match(r"#\s*(?:escape|syntax)\s*=", stripped, re.I):
+                raise ValueError("lab Dockerfile parser directives are not accepted")
+            continue
+        if not stripped:
+            continue
+        continued = re.search(r"\\[ \t]*$", line)
+        part = line[:continued.start()] if continued else line
+        current = part.lstrip() if current is None else current + part
+        if not continued:
+            result.append(current)
+            current = None
+    return result if current is None else [*result, current]
 
 
 def validate_dockerfile(data):
     text = data.decode("utf-8")
     if len(text) > 262144:
         raise ValueError("lab Dockerfile exceeds its size bound")
-    # Continuations are ordinary in a real build, so they are joined before the directives are read.
-    joined = re.sub(r"\\[ \t]*\r?\n", " ", text)
     bases, stages = [], set()
-    for line in joined.splitlines():
+    for line in instructions(text):
         line = line.strip()
-        if not line or line.startswith("#"):
+        if not line:
             continue
         instruction, _, value = line.partition(" ")
         instruction, value = instruction.upper(), value.strip()
         if instruction not in LAB_DIRECTIVES:
             raise ValueError("unsupported lab Dockerfile directive")
+        if instruction in {"FROM", "COPY", "ADD"} and "$" in value:
+            # The Engine expands a variable here, so what is checked would not be what it builds.
+            raise ValueError("lab FROM, COPY and ADD cannot use variables")
         if instruction == "FROM":
             if not LAB_BASE.fullmatch(value):
                 reference = value.split()[0]
                 # An earlier stage of this same build is not an external base.
                 if reference not in stages:
-                    raise ValueError("lab base must be bundled, scratch, a build stage or digest pinned")
+                    raise ValueError("lab base must be the bundled lab image, scratch or a build stage")
             else:
                 bases.append(value.split()[0])
             if " AS " in value.upper():
@@ -110,17 +149,30 @@ def validate_dockerfile(data):
         if instruction in {"COPY", "ADD"}:
             source = next((f.removeprefix("--from=") for f in flags if f.startswith("--from=")), None)
             if source is not None:
-                # With --from the source path belongs to that stage or image, not to the context.
-                if source not in stages and not LAB_BASE.fullmatch(source):
-                    raise ValueError("lab COPY --from must name a build stage or a digest-pinned image")
+                # With --from the source path belongs to that stage, not to the context.
+                if source not in stages:
+                    raise ValueError("lab COPY --from must name an earlier build stage")
             else:
-                parts = [part for part in value.split() if not part.startswith("--")]
-                local = [part for part in parts[:-1] if not re.match(r"[a-z][a-z0-9+.-]*://", part)]
-                if any(part.startswith("/") or ".." in part.split("/") for part in local):
+                sources = [part for part in value.split() if not part.startswith("--")][:-1]
+                if any("://" in part for part in sources):
+                    raise ValueError("lab COPY and ADD sources cannot be URLs")
+                if any(part.startswith("/") or ".." in part.split("/") for part in sources):
                     raise ValueError("lab COPY source must be within context")
     if not bases and not stages:
         raise ValueError("lab Dockerfile lacks a pinned base")
     return bases
+
+
+def labelled(text, labels):
+    """The Dockerfile with a LABEL after every FROM, so every layer and every build-step container
+    of the build carries the run's labels and the run's cleanup finds a failed build's remains."""
+    label = "LABEL " + " ".join(f"{json.dumps(k)}={json.dumps(v)}" for k, v in labels.items())
+    lines = []
+    for line in instructions(text):
+        lines.append(line)
+        if line.upper().startswith("FROM "):
+            lines.append(label)
+    return "\n".join(lines) + "\n"
 
 
 # Workloads reach providers only through the run's credential-free gateway.
@@ -129,9 +181,16 @@ PROXY_ENVIRONMENT = {"HTTP_PROXY":"http://gateway:8082","HTTPS_PROXY":"http://ga
                      "NODE_USE_ENV_PROXY":"1"}
 
 
+def npm_registry():
+    return os.getenv("NUMEN_NPM_REGISTRY_URL", "https://registry.npmjs.org")
+
+
 def gateway_config(request, profile, interactive):
     """The gateway's CONNECT allowlist: the provider's own hosts, plus herdr.dev for a run that
-    hosts a Herdr session, because Herdr fetches its agent-detection manifests from there."""
+    hosts a Herdr session, because Herdr fetches its agent-detection manifests from there. A Lab's
+    dependency fetch reaches only the npm registry, whatever its Profile names."""
+    if request.kind == "lab":
+        return {"provider_hosts": [urlsplit(npm_registry()).hostname]}
     hosts = [] if request.kind == "probe" else PROVIDERS.get(profile["provider_id"], [])
     return {"provider_hosts": hosts + (HERDR_HOSTS if interactive else [])}
 
@@ -171,7 +230,17 @@ class DockerEngine:
                 network.remove()
             except docker.errors.NotFound:
                 pass
-        for image in self.client.images.list(filters={"label":[f"{LABEL}={run_id}",f"{INSTANCE}={self.instance}"]}):
+        try:
+            self.client.images.remove("asset-monitor-lab-job:" + run_id, force=True)
+        except docker.errors.NotFound:
+            pass
+        # A Lab build's intermediate layers carry the run label too. Only an image no other one
+        # builds on can be removed, and removing it also removes its untagged parents.
+        images = self.client.images.list(all=True, filters={"label":[f"{LABEL}={run_id}",f"{INSTANCE}={self.instance}"]})
+        parents = {image.attrs.get("Parent") for image in images}
+        for image in images:
+            if image.id in parents:
+                continue
             try:
                 self.client.images.remove(image.id, force=True)
             except docker.errors.NotFound:
@@ -181,7 +250,7 @@ class DockerEngine:
         ids = {c.labels[LABEL] for c in self.client.containers.list(all=True, filters={"label":[LABEL,f"{INSTANCE}={self.instance}"]})}
         ids.update(n.attrs.get("Labels", {}).get(LABEL) for n in self.client.networks.list(filters={"label":[LABEL,f"{INSTANCE}={self.instance}"]}))
         ids.update(v.attrs.get("Labels", {}).get(LABEL) for v in self.client.volumes.list(filters={"label":[LABEL,f"{INSTANCE}={self.instance}"]}))
-        ids.update(i.labels.get(LABEL) for i in self.client.images.list(filters={"label":[LABEL,f"{INSTANCE}={self.instance}"]}))
+        ids.update(i.labels.get(LABEL) for i in self.client.images.list(all=True, filters={"label":[LABEL,f"{INSTANCE}={self.instance}"]}))
         for run_id in ids:
             if run_id:
                 self.cleanup(run_id)
@@ -210,6 +279,17 @@ class DockerEngine:
             spec["tmpfs"] = {"/tmp":"rw,nosuid,nodev,size=1073741824"}
             spec["ulimits"] = [docker.types.Ulimit(name="nofile",soft=4096,hard=4096)]
         return spec
+
+    def start_gateway(self, run_id, request, network, labels, config):
+        """The run's credential-free gateway, on its own egress bridge and reachable from network as `gateway`."""
+        egress = self.client.networks.create("numen-egress-" + run_id, labels=labels)
+        proxy_spec = self.spec(request, egress, labels)
+        proxy_spec["tmpfs"] = {"/tmp":"rw,nosuid,nodev,size=16777216,uid=10001,gid=10001"}
+        proxy = self.client.containers.create("asset-monitor-gateway:" + VERSION, command=["python","-m","numen_runner.gateway"],
+                                               environment={"NUMEN_GATEWAY_CONFIG":json.dumps(config)}, **proxy_spec)
+        network.connect(proxy, aliases=["gateway"])
+        proxy.start()
+        return proxy
 
     def prepare_session_home(self, run_id, image, labels):
         # Native conversation files must survive workload exit/cancellation until the broker
@@ -253,26 +333,22 @@ class DockerEngine:
                 policy["blocked_cidrs"] = blocked
                 config.update({"target_policy":policy,"fetch_token":secrets.token_urlsafe(32)})
                 environment.update({"NUMEN_FETCH_URL":"http://gateway:8082/fetch","NUMEN_FETCH_TOKEN":config["fetch_token"]})
-            egress = self.client.networks.create("numen-egress-" + run_id, labels=labels)
-            proxy_spec = self.spec(request, egress, labels)
-            proxy_spec["tmpfs"] = {"/tmp":"rw,nosuid,nodev,size=16777216,uid=10001,gid=10001"}
-            proxy = self.client.containers.create("asset-monitor-gateway:" + VERSION, command=["python","-m","numen_runner.gateway"],
-                                                   environment={"NUMEN_GATEWAY_CONFIG":json.dumps(config)}, **proxy_spec)
-            job_network.connect(proxy, aliases=["gateway"])
-            proxy.start()
+            self.start_gateway(run_id, request, job_network, labels, config)
             environment.update(PROXY_ENVIRONMENT)
         image = "asset-monitor-" + (profile["agent"] if kind in {"agent","capabilities","account_login"} else kind) + ":" + VERSION
         lab_image = None
         lab_application = None
+        # A Lab's dependency fetch and its PoC read the same immutable inputs.
+        input_volume = self.materialize_inputs(run_id, request, labels)
         if kind == "lab":
-            # The application installs and updates, so its own bridge reaches the internet. Docker
-            # keeps bridges apart, so it cannot reach the application or control networks.
-            lab_egress = self.client.networks.create("asset-monitor-lab-" + run_id, labels=labels)
-            lab_image = self.build_lab(run_id, request, cancelled, event, lab_egress)
-            app_spec = self.spec(request, lab_egress, labels, application=True)
-            app_spec["tmpfs"].pop("/workspace", None)
+            lab_image = self.build_lab(run_id, request, cancelled, event, input_volume, labels)
+            # The run's own deadline starts once its image is built (ADR-0005: build 15 min, run 10).
+            deadline = time.monotonic() + timeout
+            # The application joins only the internal job network, beside its PoC: it has no route
+            # out and none to the application or control networks (ADR-0005).
+            app_spec = self.spec(request, job_network, labels, application=True)
+            app_spec["networking_config"] = {job_network.name: self.client.api.create_endpoint_config(aliases=["application"])}
             application = self.client.containers.create(lab_image, **app_spec)
-            job_network.connect(application, aliases=["application"])
             application.start()
             environment["TARGET_URL"] = "http://application:8080"
             event({"type":"lab_started","message":"Pinned application launched on the isolated job network."})
@@ -287,7 +363,6 @@ class DockerEngine:
                                          "The pinned application stopped before anything could be verified.")
                 time.sleep(0.5)
             lab_application = application
-        input_volume = self.materialize_inputs(run_id, request, labels)
         spec = self.spec(request, job_network, labels)
         spec["volumes"] = {input_volume.name:{"bind":"/workspace/inputs","mode":"ro"}}
         if kind == "agent" and profile["agent"] == "codex":
@@ -513,62 +588,124 @@ class DockerEngine:
             stager.remove(force=True)
         return volume
 
-    def build_lab(self, run_id, request, cancelled, event, network=None):
-        staged = input_files([f.model_dump() for f in request.inputs], int(request.bounds["input_bytes"]))
+    def fetch_dependencies(self, run_id, request, cancelled, deadline, inputs, labels):
+        """Lab phase one (A07): the Node app's dependencies, fetched with install scripts disabled and
+        no credential, through a gateway that reaches only the npm registry. Returns node_modules
+        as a tar file, or None when the app has none."""
+        bounds = request.bounds
+        network = self.client.networks.create("asset-monitor-lab-fetch-" + run_id, internal=True, labels=labels)
+        proxy = self.start_gateway(run_id, request, network, labels, gateway_config(request, request.profile.model_dump(), False))
+        # /opt/lab is owned by the job user in the Lab base, and Docker gives the empty volume that ownership.
+        app = self.client.volumes.create("asset-monitor-lab-app-" + run_id, labels=labels)
+        spec = self.spec(request, network, labels)
+        spec["volumes"] = {inputs.name:{"bind":"/workspace/inputs","mode":"ro"}, app.name:{"bind":"/opt/lab","mode":"rw"}}
+        environment = {"HOME":"/home/job","PATH":"/usr/local/bin:/usr/bin:/bin","HTTP_PROXY":"http://gateway:8082",
+                       "HTTPS_PROXY":"http://gateway:8082","NO_PROXY":"gateway,localhost,127.0.0.1",
+                       "npm_config_registry":npm_registry(),"npm_config_cache":"/opt/lab/cache","npm_config_update_notifier":"false"}
+        fetch = self.client.containers.create("asset-monitor-lab:" + VERSION, ["sh","-c",FETCH_DEPENDENCIES], environment=environment, **spec)
+        try:
+            fetch.start()
+            while True:
+                if cancelled():
+                    fetch.kill()
+                    raise RuntimeFailure("cancelled", "Lab build stopped before verification.")
+                if time.monotonic() > deadline:
+                    fetch.kill()
+                    raise RuntimeFailure("timeout", f"The Lab build exceeded its {int(bounds['build_seconds'])} s limit and was removed.")
+                fetch.reload()
+                if fetch.status in {"exited","dead"}:
+                    break
+                time.sleep(0.25)
+            if fetch.attrs["State"]["ExitCode"]:
+                raise RuntimeFailure("lab_dependencies_failed", "The Lab could not fetch its dependencies with install scripts disabled.")
+            try:
+                stream, _ = fetch.get_archive("/opt/lab/app/node_modules")
+            except docker.errors.NotFound:
+                return None
+            modules, size = tempfile.TemporaryFile(), 0
+            for chunk in stream:
+                size += len(chunk)
+                if size > bounds["image_bytes"]:
+                    modules.close()
+                    raise RuntimeFailure("lab_image_too_large", f"The Lab image is larger than its {bounds['image_bytes'] / 1024**3:.3g} GB limit and was removed.")
+                modules.write(chunk)
+            modules.seek(0)
+            return modules
+        finally:
+            fetch.remove(force=True)
+            proxy.remove(force=True)
+            app.remove(force=True)
+
+    def build_lab(self, run_id, request, cancelled, event, inputs, labels):
+        bounds = request.bounds
+        staged = input_files([f.model_dump() for f in request.inputs], int(bounds["input_bytes"]))
         # A bundle larger than the individual-input path can carry arrives as one archive.
         files = {path.removeprefix(BUNDLE_PREFIX): data for path, data in staged}
         if not {"poc.py","report.md","vulnerable-app/Dockerfile"}.issubset(files):
             raise RuntimeFailure("lab_incomplete", "Lab requires poc.py, report.md, and vulnerable-app/Dockerfile.")
+        if "vulnerable-app/package.json" not in files:
+            raise RuntimeFailure("lab_stack_unsupported", "Labs run only Node applications in this release: the Proof bundle needs vulnerable-app/package.json.")
         try:
             bases = validate_dockerfile(files["vulnerable-app/Dockerfile"])
         except ValueError as exc:
-            raise RuntimeFailure("unsafe_lab_bundle", "Lab Dockerfile must use approved pinned bases, local COPY, and supported directives.") from exc
-        context = io.BytesIO()
+            raise RuntimeFailure("unsafe_lab_bundle", "Lab Dockerfile must build on asset-monitor-lab:0.1.0, scratch or its own stages, from bundle files only, with supported directives.") from exc
+        files["vulnerable-app/Dockerfile"] = labelled(files["vulnerable-app/Dockerfile"].decode(), {LABEL:run_id,INSTANCE:self.instance}).encode()
+        # The build deadline covers phase one as well (ADR-0005: 15 minutes).
+        deadline, done = time.monotonic() + bounds["build_seconds"], threading.Event()
+        event({"type":"lab_dependencies","message":"Fetching the Lab's dependencies with install scripts disabled."})
+        modules = self.fetch_dependencies(run_id, request, cancelled, deadline, inputs, labels)
+        # The context is the bundle's application, its own node_modules dropped, plus the fetched one.
+        context = tempfile.TemporaryFile()
         with tarfile.open(fileobj=context,mode="w") as archive:
             for path,data in files.items():
-                if not path.startswith("vulnerable-app/"):
+                name = path.removeprefix("vulnerable-app/")
+                if name == path or name.split("/")[0] == "node_modules":
                     continue
-                info = tarfile.TarInfo(path.removeprefix("vulnerable-app/"))
+                info = tarfile.TarInfo(name)
                 info.size,info.mode = len(data),0o644
                 archive.addfile(info,io.BytesIO(data))
+            if modules:
+                with modules, tarfile.open(fileobj=modules, mode="r|") as fetched:
+                    for member in fetched:
+                        parts = member.name.split("/")
+                        # npm writes files, directories and its .bin symlinks; nothing else is carried.
+                        if parts[0] != "node_modules" or ".." in parts or not (member.isreg() or member.isdir() or member.issym()):
+                            raise RuntimeFailure("lab_dependencies_failed", "The Lab's fetched dependencies held an unsupported entry.")
+                        archive.addfile(member, fetched.extractfile(member) if member.isreg() else None)
         context.seek(0)
         tag = "asset-monitor-lab-job:" + run_id
-        # A bundle's base is validated to be either the bundled lab image or an approved repository
-        # pinned by digest. The build itself stays offline, so an absent immutable base is fetched
-        # first; otherwise only bases that happen to sit in the local store could ever verify.
-        for base in bases:
-            if base in ("asset-monitor-lab:" + VERSION, "scratch"):
-                continue
-            try:
-                self.client.images.get(base)
-                continue
-            except docker.errors.DockerException:
-                pass
-            event({"type":"lab_base_fetch","message":"Fetching the bundle's digest-pinned base before the offline build."})
-            repository, _, digest = base.partition("@")
-            try:
-                self.client.images.pull(repository, tag=digest)
-                self.client.images.get(base)
-            except (docker.errors.DockerException, requests.exceptions.RequestException) as exc:
-                raise RuntimeFailure("lab_base_unavailable",
-                                     "The bundle's digest-pinned base image could not be fetched.") from exc
         event({"type":"lab_build","message":"Building the pinned lab image from its bundle."})
-        # A vulnerable application is built as its own project: its build steps execute, with the
-        # network its dependencies need, on a per-run bridge that reaches no Numen network.
-        stream = self.client.api.build(fileobj=context,custom_context=True,tag=tag,rm=True,forcerm=True,pull=False,
-                                       network_mode=network.name if network is not None else "none",
-                                       timeout=int(request.bounds["timeout_seconds"]),
-                                       container_limits={"memory":int(request.bounds["memory_mb"])*1024*1024,"memswap":int(request.bounds["memory_mb"])*1024*1024,"cpushares":512},
-                                       labels={LABEL:run_id,INSTANCE:self.instance},decode=True,use_config_proxy=False)
-        deadline = time.monotonic() + request.bounds["timeout_seconds"]
-        try:
-            for chunk in stream:
+        # The build stream yields only between chunks, so a silent RUN step is stopped here: at the
+        # deadline or on cancel, the run's build-step containers are killed, which ends the build.
+        def watchdog():
+            while not done.wait(1):
                 if cancelled() or time.monotonic() > deadline:
-                    raise RuntimeFailure("cancelled" if cancelled() else "timeout", "Lab build stopped before verification.")
-                if "error" in chunk:
-                    raise RuntimeFailure("lab_build_failed", "Lab build failed. Bundle prerequisites must be available offline in the pinned base or context.")
+                    for container in self.client.containers.list(filters={"label":[f"{LABEL}={run_id}",f"{INSTANCE}={self.instance}"]}):
+                        try:
+                            container.kill()
+                        except docker.errors.APIError:
+                            pass  # It ended on its own.
+        threading.Thread(target=watchdog, daemon=True).start()
+        failed = False
+        try:
+            # Offline (ADR-0005): no build step reaches any network.
+            stream = self.client.api.build(fileobj=context,custom_context=True,tag=tag,rm=True,forcerm=True,pull=False,
+                                           network_mode="none", timeout=int(bounds["build_seconds"]) + 60,
+                                           container_limits={"memory":int(bounds["memory_mb"])*1024*1024,"memswap":int(bounds["memory_mb"])*1024*1024,"cpushares":512},
+                                           decode=True,use_config_proxy=False)
+            for chunk in stream:
+                failed = failed or "error" in chunk
         finally:
-            stream.close()
+            done.set()
+            context.close()
+        if cancelled():
+            raise RuntimeFailure("cancelled", "Lab build stopped before verification.")
+        if time.monotonic() > deadline:
+            raise RuntimeFailure("timeout", f"The Lab build exceeded its {int(bounds['build_seconds'])} s limit and was removed.")
+        if failed:
+            raise RuntimeFailure("lab_build_failed", "Lab build failed. The build is offline: its prerequisites must come from the Lab base, the bundle or its fetched dependencies.")
         image = self.client.images.get(tag)
+        if image.attrs["Size"] > bounds["image_bytes"]:
+            raise RuntimeFailure("lab_image_too_large", f"The Lab image is larger than its {bounds['image_bytes'] / 1024**3:.3g} GB limit and was removed.")
         event({"type":"lab_built","message":f"Built immutable lab image {image.id}; bases: {', '.join(bases)}."})
         return image.id

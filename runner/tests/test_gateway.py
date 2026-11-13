@@ -35,3 +35,17 @@ def test_only_a_run_hosting_a_herdr_session_may_reach_herdr_dev():
         assert hosts == {"provider_hosts": PROVIDERS["deepseek"] + extra}, operation
     engine.agent_backend = "native"  # Print mode: no session, so no herdr.dev for Analysis either.
     assert not engine.hosts_session(request)
+
+
+def test_lab_fetch_gateway_reaches_only_the_registry(monkeypatch):
+    """A Lab's dependency fetch reaches only the npm registry through the gateway, never a provider,
+    though its default Profile names openai."""
+    from numen_runner.contracts import RunRequest
+    from numen_runner.engine import gateway_config
+    request = RunRequest(attempt_token="t", kind="lab")
+    profile = request.profile.model_dump()
+    assert profile["provider_id"] == "openai"
+    monkeypatch.delenv("NUMEN_NPM_REGISTRY_URL", raising=False)
+    assert gateway_config(request, profile, False) == {"provider_hosts": ["registry.npmjs.org"]}
+    monkeypatch.setenv("NUMEN_NPM_REGISTRY_URL", "https://npm.mirror.example/")
+    assert gateway_config(request, profile, True) == {"provider_hosts": ["npm.mirror.example"]}

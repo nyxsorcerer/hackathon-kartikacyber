@@ -20,19 +20,27 @@ CMD ["python", "-m", "numen_runner.gateway"]
 FROM runtime AS probe
 USER 10001:10001
 CMD ["python", "-m", "numen_runner.workload"]
+FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d488ce091c69d442ebec9f103 AS node
 FROM runtime AS lab
-# Vulnerable applications are built on this base, so it carries the tools their builds reach for,
-# and a bundle's Dockerfile installs packages without switching user. The PoC workload that also
-# runs this image is always started as the unprivileged job user by the engine.
+# Vulnerable applications are built on this base, offline, so it carries the tools their builds
+# reach for, pinned Node (the first-release Lab stack) included, and a bundle's Dockerfile installs
+# packages without switching user. The PoC workload that also runs this image is always started as
+# the unprivileged job user by the engine.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git unzip \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=node /usr/local/bin/node /usr/local/bin/
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+# No dependency lifecycle script runs in a Lab (AC-A07): phase one passes --ignore-scripts, and this
+# global npmrc makes an npm install or rebuild in a bundle's RUN or CMD skip them too, while npm
+# start and npm run still work. /opt/lab is phase one's working volume, owned by the job user.
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && mkdir -p /usr/local/etc /opt/lab && echo ignore-scripts=true > /usr/local/etc/npmrc && chown 10001:10001 /opt/lab
 CMD ["python", "-m", "numen_runner.workload"]
 FROM runtime AS test
 RUN uv sync --locked --extra dev
 COPY runner/tests ./tests
 USER 10001:10001
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]
-FROM node:24.9.0-bookworm-slim@sha256:3e69116c924bfcba6c6979aff60d966c37aef56d488ce091c69d442ebec9f103 AS node
 # Agent images carry no Docker client and no image here receives an Engine socket (ADR-0005).
 FROM runtime AS node-runtime
 COPY --from=node /usr/local/bin/node /usr/local/bin/

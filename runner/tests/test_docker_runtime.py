@@ -23,14 +23,50 @@ def request(script, **limits):
     return RunRequest(attempt_token=str(uuid.uuid4()), kind="probe", inputs=[{"path":"recipe.py","content_base64":base64.b64encode(script.encode()).decode()}], limits={"timeout_seconds":30, **limits})
 
 
-def execute(engine, job):
-    run_id = str(uuid.uuid4())
+def execute(engine, job, run_id=None, event=lambda _:None):
+    run_id = run_id or str(uuid.uuid4())
     try:
-        return engine.run(run_id,job,lambda:False,lambda _:None)
+        return engine.run(run_id,job,lambda:False,event)
     finally:
         engine.cleanup(run_id)
         assert not engine.client.containers.list(all=True,filters={"label":f"{LABEL}={run_id}"})
         assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
+        assert not engine.client.volumes.list(filters={"label":f"{LABEL}={run_id}"})
+        # ADR-0005: every Lab's images, a failed build's intermediate layers included, go with its run.
+        assert not engine.client.images.list(all=True,filters={"label":f"{LABEL}={run_id}"})
+
+
+def lab(inputs, **limits):
+    """A small Lab run: its bounds stay low so it does not contend with other work on the Engine."""
+    return RunRequest(attempt_token=str(uuid.uuid4()), kind="lab", inputs=inputs,
+                      limits={"timeout_seconds":60,"memory_mb":512,"cpus":1,"pids":256,**limits})
+
+
+def tgz(files, prefix=""):
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w:gz") as archive:
+        for path, data in files.items():
+            data = data if isinstance(data, bytes) else data.encode()
+            info = tarfile.TarInfo(prefix + path)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return payload.getvalue()
+
+
+def node_bundle(app_files, bundle_files):
+    """One `bundle` archive input, as the backend submits a Proof bundle; app_files are vulnerable-app/."""
+    files = {**{"vulnerable-app/" + p: d for p, d in app_files.items()}, **bundle_files}
+    return [{"path":"bundle","content_base64":base64.b64encode(tgz(files)).decode(),"archive":True}]
+
+
+def node_lab(server, poc, steps=""):
+    """A tiny Node application with no dependencies, the only first-release Lab stack."""
+    return node_bundle({"Dockerfile":f'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY . /app/\n{steps}CMD ["node","/app/server.js"]\n',
+                        "package.json":'{"name":"lab-fixture","version":"1.0.0","private":true}\n', "server.js":server},
+                       {"poc.py":poc, "report.md":"Runtime Lab fixture."})
+
+
+SERVE = 'require("http").createServer((q,r)=>r.end(BODY)).listen(8080);\n'
 
 
 def test_agent_source_archive_is_staged_as_read_only_files(engine):
@@ -114,17 +150,163 @@ def test_actual_native_cli_version(engine,agent,version):
     assert version in output.decode()
 
 
-def test_lab_build_and_poc_actual_verification(engine):
-    files = {
-      "vulnerable-app/Dockerfile":'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY app.py /app/app.py\nCMD ["python","/app/app.py"]\n',
-      "vulnerable-app/app.py":'from http.server import BaseHTTPRequestHandler,HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200);self.end_headers();self.wfile.write(b"fixture-vulnerable-version-1")\nHTTPServer(("0.0.0.0",8080),H).serve_forever()\n',
-      "poc.py":'import os,time,urllib.request\nfor n in range(20):\n try:\n  data=urllib.request.urlopen(os.environ["TARGET_URL"],timeout=1).read();assert b"fixture-vulnerable-version-1" in data;print("reproduced fixture version 1");break\n except OSError: time.sleep(.2)\nelse: raise RuntimeError("lab unavailable")\n',
-      "report.md":"Fixture version 1; isolated verification only."
-    }
-    job = RunRequest(attempt_token=str(uuid.uuid4()),kind="lab",inputs=[{"path":path,"content_base64":base64.b64encode(data.encode()).decode()} for path,data in files.items()],limits={"timeout_seconds":60})
-    result = execute(engine,job)["result"]
-    assert result["verified"] and result["exit_code"] == 0 and result["pinned_image"].startswith("sha256:")
-    assert "reproduced fixture version 1" in result["log"]
+def test_lab_base_runs_node(engine):
+    output = engine.client.containers.run("asset-monitor-lab:0.1.0",["node","--version"],network_mode="none",user="10001:10001",remove=True)
+    assert output.decode().strip() == "v24.9.0"
+
+
+def test_lab_dependency_install_scripts_never_run(engine):
+    """AC-A07: a Lab build cannot run a dependency install script. A vendored dependency's preinstall,
+    install and postinstall each write a marker into its own directory; phase one installs it with
+    scripts disabled, and the bundle's own `RUN npm rebuild` skips them too. The fixture is a
+    `file:` tarball with a lockfile, so npm never needs a registry."""
+    import hashlib
+    scripts = {s: f"touch {s}-ran" for s in ("preinstall", "install", "postinstall")}
+    marker = tgz({"package.json": json.dumps({"name":"marker","version":"1.0.0","main":"index.js","bin":{"marker":"index.js"},"scripts":scripts}),
+                  "index.js": '#!/usr/bin/env node\nmodule.exports="marker-1.0.0";\n'}, "package/")
+    spec = "file:vendor/marker-1.0.0.tgz"
+    lock = {"name":"lab-fixture","version":"1.0.0","lockfileVersion":3,"requires":True,"packages":{
+        "":{"name":"lab-fixture","version":"1.0.0","dependencies":{"marker":spec}},
+        "node_modules/marker":{"version":"1.0.0","resolved":spec,"hasInstallScript":True,"bin":{"marker":"index.js"},
+                               "integrity":"sha512-"+base64.b64encode(hashlib.sha512(marker).digest()).decode()}}}
+    server = '''const fs=require("fs"),dir="/app/node_modules/marker/";
+const seen={installed:require("marker"),bin:fs.lstatSync("/app/node_modules/.bin/marker").isSymbolicLink(),
+ ran:["preinstall","install","postinstall"].filter(s=>fs.existsSync(dir+s+"-ran"))};
+''' + SERVE.replace("BODY","JSON.stringify(seen)")
+    poc = '''import json,os,sys,time,urllib.request
+for _ in range(50):
+    try:seen=json.loads(urllib.request.urlopen(os.environ["TARGET_URL"],timeout=1).read());break
+    except OSError:time.sleep(.2)
+else:sys.exit("the application never answered")
+print(json.dumps(seen))
+sys.exit(seen!={"installed":"marker-1.0.0","bin":True,"ran":[]})
+'''
+    app = {"Dockerfile":'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY . /app/\nRUN npm rebuild\nCMD ["node","/app/server.js"]\n',
+           "package.json":json.dumps({"name":"lab-fixture","version":"1.0.0","private":True,"dependencies":{"marker":spec}}),
+           "package-lock.json":json.dumps(lock), "vendor/marker-1.0.0.tgz":marker, "server.js":server}
+    events = []
+    result = execute(engine,lab(node_bundle(app,{"poc.py":poc,"report.md":"Install scripts never run."})),event=events.append)["result"]
+    assert result["verified"] is True and result["pinned_image"].startswith("sha256:"), result["log"]
+    assert json.loads(result["log"].strip().splitlines()[-1]) == {"installed":"marker-1.0.0","bin":True,"ran":[]}
+    assert [e["type"] for e in events if e["type"].startswith("lab_")] == ["lab_dependencies","lab_build","lab_built","lab_started"]
+
+
+def own_repository(server):
+    """The input lab_run sends for an Own-repository Proof: the repository at the Verdict's commit
+    under vulnerable-app/ (package.json, a lockfile with one vendored `file:` dependency, server.js)
+    and the bundle's Dockerfile, PoC and report over it."""
+    import hashlib
+    greet = tgz({"package.json":'{"name":"greet","version":"1.0.0"}',"index.js":'module.exports="hello from greet";\n'},"package/")
+    spec = "file:vendor/greet-1.0.0.tgz"
+    lock = {"name":"shop","version":"1.0.0","lockfileVersion":3,"requires":True,"packages":{
+        "":{"name":"shop","version":"1.0.0","dependencies":{"greet":spec}},
+        "node_modules/greet":{"version":"1.0.0","resolved":spec,"integrity":"sha512-"+base64.b64encode(hashlib.sha512(greet).digest()).decode()}}}
+    repository = {"package.json":json.dumps({"name":"shop","version":"1.0.0","dependencies":{"greet":spec}}),
+                  "package-lock.json":json.dumps(lock),"vendor/greet-1.0.0.tgz":greet,"public/index.txt":"index","server.js":server}
+    poc = '''import os,sys,time,urllib.request
+base=os.environ["TARGET_URL"]
+for _ in range(50):
+    try:urllib.request.urlopen(base,timeout=1).read();break
+    except OSError:time.sleep(.2)
+else:sys.exit("the application never answered")
+try:body=urllib.request.urlopen(base+"/?file=../package.json",timeout=2).read()
+except OSError as e:print("traversal refused:",e);sys.exit(1)
+print("read outside public/:",body.decode());sys.exit(b'"shop"' not in body)
+'''
+    return node_bundle(repository, {"vulnerable-app/Dockerfile":'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY . /app/\nCMD ["node","server.js"]\n',
+                                    "poc.py":poc,"report.md":"Path traversal in ?file."})
+
+
+# The Own repository's server.js at the Verdict's commit, and after its fix.
+TRAVERSAL = '''const fs=require("fs"),path=require("path"),greet=require("greet");
+require("http").createServer((q,r)=>{const f=new URL(q.url,"http://x").searchParams.get("file");
+ try{r.end(f?fs.readFileSync("/app/public/"+NAME):greet)}catch(e){r.statusCode=404;r.end()}}).listen(8080);
+'''
+
+
+def test_own_repository_node_vulnerability_reproduces(engine):
+    result = execute(engine,lab(own_repository(TRAVERSAL.replace("NAME","f"))))["result"]
+    assert result["verified"] is True and result["status"] == "verified", result["log"]
+    assert "read outside public/:" in result["log"] and '"shop"' in result["log"]
+
+
+def test_own_repository_at_the_fixed_revision_is_not_reproduced(engine):
+    result = execute(engine,lab(own_repository(TRAVERSAL.replace("NAME","path.basename(f)"))))["result"]
+    assert (result["status"], result["verified"], result["exit_code"]) == ("not_reproduced", False, 1)
+    assert "traversal refused: HTTP Error 404" in result["log"]
+
+
+def test_lab_has_no_outbound_network(engine):
+    """AC-A07 and ADR-0005: neither the application nor its PoC reaches another network, here a
+    listener on a bridge named like the application network, or resolves a name. No packet is
+    aimed at a public host: the listener is private and host.docker.internal is the Engine's own."""
+    run_id = str(uuid.uuid4())
+    labels = {LABEL:run_id, INSTANCE:engine.instance}
+    outside = engine.client.networks.create(f"asset-monitor-lab-proof-{run_id}_application", labels=labels)
+    listen = "import socket\ns=socket.create_server(('0.0.0.0',9000))\nwhile True:s.accept()[0].close()\n"
+    listener = engine.client.containers.run("asset-monitor-probe:0.1.0",["python","-c",listen],network=outside.name,labels=labels,detach=True)
+    connect = "import socket,sys,time\nfor _ in range(50):\n try:socket.create_connection((sys.argv[1],9000),1).close();break\n except OSError:time.sleep(.1)\nelse:sys.exit(1)\n"
+    try:
+        listener.reload()
+        ip = listener.attrs["NetworkSettings"]["Networks"][outside.name]["IPAddress"]
+        # The listener is live: a container on its own bridge reaches it.
+        engine.client.containers.run("asset-monitor-probe:0.1.0",["python","-c",connect,ip],network=outside.name,labels=labels,remove=True)
+        server = ('const net=require("net"),dns=require("dns"),seen={};\n'
+                  'net.connect({host:"IP",port:9000}).setTimeout(3000,function(){seen.tcp="timeout";this.destroy()})'
+                  '.on("connect",function(){seen.tcp="connected";this.destroy()}).on("error",e=>{seen.tcp=e.code});\n'
+                  'dns.lookup("host.docker.internal",e=>{seen.dns=e?e.code:"resolved"});\n'
+                  + SERVE.replace("BODY","JSON.stringify(seen)")).replace("IP",ip)
+        poc = '''import json,os,socket,sys,time,urllib.request
+for _ in range(100):
+    try:
+        app=json.loads(urllib.request.urlopen(os.environ["TARGET_URL"],timeout=1).read())
+        if {"tcp","dns"}<=set(app):break
+    except OSError:pass
+    time.sleep(.2)
+else:sys.exit("the application never reported")
+def tcp():
+    try:socket.create_connection(("IP",9000),3).close();return "connected"
+    except OSError as e:return type(e).__name__
+def dns():
+    try:socket.getaddrinfo("host.docker.internal",80);return "resolved"
+    except OSError:return "blocked"
+seen={"application":app,"poc":{"tcp":tcp(),"dns":dns()}}
+print(json.dumps(seen))
+sys.exit(any(v in ("connected","resolved") for side in seen.values() for v in side.values()))
+'''.replace("IP",ip)
+        result = execute(engine,lab(node_lab(server,poc)),run_id)["result"]
+        assert result["verified"] is True, result["log"]
+        seen = json.loads(result["log"].strip().splitlines()[-1])
+        assert seen["application"]["dns"] != "resolved" and seen["poc"] == {"tcp":seen["poc"]["tcp"],"dns":"blocked"}
+        assert "connected" not in (seen["application"]["tcp"], seen["poc"]["tcp"]), seen
+    finally:
+        engine.cleanup(run_id)
+
+
+LIMITS = {
+    # The 8 MiB layer takes the image past a limit of its base plus 1 MiB.
+    "image_bytes": ("RUN head -c 8388608 /dev/zero > /blob\n", 'print("built")', "lab_image_too_large"),
+    # A silent step: the build stream yields nothing until the step ends.
+    "build_seconds": ("RUN sleep 120\n", 'print("built")', "timeout"),
+    # The run's deadline starts after the build and covers the application's 10 s startup watch,
+    # so 15 s leaves the PoC asleep when it is stopped.
+    "timeout_seconds": ("", "import time\ntime.sleep(120)", "timeout"),
+}
+
+
+@pytest.mark.parametrize("limit", LIMITS)
+def test_lab_over_a_limit_fails_and_leaves_no_image(engine, limit):
+    import time
+    step, poc, code = LIMITS[limit]
+    value = {"image_bytes": engine.client.images.get("asset-monitor-lab:0.1.0").attrs["Size"] + 1024**2,
+             "build_seconds": 5, "timeout_seconds": 15}[limit]
+    owned = lambda: {i.id for i in engine.client.images.list(all=True,filters={"label":"org.pruferva.asset-monitor.image=true"})}
+    before, started = owned(), time.monotonic()
+    with pytest.raises(RuntimeFailure) as error:
+        execute(engine,lab(node_lab(SERVE.replace("BODY",'"up"'),poc,step),**{limit:value}))
+    assert error.value.code == code, error.value.safe_message
+    assert time.monotonic() - started < 60
+    assert owned() == before
 
 
 def test_memory_and_pid_limits_are_observed(engine):
@@ -235,9 +417,8 @@ def test_immutable_inputs_and_false_poc_result_are_preserved(engine):
     result=execute(engine,request('import json;from pathlib import Path\ntry:Path("/workspace/inputs/recipe.py").write_text("altered");blocked=False\nexcept OSError:blocked=True\nprint(json.dumps({"immutable":blocked}))'))
     assert result['result']['immutable']
     assert result['execution']['image_digest'].startswith('sha256:')
-    files={'vulnerable-app/Dockerfile':'FROM asset-monitor-lab:0.1.0\nCMD ["sleep","30"]\n','poc.py':'import sys;print("observed failure to reproduce");sys.exit(3)','report.md':'Fixture not reproduced.'}
-    job=RunRequest(attempt_token=str(uuid.uuid4()),kind='lab',inputs=[{'path':p,'content_base64':base64.b64encode(d.encode()).decode()}for p,d in files.items()],limits={'timeout_seconds':30})
-    result=execute(engine,job)['result']
+    files=node_lab('setTimeout(()=>{},30000);\n','import sys;print("observed failure to reproduce");sys.exit(3)')
+    result=execute(engine,lab(files,timeout_seconds=30))['result']
     assert result['verified'] is False and result['status']=='not_reproduced' and result['exit_code']==3
     assert 'observed failure to reproduce' in result['log']
 
@@ -320,17 +501,16 @@ def test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed(
     wrapper=TemporaryCleanupFailure()
     token='protected-engine-lifecycle-token'
     headers={'X-Broker-Token':token}
-    files={
-        'vulnerable-app/Dockerfile':'FROM asset-monitor-lab:0.1.0\nCOPY app.py /app.py\nCMD ["python","/app.py"]\n',
-        'vulnerable-app/app.py':'from http.server import BaseHTTPRequestHandler,HTTPServer\nclass H(BaseHTTPRequestHandler):\n def do_GET(self):self.send_response(200);self.end_headers();self.wfile.write(b"observed")\nHTTPServer(("0.0.0.0",8080),H).serve_forever()\n',
-        'poc.py':'import os,time,urllib.request\nfor _ in range(30):\n try:\n  assert urllib.request.urlopen(os.environ["TARGET_URL"],timeout=1).read()==b"observed";break\n except OSError:time.sleep(.1)\nelse:raise RuntimeError("lab unavailable")\n',
-        'report.md':'Lifecycle verification fixture.'}
-    body=RunRequest(attempt_token=str(uuid.uuid4()),kind='lab',inputs=[{'path':p,'content_base64':base64.b64encode(d.encode()).decode()}for p,d in files.items()],limits={'timeout_seconds':30}).model_dump()
+    files=node_lab(SERVE.replace('BODY','"observed"'),
+        'import os,time,urllib.request\nfor _ in range(30):\n try:\n  assert urllib.request.urlopen(os.environ["TARGET_URL"],timeout=1).read()==b"observed";break\n except OSError:time.sleep(.1)\nelse:raise RuntimeError("lab unavailable")\n')
+    body=lab(files,timeout_seconds=30).model_dump()
     run_id=None
     try:
         with TestClient(create_app(token,tmp_path,engine=wrapper,reconcile_interval=.05)) as client:
             run_id=client.post('/internal/runs',headers=headers,json=body).json()['run_id']
-            deadline=time.monotonic()+20
+            # Phase one, the build and the application's 10 s startup watch come first: about 20 s
+            # on a loaded Docker Desktop, so 20 s was a race.
+            deadline=time.monotonic()+120
             while time.monotonic()<deadline:
                 state=client.get('/internal/runs/'+run_id,headers=headers).json()
                 if state.get('error',{}).get('code')=='cleanup_pending':
@@ -353,80 +533,6 @@ def test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed(
         wrapper.available=True
         if run_id:
             engine.cleanup(run_id)
-
-
-PHP_BASE = "php@sha256:8c0ac7363ba26de6279a0614a9072277e3c86f90d11447002bdf74ad7db9aac3"
-
-
-def test_lab_builds_and_verifies_an_application_with_its_own_database(engine):
-    """The reported blocker: a bundle that installs dependencies, runs a database and serves."""
-    run_id = str(uuid.uuid4())
-    start = """#!/bin/sh
-set -e
-mkdir -p /run/mysqld /var/lib/mysql
-mariadb-install-db --user=root --datadir=/var/lib/mysql >/dev/null 2>&1 || true
-mariadbd --user=root --datadir=/var/lib/mysql --skip-networking=0 --bind-address=127.0.0.1 &
-for i in $(seq 1 60); do mariadb -u root -e 'select 1' >/dev/null 2>&1 && break; sleep 1; done
-mariadb -u root -e "create database app; create user 'app'@'%' identified by 'app'; grant all on app.* to 'app'@'%'; create table app.note (body text); insert into app.note values ('uTimezone-sink');"
-exec php -S 0.0.0.0:8080 -t /app /app/index.php
-"""
-    index = """<?php
-$db = new mysqli('127.0.0.1', 'app', 'app', 'app');
-$row = $db->query('select body from app.note')->fetch_assoc();
-// The sink the finding is about: the stored value is rendered without encoding.
-echo "<div>" . $row['body'] . "</div>";
-"""
-    poc = """import os, time, urllib.request
-target = os.environ["TARGET_URL"]
-for _ in range(240):
-    try:
-        body = urllib.request.urlopen(target, timeout=5).read().decode()
-        break
-    except Exception:
-        time.sleep(1)
-else:
-    raise SystemExit("application never answered")
-assert "uTimezone-sink" in body, body[:200]
-print("observed the stored value rendered by the application")
-"""
-    dockerfile = (
-        f"FROM {PHP_BASE}\n"
-        "RUN apt-get update && apt-get install -y --no-install-recommends mariadb-server \\\n"
-        "    && rm -rf /var/lib/apt/lists/* && docker-php-ext-install mysqli >/dev/null\n"
-        "COPY app/ /app/\n"
-        "COPY start.sh /start.sh\n"
-        "EXPOSE 8080\n"
-        'CMD ["sh", "/start.sh"]\n'
-    )
-    bundle = {
-        "poc.py": poc.encode(),
-        "report.md": b"# Fixture reproduction\n",
-        "vulnerable-app/Dockerfile": dockerfile.encode(),
-        "vulnerable-app/compose.yaml": b"services:\n  app:\n    build: .\n",
-        "vulnerable-app/README.md": b"Fixture application with its own database.\n",
-        "vulnerable-app/application.lock.json": b'{"version":"9.5.3","source_ref":"' + b"9" * 40 + b'","images":[]}',
-        "vulnerable-app/start.sh": start.encode(),
-        "vulnerable-app/app/index.php": index.encode(),
-    }
-    payload = io.BytesIO()
-    with tarfile.open(fileobj=payload, mode="w:gz") as archive:
-        for path, data in bundle.items():
-            info = tarfile.TarInfo(path)
-            info.size = len(data)
-            archive.addfile(info, io.BytesIO(data))
-    job = RunRequest(
-        attempt_token=run_id, kind="lab",
-        inputs=[{"path":"bundle","content_base64":base64.b64encode(payload.getvalue()).decode(),"archive":True}],
-        limits={"timeout_seconds":2400,"memory_mb":4096,"cpus":2,"pids":4096})
-    events = []
-    try:
-        result = engine.run(run_id, job, lambda: False, events.append)
-        assert result["result"]["verified"] is True, result["result"]
-        assert "observed the stored value" in result["result"]["log"], result["result"]["log"][-400:]
-        assert [e["type"] for e in events if e["type"].startswith("lab_")] == ["lab_build","lab_built","lab_started"]
-    finally:
-        engine.cleanup(run_id)
-        assert not engine.client.networks.list(filters={"label":f"{LABEL}={run_id}"})
 
 
 def test_analysis_container_has_no_docker_daemon_no_registry_and_only_provider_and_herdr_egress(engine, monkeypatch):

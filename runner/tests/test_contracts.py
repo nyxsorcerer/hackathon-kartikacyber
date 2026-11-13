@@ -20,6 +20,26 @@ def test_limits_only_lower_and_credentials_required():
     assert RunRequest(attempt_token="one", kind="probe", limits={"memory_mb": 128}).bounds["memory_mb"] == 128
 
 
+def test_lab_limits_are_the_adr_0005_ceilings():
+    """A Lab image is at most 4 GB, its build 15 minutes and its run 10 (ADR-0005); callers only lower them."""
+    bounds = RunRequest(attempt_token="one", kind="lab").bounds
+    assert (bounds["timeout_seconds"], bounds["build_seconds"], bounds["image_bytes"]) == (600, 900, 4 * 1024**3)
+    for limit in ({"timeout_seconds": 601}, {"build_seconds": 901}, {"image_bytes": 4 * 1024**3 + 1}):
+        with pytest.raises(ValueError, match="must lower the broker maximum"):
+            RunRequest(attempt_token="one", kind="lab", limits=limit)
+    assert RunRequest(attempt_token="one", kind="lab", limits={"build_seconds": 5}).bounds["build_seconds"] == 5
+    for limit in ({"build_seconds": 5}, {"image_bytes": 1024}):
+        with pytest.raises(ValueError, match="unknown execution limit"):
+            RunRequest(attempt_token="one", kind="probe", limits=limit)
+
+
+def test_a_lab_request_carries_no_credential():
+    """PRD A07: a Lab, its dependency fetch included, runs with no model credential."""
+    with pytest.raises(ValueError, match="a Lab run carries no credential"):
+        RunRequest(attempt_token="one", kind="lab", profile={"credential": {"api_key": "k"}})
+    assert RunRequest(attempt_token="one", kind="lab").profile.credential == {}
+
+
 def test_output_integrity_and_aggregate_limit():
     data = b"hi"
     item = {"path": "report.md", "content_base64": base64.b64encode(data).decode(), "size": 2, "sha256": hashlib.sha256(data).hexdigest()}

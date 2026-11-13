@@ -100,6 +100,8 @@ services:
       NUMEN_RUNNER_STATE: /data/runner
       NUMEN_RUNNER_CONCURRENCY: ${NUMEN_RUNNER_CONCURRENCY:-4}
       NUMEN_AGENT_BACKEND: ${NUMEN_AGENT_BACKEND:-herdr}
+      # Lab phase one fetches dependencies from this registry only (https on port 443).
+      NUMEN_NPM_REGISTRY_URL: ${NUMEN_NPM_REGISTRY_URL:-https://registry.npmjs.org}
     volumes: [/var/run/docker.sock:/var/run/docker.sock, runner-state:/data/runner]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=3)"]
@@ -179,6 +181,8 @@ services:
     environment:
       NUMEN_DOCKER_TESTS: "1"
       NUMEN_RUNNER_INSTANCE: runtime-tests
+      # A test Lab never reaches a real registry: its fixtures vendor every dependency.
+      NUMEN_NPM_REGISTRY_URL: https://registry.invalid
     volumes: [/var/run/docker.sock:/var/run/docker.sock]
     command: [pytest, -q, -p, no:cacheprovider]
     network_mode: none

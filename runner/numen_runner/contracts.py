@@ -18,9 +18,10 @@ MAXIMA = {"timeout_seconds": 1800, "memory_mb": 2048, "cpus": 2.0, "pids": 128,
 # thousands of files and hundreds of megabytes before its dependencies are vendored at all.
 ARCHIVE_FILES, ARCHIVE_BYTES = 65536, 512 * 1024 * 1024
 # A lab run carries a whole application and builds it, so it is bounded like a build, not like a
-# read-only analysis. Its ceiling applies only to that kind.
-LAB_MAXIMA = {"timeout_seconds": 10800, "memory_mb": 8192, "cpus": 4.0, "pids": 4096,
-              "output_bytes": 64 * 1024 * 1024, "input_bytes": 512 * 1024 * 1024}
+# read-only analysis. Its ceiling applies only to that kind. ADR-0005: a Lab image is at most 4 GB,
+# its build gets 15 minutes and its run (timeout_seconds, which starts after the build) 10.
+LAB_MAXIMA = {"timeout_seconds": 600, "build_seconds": 900, "image_bytes": 4 * 1024**3, "memory_mb": 8192,
+              "cpus": 4.0, "pids": 4096, "output_bytes": 64 * 1024 * 1024, "input_bytes": 512 * 1024 * 1024}
 PROVIDERS = {"openai": ["api.openai.com", "chatgpt.com", "auth.openai.com"],
              "claude": ["api.anthropic.com", "claude.ai", "platform.claude.com", "console.anthropic.com"],
              "deepseek": ["api.deepseek.com"], "commandcode": ["api.commandcode.ai"]}
@@ -166,6 +167,8 @@ class RunRequest(BaseModel):
                 seen.add(path)
         if total > self.bounds["input_bytes"]:
             raise ValueError("aggregate input byte limit exceeded")
+        if self.kind == "lab" and self.profile.credential:
+            raise ValueError("a Lab run carries no credential")
         if self.kind in ("agent", "capabilities", "account_login"):
             p = self.profile
             if p.provider_id not in PROVIDERS:

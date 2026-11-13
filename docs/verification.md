@@ -483,6 +483,102 @@ After the review fixes, on the same machine:
 | `make test-ui` | 120 passed in 19 files |
 | `make test-journey` | passed (all 8 PASS lines, JOURNEY PASSED); the `asset-monitor-test` stack was then stopped with its volumes kept |
 
+## Phase 4: Labs behind Approval (2026-11-13)
+
+Phase 4 (A07 Labs, the Approval bullets of A15), T1–T5. This section records each task, the acceptance mapping and the phase's verification.
+
+What each task changed:
+- **T1, Approval (A15).**
+  - `POST /findings/{id}/lab-runs` takes `{password}` (`ApprovalInput`, `repr=False`). One reusable check, `approval(request, db, password)` in `create_app`, runs before the completeness check and the enqueue, and Phase 6 will call it too. It first calls `throttle(request, scope, code, message)`, login's old inline limit moved out and keyed by `(scope, client address)`: 10 attempts per 60 s, then 429 `approval_rate_limited`. It then verifies the password against the Operator's hash. A missing, empty or wrong password gets 403 `approval_refused`, also straight after a good Approval: there is no cache and no window. CSRF is the router's existing `auth` dependency.
+  - A new Lab run records an Action `{action: approved, approved: lab_run, job_id, artifact_revision}` on the Finding; an idempotent repeat records no second one. The password reaches no job input, Action, event or log.
+  - `POST /jobs/{id}/retry` refuses a `lab_run` with 409 `approval_required`, and the block that copied a Lab run for a retried Lab job is deleted.
+  - UI: the Lab panel's button reads Start Lab and opens a password dialog (`type=password`, `autoComplete=current-password`); a refusal keeps it open with the message. The history shows Approved · Lab, Jobs hides Retry for `lab_run`, and the Lab job summary reads Reproduced or Not reproduced.
+- **T2, offline build and the ADR-0005 limits (A07).**
+  - `asset-monitor-lab:0.1.0` carries pinned Node 24.9.0 and npm. `FROM` may name only it, `scratch` or an earlier stage, `COPY --from` only an earlier stage, and a URL `ADD`/`COPY` source is refused. The digest-base pull, the `lab_base_fetch` event and the retained base cache are deleted. `artifacts.completeness` mirrors these rules, and lock `images` must be exactly `asset-monitor-lab:0.1.0`.
+  - `build_lab` builds with `network_mode="none"`. A `LABEL` with the run's labels follows every `FROM`, so every layer and build-step container carries the run label, and cleanup lists images with `all=True` and removes leaves first.
+  - A watchdog kills the run's build-step containers at `build_seconds` (also through a silent `RUN`); an image over `image_bytes` fails with `lab_image_too_large`. `LAB_MAXIMA` is 600 s run, 900 s build and 4 GiB; the run deadline starts after the build. The backend's Lab defaults follow, and it waits up to 1800 s for a Lab.
+  - The application runs on the internal `numen-job-<run>` network only, alias `application`; the Lab's egress bridge is gone.
+- **T3, phase one and Node only (A07).**
+  - A bundle without `vulnerable-app/package.json` fails with `lab_stack_unsupported` before any Engine call.
+  - `fetch_dependencies` runs a fixed `npm ci`/`npm install --ignore-scripts --no-audit --no-fund` in the Lab base, nonroot and bounded, on an internal `asset-monitor-lab-fetch-<run>` network whose gateway allows only the `NUMEN_NPM_REGISTRY_URL` host. Its environment has no credential, and `RunRequest` refuses a `lab` request that carries one. `node_modules` joins the build context, bounded by `image_bytes`.
+  - The Lab base's global npmrc sets `ignore-scripts=true`, so npm in a bundle's `RUN` or `CMD` skips dependency scripts too. The `lab_dependencies` runtime event replaces `lab_base_fetch`.
+- **T4, Own-repository Proofs, results and the agents' Lab contract (A07).**
+  - For a `commit` Finding whose source commit is in a repository its Application links as Own, `Workflows.lab_run` sends that repository at the Verdict's commit, from its stored snapshot, under `vulnerable-app/` with the bundle's files over it (without the snapshot's `manifest.json` and the repository's `.dockerignore`), and records `source_ref` in `LabRun.data`. Upstream and Numen CVE Findings keep the bundle-only Lab.
+  - A verified Lab still confirms with `{by: proof, lab_run_id}`; a not-reproduced or failed one makes no lifecycle call.
+  - `prompt_templates/sections/bundle.md` describes the offline Node Lab, its base, its limits and the Own-repository case, and commit Analysis gets an `own_repository` fact.
+- **T5, journey, docs and this sweep.**
+  - The journey's uploaded bundle is a tiny Node app (`package.json`, a dependency-free `package-lock.json`, `server.js`) whose PoC reads a leaked value through `TARGET_URL`. A new step sends a wrong password (403 `approval_refused`), then the bootstrap password (202), waits for the Lab on the real Engine, and asserts a `verified` Lab run, a Confirmed Finding with cause `proof` and the `approved` event. The Lab took about 18 s through `lab_dependencies`, `lab_build`, `lab_built` and `lab_started`.
+  - A failed `lab_run` job no longer shows a "retry" remedy: its hint reads "A Lab is not retried: fix the cause, then start a new Lab from its Finding with a new Approval.", and the retry fact is left out (UI `Jobs` "explains a lab_run failed with broker_unavailable", seen failing first).
+  - The runtime test `test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed` waited 20 s for its Lab to reach `cleanup_pending`. With phase one, the build and the 10 s startup watch in front, that is about what a Lab takes, and the first full `make test-runtime` of this task failed there with the run still `running`. It now waits up to 120 s.
+  - `runner/README.md`'s Lab bundles section is now Labs, in the order Node only, phase one, phase two, limits, run. The contract's `lab-runs` route names its 403 and 429 codes, and its verified adjustments record this phase's deviations. README step 7 and the runtime paragraph describe Start Lab with Approval and the offline Node Lab.
+
+Acceptance tests, all passing in the runs below:
+
+| Criterion | Tests |
+|---|---|
+| AC-A15: an Approval with a missing or wrong password is refused, even straight after another Approval | backend `test_an_approval_checks_the_password_on_every_request` (a good Approval, then wrong, missing and empty passwords refused with 403, no second job; a forged CSRF token refused; the password in no job, Action, event or log), `test_approvals_are_rate_limited_like_login`, `test_a_lab_job_is_never_retried_without_a_new_approval`; UI `Findings` "starting a Lab asks for the Operator's password", `Jobs` "offers no Retry for a failed Lab: a new Lab needs a new Approval"; journey Approval step (wrong password, then the real Engine) |
+| AC-A07: a Lab build cannot run a dependency install script | runtime `test_lab_dependency_install_scripts_never_run` (a vendored `file:` tarball with preinstall, install and postinstall scripts and a `RUN npm rebuild`; seen failing with scripts enabled in phase one and with the npmrc removed); runner `test_lab_fetch_gateway_reaches_only_the_registry`, `test_a_lab_request_carries_no_credential` |
+| AC-A07: a Lab run cannot reach any network | runtime `test_lab_has_no_outbound_network` (the app and the PoC: TCP to a live listener on another bridge times out, DNS is blocked); the offline build itself in every runtime Lab test |
+| AC-A07: a Lab over a limit fails visibly and leaves no image behind | runtime `test_lab_over_a_limit_fails_and_leaves_no_image[image_bytes]`, `[build_seconds]` (a silent `RUN sleep`), `[timeout_seconds]` (no container, network, volume or image left, and the set of `org.pruferva.asset-monitor.image=true` images unchanged); backend `test_a_lab_over_a_limit_fails_visibly_and_changes_no_state`, `test_lab_runs_default_to_the_adr_0005_limits`; runner `test_lab_limits_are_the_adr_0005_ceilings`, `test_every_stage_of_a_lab_build_carries_the_run_label` (so cleanup removes a failed build's layers) |
+| AC-A07: a Lab that fails to reproduce stays visible as not reproduced | runtime `test_own_repository_at_the_fixed_revision_is_not_reproduced`; backend `test_a_lab_that_does_not_reproduce_stays_visible_and_changes_no_state`; UI `Findings` "starting a Lab asks for the Operator's password" (Not reproduced shown) |
+| A07: Node is the only Lab stack; the Lab base runs Node | runner `test_a_lab_refuses_a_bundle_that_is_not_node`; runtime `test_lab_base_runs_node` |
+| A07: an Own-repository Proof's app is the Own repository at the Verdict's commit; Upstream Proofs stay bundle-only | backend `test_an_approved_lab_builds_the_own_repository_at_the_verdicts_commit`, `test_an_upstream_proof_keeps_the_bundle_only_lab`; runtime `test_own_repository_node_vulnerability_reproduces` |
+| A07: bundles name only the bundled base and no URL source; agents are told so | backend `test_completeness_accepts_exactly_the_bases_the_lab_verifier_builds`, `test_completeness_refuses_directives_the_lab_verifier_rejects`, `test_completeness_requires_lock_images_to_be_the_bundled_lab_base`, `test_the_bundle_section_describes_the_offline_node_lab` |
+| Plan Done-when: a fixture Own-repository vulnerability reproduces after Approval | three pieces together: backend `test_an_approved_lab_builds_the_own_repository_at_the_verdicts_commit` (Approval, then the Lab input built from the Own snapshot, against `FixtureBroker`), runtime `test_own_repository_node_vulnerability_reproduces` (the same input shape on the real Engine), and the journey Approval step (API, worker, broker and the real Engine on a bundle-only fixture Finding) |
+| Plan Done-when: runtime tests show that an install script does not run, the Lab has no network, and an oversized image fails and leaves nothing behind | the runtime rows above |
+| Plan Done-when: AC-A15's Approval bullet has a test | the AC-A15 row above |
+
+Deviations from the plan, PRD and ADRs:
+- **Lab bases.** Numen's bundle contract allowed digest-pinned bases. Lab bases are now only `asset-monitor-lab:0.1.0` (pinned Node 24.9.0), `scratch` and earlier stages, and URL `ADD`/`COPY` sources are refused, because the Engine would fetch these outside `--network none` and a retained base contradicts ADR-0005's "images removed after every run". A carried-over bundle with a digest base reads as Draft and is refused at Lab start. A Node app that needs another Node version cannot get one in this release.
+- **Install scripts.** AC-A07's "cannot run a dependency install script" is enforced for npm: `--ignore-scripts` in phase one and `ignore-scripts=true` in the Lab base's global npmrc, which covers `npm install`, `ci` and `rebuild` in `RUN` or `CMD`. `RUN` stays accepted and runs offline. A bundle that runs a dependency's script directly (`node node_modules/x/install.js`) still runs it, with no network. `composer --no-scripts` is not implemented, because Node is the only first-release stack.
+- **Node only, checked late.** `artifacts.completeness` does not check the Node-only rule, so a non-Node bundle reads as complete and is refused with `lab_stack_unsupported` only at Lab start, after its Approval.
+- **Image limit.** The 4 GB is checked after the build and covers the whole image, the Lab base layers included. A step that writes more than the host disk holds is stopped only by the 15-minute build deadline; the phase-one dependency volume is bounded only by the disk and that deadline.
+- **Registry egress untested against a registry.** No test reaches a registry: runtime fixtures vendor `file:` dependencies and the gateway's allowlist is unit-tested. With a real registry, the gateway's 64 MiB-per-tunnel bound could cut a large install over one keep-alive connection; lockfiles that resolve from other registries or git URLs fail visibly; the registry must be https on port 443.
+- **Approval rate limit.** Like login's, it is in memory per app process: it resets on restart and is keyed by client address, so behind the Operator's tunnel every request shares one address. Refused Approvals are rate-limited but not recorded as Actions; only granted ones are.
+- **No Lab retry.** Retrying a `lab_run` job is refused; a new Lab needs a new Approval. The worker's crash recovery still re-runs an approved job at least once, which is the approved action, not a new one.
+- **Own-repository Labs.** They use the stored snapshot, which omits binary media and is bounded (20,000 files / 64 MiB), and `package.json` must sit at the repository root. Completeness is judged on the bundle alone, so an Own-repository Dockerfile must `COPY . /app/`. Finding generation (regenerating a bundle) gets no `own_repository` fact, so its agent may bundle a minimal app, which still runs because the bundle's files win. A repository that is Own for one Application and Upstream for another gets one drafted bundle published to both Findings, and a Dockerfile-only bundle written for the Own case fails the Upstream Application's bundle-only Lab with `lab_stack_unsupported`. Upstream and Numen CVE Findings keep the bundle-only Lab until Phase 7.
+- **Reproduces after Approval.** No single automated test covers the Own-repository overlay and the real Engine together; the Done-when row above names the three pieces that do.
+- **Run deadline.** The Lab's 10 minutes now start after the build and include the app's startup, where Numen gave one shared budget, so a slowly booting app may time out. The backend's per-container memory default (6144 MB) is unchanged; runtime tests pass small limits.
+- **No migration.** The Approval is an `actions` row and `LabRun.data` (JSON) gains `source_ref`.
+
+**Stale-reference sweep.** `git grep -n -i "verify in lab\|lab_base_fetch\|digest-pinned base\|with network\|internet access\|Executable RUN"` over `backend`, `frontend`, `runner`, `tests`, `README.md` and `docs/implementation-contract.md` leaves three hits, all deliberate:
+- `backend/tests/test_prompts.py` (twice): `test_the_bundle_section_describes_the_offline_node_lab` lists these phrases to assert the bundle instructions no longer contain them;
+- `docs/implementation-contract.md`'s agent-run paragraph: Codex keeps its shell "in its native `:workspace` sandbox with network off except for `version_recipe`", which is about agent runs, not the Lab.
+
+A broader sweep for "digest", "lab verif" and "retry" in the README, the runner README and the UI found README line 52 (a bundle "must pin every base by digest", built "with the network its dependencies need") and the generic "retry" remedies shown for a failed Lab, both fixed above. The Finding page's "Lab verification" wording and the generic "Retry" remedies for other job kinds are accurate and kept. The history entries above (PHP/mariadb Lab, build daemon) record what was verified at the time and are left as they are.
+
+**Outside traffic.** No paid inference was made, and no request reached a real Asset, GitHub, Discord, a package registry or `herdr.dev`. Phase one's registry is `https://registry.invalid` for runtime tests and in the test stack's broker, the journey's lockfile has no dependencies, and runtime fixtures vendor `file:` tarballs. The no-network test aims only at a private listener on a test bridge and at `host.docker.internal`. Model providers are `FixtureBroker` or loopback fixtures. Numen's pre-existing gateway runtime test still opens one credential-free TCP tunnel to `api.openai.com:443` to prove that a provider host is allowed. It sends no TLS handshake and no request.
+
+Review fixes, made after the first table of runs below and verified by the second:
+- **Dockerfile read as the Engine reads it.** Both validators and `labelled()` joined a line ending in `\` before skipping comments, while Docker drops a comment line first. `FROM asset-monitor-lab:0.1.0` / `# note \` / `FROM attacker.example/x:1` passed both checks, the Engine pulled the hidden base, and `labelled()` added no run label after it, so cleanup and the build watchdog missed that stage. `ARG U=https://…` with `ADD $U /x` and a `# escape=` directive got past the URL and continuation rules the same way. `engine.instructions` (runner) and its mirror `artifacts.dockerfile_instructions` (backend; the two packages ship in separate images) now follow Docker 20.10's parser: comment lines are dropped before joining, blank and comment lines inside a continuation are skipped, and continuations join without an added space. Parser directives and `$` in `FROM`, `COPY` and `ADD` are refused. `labelled()` emits exactly those instructions with a `LABEL` after each `FROM`, and cleanup also removes the `asset-monitor-lab-job:<run>` tag by name. Tests: runner `test_lab_accepts_a_real_build_but_never_a_host_path_or_a_floating_base` (comment-continued `FROM`, `ADD $U`, `FROM $B`, `# escape=`), `test_every_stage_of_a_lab_build_carries_the_run_label`; backend `test_completeness_reads_the_dockerfile_shapes_the_verifier_will_see`.
+- **A Malicious change never gets a Lab** (ADR-0004 rule 6, AC-A07). A Finding a Malicious change Verdict opened could still be given a complete bundle by upload or generation, and for an Own repository `lab_run` would then build and run the malicious commit. `domain.malicious_change` (opened by that Verdict, or the source commit's newest Verdict is Malicious change) refuses `POST /findings/{id}/lab-runs` with 409 `lab_not_allowed` after the Approval check, and `Workflows.lab_run` checks again before the merge, so a Lab queued before a later Analysis found the commit malicious fails without reaching the broker. Test: backend `test_a_malicious_change_never_gets_a_lab`.
+- **Cached artifact state.** A Finding caches its artifact state by revision, and this phase tightened completeness, so a carried-over digest-base bundle still read as complete until its next upload. The cache now also carries `artifacts.RULES` (2), and a state cached under other rules is recomputed on read, so such a bundle reads as Draft as stated above. No migration: the cache lives in `findings.data`.
+
+On Docker Desktop (Engine 20.10, 8 GB):
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed (ruff, eslint, tsc, vite build; only Vite's existing chunk-size warning) |
+| `make test-unit` | backend 234 passed; runner 129 passed, 63 skipped |
+| `make test-integration` | 372 passed against PostgreSQL |
+| `make test-runtime` | first run 191 passed, 1 failed (`test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed`, its 20 s wait; see T5); after the fix, 192 passed |
+| `make test-ui` | 123 passed in 19 files |
+| `make test-journey` | passed (all 9 PASS lines, including "Approval refuses a wrong password, then a Lab on the real Engine reproduces the Proof and confirms the Finding", JOURNEY PASSED), before and again after the UI and runtime-test changes; the `asset-monitor-test` stack was then stopped with its volumes kept. No runtime-tests containers, volumes or Lab networks remain |
+| `vitest run src/pages/Jobs.integration.test.tsx` (frontend-tests) with the Lab hint disabled | 1 failed ("explains a lab_run failed with broker_unavailable": the old "then retry" text), 21 passed; with the hint, the full UI suite above passes |
+
+After the review fixes, on the same Engine (the parser claim was also checked there: the classic builder ran `RUN` on the line after `# note \`, and the throwaway image was removed):
+
+| Command | Result |
+|---|---|
+| `make build` | passed |
+| `make check` | passed (only Vite's existing chunk-size warning) |
+| `make test-unit` | backend 239 passed; runner 129 passed, 63 skipped |
+| `make test-integration` | 377 passed against PostgreSQL |
+| `make test-runtime` | 192 passed |
+| `make test-ui` | 123 passed in 19 files |
+| `make test-journey` | passed (all 9 PASS lines, JOURNEY PASSED); the `asset-monitor-test` stack was then stopped with its volumes kept, and no `asset-monitor-lab-job` image remains |
+
 ## Commit review correction (2026-10-06)
 
 Program selection now precedes global review and only that program's records are fetched; switching programs clears the previous queue. New triage output includes a potential issue title and fix/hardening/introduction kind. Complete unrelated results are dismissed, incomplete evidence stays pending, and manual review actions after job submission take precedence. Jev's three typed questions follow its official contract; existing source messages and legacy reports remain readable without inventing classifications.

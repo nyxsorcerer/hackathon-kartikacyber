@@ -12,7 +12,7 @@ from .domain import event
 RUNTIME_EVENTS = {
     "lab_started": "Pinned application launched for lab verification",
     "lab_application_exited": "The pinned application stopped before it could be verified",
-    "lab_base_fetch": "Fetching the bundle's pinned base before the offline lab build",
+    "lab_dependencies": "Fetching the Lab's dependencies with install scripts disabled",
     "lab_build": "Building the pinned lab image",
     "lab_built": "Built the pinned lab image",
     "result_repair": "The agent was asked to restate its final answer as the result",

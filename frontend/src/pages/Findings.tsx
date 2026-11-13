@@ -594,6 +594,7 @@ function FindingBody({
 }) {
   const [generate, setGenerate] = useState(false);
   const [upload, setUpload] = useState(false);
+  const [approve, setApprove] = useState(false);
   const navigate = useNavigate();
   const application = useResource(
     `/applications/${finding.application_id}`,
@@ -857,25 +858,18 @@ function FindingBody({
         )}
       </Panel>
       <Panel
-        title="Lab verification"
-        description="Runs this artifact set against its isolated vulnerable Docker application."
+        title="Lab"
+        description="Builds the vulnerable application and runs this Proof in a disposable Lab, only after your Approval."
         actions={
-          <ActionButton
+          <button
             className="primary"
             disabled={!complete}
             title={complete ? undefined : "Complete the bundle first"}
-            onAction={() =>
-              queueJob(
-                `/findings/${finding.id}/lab-runs`,
-                {},
-                undefined,
-                "Lab verification queued.",
-              )
-            }
+            onClick={() => setApprove(true)}
           >
             <FlaskConical size={15} aria-hidden="true" />
-            Verify in lab
-          </ActionButton>
+            Start Lab
+          </button>
         }
       >
         {finding.lab_runs.length ? (
@@ -916,8 +910,8 @@ function FindingBody({
             title="Not verified"
             description={
               complete
-                ? "Verify in lab to record a result for the pinned vulnerable application."
-                : "Complete the required artifacts before requesting isolated lab verification."
+                ? "Start Lab to run the Proof against the pinned vulnerable application."
+                : "Complete the required artifacts before a Lab can run the Proof."
             }
           />
         )}
@@ -936,6 +930,13 @@ function FindingBody({
         <ArtifactUpload
           finding={finding}
           onClose={() => setUpload(false)}
+          refresh={refresh}
+        />
+      )}
+      {approve && (
+        <LabApproval
+          finding={finding}
+          onClose={() => setApprove(false)}
           refresh={refresh}
         />
       )}
@@ -1048,7 +1049,9 @@ function HistoryEvent({
               `${humanize(text(event, "from") || "")} → ${humanize(text(event, "to") || "")}`,
               causeLabel(event.cause),
             ]
-          : [humanize(action), undefined];
+          : action === "approved"
+            ? ["Approved · Lab", undefined]
+            : [humanize(action), undefined];
   return (
     <li className="timeline-item">
       <span className="timeline-marker neutral" aria-hidden="true" />
@@ -1060,6 +1063,71 @@ function HistoryEvent({
         {detail && <small>{detail}</small>}
       </div>
     </li>
+  );
+}
+/** The Approval that starts a Lab (A15): the Operator's password, checked on this request. */
+function LabApproval({
+  finding,
+  onClose,
+  refresh,
+}: {
+  finding: Finding;
+  onClose: () => void;
+  refresh: () => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  return (
+    <Modal
+      title="Approve the Lab"
+      description="Asset Monitor builds the vulnerable application and runs the Proof in a disposable Lab. Enter your password to approve this Lab."
+      onClose={onClose}
+    >
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          setBusy(true);
+          setError(undefined);
+          try {
+            await queueJob(
+              `/findings/${finding.id}/lab-runs`,
+              { password },
+              undefined,
+              "Lab started after Approval.",
+            );
+            refresh();
+            onClose();
+          } catch (err) {
+            setError(err instanceof Error ? err.message : "Approval failed.");
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <label>
+          Password
+          <input
+            required
+            type="password"
+            autoComplete="current-password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            data-autofocus
+          />
+        </label>
+        {error && <ErrorNote>{error}</ErrorNote>}
+        <div className="form-actions">
+          <button className="secondary" type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="primary" disabled={busy || !password}>
+            <FlaskConical size={15} aria-hidden="true" />
+            {busy ? "Approving…" : "Approve"}
+          </button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 function ArtifactUpload({
@@ -1079,7 +1147,7 @@ function ArtifactUpload({
   return (
     <Modal
       title="Upload finding artifacts"
-      description="Uploads are passive. Lab execution requires a separate explicit action."
+      description="Uploads are passive. A Lab runs only after your Approval."
       onClose={onClose}
     >
       <form

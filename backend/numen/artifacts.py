@@ -38,12 +38,34 @@ LAB_DIRECTIVES = frozenset(
         "CMD", "ENTRYPOINT", "LABEL", "VOLUME", "STOPSIGNAL", "SHELL", "HEALTHCHECK",
     }
 )
-LAB_BASE = re.compile(
-    r"(?:asset-monitor-lab:0\.1\.0|scratch|[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9._-]+)?"
-    r"@sha256:[0-9a-f]{64})(?: AS [a-zA-Z][a-zA-Z0-9_-]*)?"
-)
+LAB_BASE = re.compile(r"(?:asset-monitor-lab:0\.1\.0|scratch)(?: AS [a-zA-Z][a-zA-Z0-9_-]*)?")
 LAB_DOCKERFILE_BYTES = 262144  # The verifier's own bound on the file it parses.
+# Findings cache their artifact state; a cache made under other rules is read again. Bump this
+# whenever completeness() changes what it accepts.
+RULES = 2
 
+
+def dockerfile_instructions(text):
+    """The Dockerfile's instructions as the Engine reads them, mirroring the runner's
+    engine.instructions: a comment line is dropped before continuations are joined, and a parser
+    directive, which could change the escape character, raises ValueError."""
+    result, current = [], None
+    for line in text.removeprefix("\ufeff").split("\n"):
+        line = line.rstrip("\r")
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            if re.match(r"#\s*(?:escape|syntax)\s*=", stripped, re.I):
+                raise ValueError("parser directive")
+            continue
+        if not stripped:
+            continue
+        continued = re.search(r"\\[ \t]*$", line)
+        part = line[: continued.start()] if continued else line
+        current = part.lstrip() if current is None else current + part
+        if not continued:
+            result.append(current)
+            current = None
+    return result if current is None else [*result, current]
 
 
 def clean_files(files, secrets=()):
@@ -239,10 +261,8 @@ def completeness(files):
                 if not isinstance(path, str) or "vulnerable-app/" + path not in files:
                     limitations.append("A declared application input is missing from the bundle")
             for image in lock.get("images", []):
-                if not isinstance(image, str) or (
-                    image != "asset-monitor-lab:0.1.0" and "@sha256:" not in image
-                ):
-                    limitations.append("Base images must be pinned by digest")
+                if image != "asset-monitor-lab:0.1.0":
+                    limitations.append("Lock images must be the bundled Lab base asset-monitor-lab:0.1.0")
         except (ValueError, TypeError):
             limitations.append("Application lock is not valid JSON")
     if "vulnerable-app/Dockerfile" in files:
@@ -251,9 +271,14 @@ def completeness(files):
         if len(text) > LAB_DOCKERFILE_BYTES:
             limitations.append("Dockerfile is larger than the lab verifier parses")
         stages = set()
-        for line in re.sub(r"\\[ \t]*\n", " ", text).splitlines():
+        try:
+            lines = dockerfile_instructions(text)
+        except ValueError:
+            lines = []
+            limitations.append("Dockerfile parser directives are refused by the lab verifier")
+        for line in lines:
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line:
                 continue
             instruction, _, value = line.partition(" ")
             instruction = instruction.upper()
@@ -261,12 +286,16 @@ def completeness(files):
                 # The message stays application-owned: the file is agent-authored and unbounded.
                 limitations.append("A Dockerfile directive is refused by the lab verifier")
                 continue
+            if instruction in ("FROM", "COPY", "ADD") and "$" in value:
+                # The Engine expands a variable here, so what is checked would not be what it builds.
+                limitations.append("Dockerfile FROM, COPY and ADD cannot use variables")
+                continue
             if instruction == "FROM":
                 bases.append(value)
                 if " AS " in value.upper():
                     stages.add(value.split()[-1])
                 if not LAB_BASE.fullmatch(value) and value.split()[0] not in stages:
-                    limitations.append("Dockerfile base must be the bundled lab image, scratch, a build stage or digest pinned")
+                    limitations.append("Dockerfile base must be the bundled lab image, scratch or a build stage")
             # Only the flags leading the directive are inspected, so an ENV may mention one.
             leading = []
             for part in value.split():
@@ -275,22 +304,22 @@ def completeness(files):
                 leading.append(part)
             if any(flag.startswith(("--mount", "--security", "--network")) for flag in leading):
                 limitations.append("Dockerfile build mounts are not accepted by the lab verifier")
-            if (
+            sources = [part for part in value.split()[:-1] if not part.startswith("--")]
+            if instruction in ("COPY", "ADD") and "--from=" not in value and any("://" in part for part in sources):
+                # The Lab builds offline: the Engine would fetch a URL source outside --network none.
+                limitations.append("Dockerfile COPY and ADD sources must be bundle files, not URLs")
+            elif (
                 instruction in ("COPY", "ADD")
                 and "--from=" not in value
-                and any(
-                    part.startswith("/") or ".." in part.split("/")
-                    for part in value.split()[:-1]
-                    if not part.startswith("--") and not re.match(r"[a-z][a-z0-9+.-]*://", part)
-                )
+                and any(part.startswith("/") or ".." in part.split("/") for part in sources)
             ):
                 limitations.append("Dockerfile COPY source must stay inside the bundle")
             elif instruction in ("COPY", "ADD") and "--from=" in value:
                 stage = next(
                     part.removeprefix("--from=") for part in value.split() if part.startswith("--from=")
                 )
-                if stage not in stages and not LAB_BASE.fullmatch(stage):
-                    limitations.append("A Dockerfile COPY --from names no build stage or pinned image")
+                if stage not in stages:
+                    limitations.append("A Dockerfile COPY --from names no earlier build stage")
             elif instruction == "COPY":
                 for part in value.split()[:-1]:
                     # A glob or the context root cannot be resolved here without the builder's rules.

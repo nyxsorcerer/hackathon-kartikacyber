@@ -1,12 +1,16 @@
 import io
 import json
+import logging
 import zipfile
 
 import pytest
+from sqlalchemy import select
 
 from conftest import FixtureBroker, connection, application, source_snapshot
 from test_workflows import cve_raw, seed_cve
 from numen.worker import run_once
+
+APPROVAL = {"password": "test-password-long"}
 
 
 def bundle(version="1.0.0"):
@@ -158,7 +162,7 @@ def test_cve_analysis_incomplete_bundle_fails_and_retains_report(system, defect)
     )
     events = client.get(f"/api/jobs/{queued}/events").json()["items"]
     assert any(event.get("partial_output_retained") is True for event in events)
-    assert client.post(f"/api/findings/{row['id']}/lab-runs").status_code == 422
+    assert client.post(f"/api/findings/{row['id']}/lab-runs", json=APPROVAL).status_code == 422
 
 
 def test_analysis_download_retains_drafts_and_enforces_auth_and_integrity(system):
@@ -336,7 +340,7 @@ def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
     p = application(client)
     row = finding(client, p["id"])
     assert row["status"] == "open" and row["artifact_state"]["status"] == "draft"
-    assert client.post(f"/api/findings/{row['id']}/lab-runs").status_code == 422
+    assert client.post(f"/api/findings/{row['id']}/lab-runs", json=APPROVAL).status_code == 422
     first = upload(client, row["id"], {"poc.py": b"first proof"}).json()
     first_artifact = next(a for a in first["artifacts"] if a["path"] == "poc.py")
     complete = upload(client, row["id"], bundle()).json()
@@ -354,13 +358,19 @@ def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
         assert manifest["revision"] == complete["artifact_revision"]
         assert all(a["sha256"] and a["size"] > 0 for a in manifest["files"])
     queued = client.post(
-        f"/api/findings/{row['id']}/lab-runs", headers={"Idempotency-Key": "lab-once"}
+        f"/api/findings/{row['id']}/lab-runs", json=APPROVAL, headers={"Idempotency-Key": "lab-once"}
     ).json()["job_id"]
     same = client.post(
-        f"/api/findings/{row['id']}/lab-runs", headers={"Idempotency-Key": "lab-once"}
+        f"/api/findings/{row['id']}/lab-runs", json=APPROVAL, headers={"Idempotency-Key": "lab-once"}
     ).json()["job_id"]
     assert queued == same
-    broker = FixtureBroker(
+
+    class Waiting(FixtureBroker):
+        def wait(self, run_id, heartbeat, progress, deadline=900):
+            self.deadline = deadline
+            return super().wait(run_id, heartbeat, progress, deadline)
+
+    broker = Waiting(
         {
             "verified": False,
             "status": "not_reproduced",
@@ -370,6 +380,8 @@ def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
         }
     )
     run_once(config, app.state.factory, broker)
+    # The broker's ADR-0005 defaults apply, and the wait covers a 15 min build and a 10 min run.
+    assert broker.calls[0]["limits"] is None and broker.deadline == 1800
     current = client.get(f"/api/findings/{row['id']}").json()
     assert current["lab_runs"][0]["status"] == "not_reproduced"
     assert current["lab_runs"][0]["artifact_revision"] == complete["artifact_revision"]
@@ -377,13 +389,126 @@ def test_bundle_draft_completion_immutable_revision_and_lab_failure(system):
     assert client.get(f"/api/jobs/{queued}").json()["status"] == "succeeded"
     # A Proof that did not reproduce leaves the Finding Open; a reproduced one confirms it (A11).
     assert current["status"] == "open" and current["cause"]["by"] == "operator"
-    client.post(f"/api/findings/{row['id']}/lab-runs", headers={"Idempotency-Key": "lab-twice"})
+    client.post(f"/api/findings/{row['id']}/lab-runs", json=APPROVAL, headers={"Idempotency-Key": "lab-twice"})
     run_once(config, app.state.factory, FixtureBroker({"verified": True, "status": "verified", "exit_code": 0}))
     current = client.get(f"/api/findings/{row['id']}").json()
     assert current["lab_runs"][0]["status"] == "verified"
     assert current["status"] == "confirmed"
     assert {k: v for k, v in current["cause"].items() if k != "at"} == {
         "by": "proof", "lab_run_id": current["lab_runs"][0]["id"]}
+    # The idempotent repeat of the first Approval recorded no second Action.
+    approved = [e["job_id"] for e in current["events"] if e["action"] == "approved"]
+    assert len(approved) == 2 and queued in approved
+
+
+def approved_lab(client):
+    """A Finding with a complete bundle, ready for an Approval."""
+    row = finding(client, application(client)["id"])
+    assert upload(client, row["id"], bundle()).json()["artifact_state"]["status"] == "complete"
+    return row
+
+
+def lab_records(app):
+    from numen.models import Action, Job, JobEvent, LabRun
+
+    with app.state.factory() as db:
+        return {
+            "jobs": [j.input for j in db.scalars(select(Job).where(Job.kind == "lab_run"))],
+            "labs": db.scalars(select(LabRun)).all(),
+            "actions": [a.data for a in db.scalars(select(Action))],
+            "events": [e.data for e in db.scalars(select(JobEvent))],
+        }
+
+
+def test_an_approval_checks_the_password_on_every_request(system, caplog):
+    caplog.set_level(logging.DEBUG)
+    app, client, _ = system
+    row = approved_lab(client)
+    path = f"/api/findings/{row['id']}/lab-runs"
+    good = client.post(path, json=APPROVAL)
+    assert good.status_code == 202, good.text
+    job_id = good.json()["job_id"]
+    revision = client.get(f"/api/findings/{row['id']}").json()["artifact_revision"]
+    records = lab_records(app)
+    assert len(records["labs"]) == 1 and records["labs"][0].job_id == job_id
+    assert [a for a in records["actions"] if a["action"] == "approved"] == [
+        {"action": "approved", "approved": "lab_run", "job_id": job_id, "artifact_revision": revision}
+    ]
+    # Each request is checked on its own: no window opens after a good Approval.
+    for kwargs in ({"json": {"password": "wrong-password"}}, {}, {"json": {}}):
+        refused = client.post(path, **kwargs)
+        assert refused.status_code == 403 and refused.json()["code"] == "approval_refused", kwargs
+    after = lab_records(app)
+    assert len(after["jobs"]) == 1 and len(after["labs"]) == 1
+    forged = client.post(path, json=APPROVAL, headers={"X-CSRF-Token": ""})
+    assert forged.status_code == 403 and forged.json()["code"] == "csrf_required"
+    again = client.post(path, json=APPROVAL)
+    assert again.status_code == 202 and again.json()["job_id"] != job_id
+    records = lab_records(app)
+    assert len(records["labs"]) == 2
+    stored = json.dumps([records["jobs"], records["actions"], records["events"]], default=str)
+    assert APPROVAL["password"] not in stored
+    assert APPROVAL["password"] not in caplog.text
+
+
+def test_approvals_are_rate_limited_like_login(system):
+    app, client, _ = system
+    row = approved_lab(client)
+    path = f"/api/findings/{row['id']}/lab-runs"
+    for _ in range(10):
+        assert client.post(path, json={"password": "wrong-password"}).status_code == 403
+    limited = client.post(path, json=APPROVAL)
+    assert limited.status_code == 429 and limited.json()["code"] == "approval_rate_limited"
+    assert lab_records(app)["labs"] == []
+    login = client.post("/api/auth/login", json={"username": "admin", "password": "test-password-long"})
+    assert login.status_code == 200
+
+
+def test_a_lab_job_is_never_retried_without_a_new_approval(system):
+    app, client, config = system
+    row = approved_lab(client)
+    queued = client.post(f"/api/findings/{row['id']}/lab-runs", json=APPROVAL).json()["job_id"]
+    run_once(config, app.state.factory, FixtureBroker({"status": "unobserved"}))
+    assert client.get(f"/api/jobs/{queued}").json()["status"] == "failed"
+    retried = client.post(f"/api/jobs/{queued}/retry", json=APPROVAL)
+    assert retried.status_code == 409 and retried.json()["code"] == "approval_required"
+    records = lab_records(app)
+    assert len(records["jobs"]) == 1 and len(records["labs"]) == 1
+
+
+def test_a_malicious_change_never_gets_a_lab(system):
+    """ADR-0004 rule 6 and AC-A07: a Malicious change never runs, even with a complete bundle."""
+    from numen import domain
+    from numen.models import Application, Commit, Finding, Repository
+
+    app, client, config = system
+    row = approved_lab(client)
+    path = f"/api/findings/{row['id']}/lab-runs"
+    queued = client.post(path, json=APPROVAL).json()["job_id"]
+    # A later Analysis finds the source commit is a Malicious change: the queued Lab never runs.
+    with app.state.factory.begin() as db:
+        commit = Commit(repository_id=db.scalar(select(Repository.id)), source_generation=1,
+                        revision="a" * 40, verdict="Malicious change")
+        db.add(commit)
+        db.flush()
+        current = db.get(Finding, row["id"])
+        current.data = {**current.data, "source_commit_id": commit.id}
+    broker = FixtureBroker({"verified": True, "status": "verified"})
+    run_once(config, app.state.factory, broker)
+    job = client.get(f"/api/jobs/{queued}").json()
+    assert broker.calls == [] and (job["status"], job["error"]["code"]) == ("failed", "lab_not_allowed")
+    refused = client.post(path, json=APPROVAL)
+    assert refused.status_code == 409 and refused.json()["code"] == "lab_not_allowed"
+    # A Finding that a Malicious change Verdict opened is refused too, whatever its source.
+    with app.state.factory.begin() as db:
+        page, _ = domain.open_finding(db, db.get(Application, row["application_id"]), "served_content", "change-1",
+                                      "Injected loader", "https://example.com/",
+                                      {"by": "verdict", "verdict": "Malicious change", "confidence": "high"})
+        page_id = page.id
+    assert upload(client, page_id, bundle()).json()["artifact_state"]["status"] == "complete"
+    refused = client.post(f"/api/findings/{page_id}/lab-runs", json=APPROVAL)
+    assert refused.status_code == 409 and refused.json()["code"] == "lab_not_allowed"
+    assert len(lab_records(app)["labs"]) == 1
 
 
 def test_paths_archives_and_configured_secrets_rejected(system):
@@ -460,11 +585,10 @@ def test_inherited_interval_tracks_global_and_explicit_stays(system):
 LAB_BASES = [
     ("asset-monitor-lab:0.1.0", True),
     ("scratch", True),
-    ("python@sha256:" + "a" * 64, True),
-    ("docker.io/library/php@sha256:" + "b" * 64, True),
-    ("python:3.12.12-slim-bookworm@sha256:" + "d" * 64, True),
-    # A vulnerable application needs its own database and toolchain images, pinned by digest.
-    ("mariadb@sha256:" + "c" * 64, True),
+    # The Engine would pull a digest base outside the offline build, and keep it after the run.
+    ("python@sha256:" + "a" * 64, False),
+    ("docker.io/library/php@sha256:" + "b" * 64, False),
+    ("node:24.9.0-bookworm-slim@sha256:" + "d" * 64, False),
     ("python:3.12", False),
     ("mysql:latest", False),
 ]
@@ -483,7 +607,8 @@ def test_completeness_accepts_exactly_the_bases_the_lab_verifier_builds(base, ac
     "line,refused",
     [
         ("RUN composer install", False),
-        ("ADD https://example.com/x /x", False),
+        ("ADD https://example.com/x /x", True),  # the Lab builds offline
+        ("COPY --from=node@sha256:" + "a" * 64 + " /x /x", True),
         ("HEALTHCHECK CMD true", False),
         ("RUN --mount=type=secret,id=k cat /run/secrets/k", True),
         ('ENV OPTS="--mount=nothing"', False),
@@ -526,6 +651,11 @@ def test_completeness_accepts_a_whole_application_sized_bundle():
         (b"FROM --platform=linux/amd64 asset-monitor-lab:0.1.0\nCOPY fixture /f\n", False),
         (b"FROM asset-monitor-lab:0.1.0\nUSER www-data\nCOPY fixture /f\n", True),
         (b"FROM asset-monitor-lab:0.1.0\nCOPY --from=build /x /y\n", False),
+        # The Engine drops a comment before joining continuations, so this FROM is its own.
+        (b"FROM asset-monitor-lab:0.1.0\n# note \\\nFROM attacker.example/x:1\nCOPY fixture /f\n", False),
+        (b"FROM asset-monitor-lab:0.1.0\nRUN echo \\\n  # skipped\n  done\nCOPY fixture /f\n", True),
+        (b"FROM asset-monitor-lab:0.1.0\nARG U=https://example.com/x\nADD $U /x\nCOPY fixture /f\n", False),
+        (b"# escape=`\nFROM asset-monitor-lab:0.1.0\nCOPY fixture /f\n", False),
     ],
 )
 def test_completeness_reads_the_dockerfile_shapes_the_verifier_will_see(dockerfile, complete):
@@ -551,3 +681,14 @@ def test_completeness_requires_the_lock_keys_at_its_top_level():
         {"version": "9.5.3", "source_ref": "9379c29cb26a1054208b37507b6869811aa75a32", "images": []}
     ).encode()
     assert completeness({**bundle(), "vulnerable-app/application.lock.json": flat})["status"] == "complete"
+
+
+def test_completeness_requires_lock_images_to_be_the_bundled_lab_base():
+    from numen.artifacts import completeness
+
+    def locked(images):
+        lock = {"version": "1.0.0", "local_inputs": {"fixture": "local bytes"}, "images": images}
+        return completeness({**bundle(), "vulnerable-app/application.lock.json": json.dumps(lock).encode()})
+
+    assert locked(["asset-monitor-lab:0.1.0"])["status"] == "complete"
+    assert locked(["node@sha256:" + "a" * 64])["status"] == "draft"

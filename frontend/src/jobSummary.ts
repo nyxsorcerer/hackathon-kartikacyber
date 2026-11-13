@@ -242,9 +242,9 @@ function successSummary(job: Job): {
       if (exit !== undefined) facts.push(`PoC exit code ${exit}`);
       if (version) facts.push(`Against version ${version}`);
       return field(r, "verified") === true
-        ? { summary: "Verified: the PoC reproduced in the isolated lab", facts }
+        ? { summary: "Reproduced: the Proof reproduced in the Lab", facts }
         : {
-            summary: "Not verified: the PoC did not reproduce",
+            summary: "Not reproduced: the Proof did not reproduce",
             facts,
             tone: "warm",
           };
@@ -343,6 +343,8 @@ const failureHints: Record<string, string> = {
   verdict_not_allowed:
     "Served content can only be Malicious change, Security hardening, Unrelated or Insufficient context. Retry the Analysis.",
 };
+const labFailure =
+  "A Lab is not retried: fix the cause, then start a new Lab from its Finding with a new Approval.";
 const analysisTimeout =
   "Analysis stopped at its 30-minute deadline. The change stays pending and is never read as Unrelated. Retry, or choose a faster model or lower reasoning effort.";
 const failureActions: Record<
@@ -436,21 +438,29 @@ export function jobOutcome(job: Job): JobOutcome {
     case "failed": {
       const code = text(job.error, "code") || "";
       const retryable = field(job.error, "retryable") === true;
+      // A Lab is never retried (A15): each one needs its own Approval.
+      const lab = job.kind === "lab_run";
       const facts = [
         ...(code ? [`Error code ${code}`] : []),
         ...(stage ? [`Stopped during ${humanize(stage).toLowerCase()}`] : []),
-        retryable
-          ? "Temporary: retrying should work"
-          : "Fix the cause before retrying",
+        ...(lab
+          ? []
+          : [
+              retryable
+                ? "Temporary: retrying should work"
+                : "Fix the cause before retrying",
+            ]),
       ];
       return {
         tone: "danger",
         summary: sentence(jobError(job)),
         hint:
-          (job.kind === "commit_analysis" &&
-          ["timeout", "runtime_timeout"].includes(code)
-            ? analysisTimeout
-            : failureHints[code]) ||
+          (lab
+            ? labFailure
+            : job.kind === "commit_analysis" &&
+                ["timeout", "runtime_timeout"].includes(code)
+              ? analysisTimeout
+              : failureHints[code]) ||
           (retryable
             ? "This failure is temporary. Retry the job."
             : "Check the job's execution events for the cause before retrying."),

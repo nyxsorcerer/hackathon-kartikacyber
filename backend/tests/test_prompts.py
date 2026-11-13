@@ -36,6 +36,28 @@ def test_each_operation_gets_only_the_sections_it_uses():
         assert "Trail of Bits" in default(phase) and "Attack path" not in default(phase)
 
 
+def test_the_bundle_section_describes_the_offline_node_lab():
+    bundle = default("commit_analysis").split("## Finding bundle", 1)[1]
+    for part in (
+        "Labs are Node only",
+        "with install scripts disabled",
+        "runs it with no network at all",
+        "asset-monitor-lab:0.1.0 is Debian bookworm with Python 3.12, Node 24.9.0 and npm",
+        "every entry of \"images\" must be asset-monitor-lab:0.1.0.",
+        "the Lab places the Own repository at the Verdict's commit under vulnerable-app/",
+        "COPY . /app/",
+        'CMD ["node", "server.js"]',
+        "at most 4 GB",
+        "15 minutes",
+        "10 minutes that include the application's startup",
+        "TARGET_URL",
+    ):
+        assert part in bundle, part
+    # Numen's Lab pulled digest-pinned bases and installed dependencies over the network.
+    for stale in ("@sha256", "digest", "with network", "internet access", "git clone checked out"):
+        assert stale not in bundle, stale
+
+
 def test_templates_list_their_sections_and_the_operations_using_them(system):
     _, client, _ = system
     body = client.get("/api/prompts").json()

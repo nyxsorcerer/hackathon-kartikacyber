@@ -366,3 +366,8 @@ class ManualObservation(Strict):
 class LoginInput(Strict):
     username: str
     password: str = Field(max_length=1024)
+
+
+class ApprovalInput(Strict):
+    # Empty by default: a missing password is refused exactly like a wrong one (A15).
+    password: str = Field(default="", max_length=1024, repr=False)

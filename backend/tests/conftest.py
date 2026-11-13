@@ -124,9 +124,10 @@ def connection(app, agents=None):
     return profile
 
 
-def source_snapshot(app, ident, revision="a" * 40, repository_id=None):
-    """A snapshot and a commit at `revision` of the Application's source repository, or of
-    `repository_id`."""
+def source_snapshot(app, ident, revision="a" * 40, repository_id=None, files=None):
+    """A snapshot holding `files` (main.py by default) and a commit at `revision` of the
+    Application's source repository, or of `repository_id`."""
+    files = files or {"main.py": b"def parse(value):\n    return str(value)\n"}
     with app.state.factory.begin() as db:
         row = db.get(Repository, repository_id) if repository_id else repository_of(db, ident)
         row.cursor = revision
@@ -134,17 +135,11 @@ def source_snapshot(app, ident, revision="a" * 40, repository_id=None):
             repository_id=row.id,
             source_generation=row.source_generation,
             source_ref=revision,
-            files=["main.py"],
+            files=list(files),
         )
         db.add(source)
         db.flush()
-        publish(
-            db,
-            app.state.config.artifact_root,
-            "snapshot",
-            source.id,
-            {"main.py": b"def parse(value):\n    return str(value)\n"},
-        )
+        publish(db, app.state.config.artifact_root, "snapshot", source.id, files)
         commit = Commit(
             repository_id=row.id,
             source_generation=row.source_generation,

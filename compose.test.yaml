@@ -24,6 +24,9 @@ services:
     depends_on:
       fixtures:
         condition: service_healthy
+  runner-broker:
+    environment:
+      NUMEN_NPM_REGISTRY_URL: https://registry.invalid
   worker:
     environment: *test-env
     depends_on:

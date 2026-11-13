@@ -868,6 +868,18 @@ def open_finding(db, application, source, subject, title, ref, cause):
     return finding, True
 
 
+def malicious_change(db, finding):
+    """Whether the Finding is for a Malicious change, which never runs (ADR-0004): a Malicious
+    change Verdict opened it, or is its source commit's newest Verdict."""
+    commit = db.get(Commit, finding.data.get("source_commit_id") or "") if finding.source == "commit" else None
+    if commit is not None and commit.verdict == "Malicious change":
+        return True
+    opened = db.scalar(select(Action).where(
+        Action.resource_type == "finding", Action.resource_id == finding.id,
+        Action.data["action"].as_string() == "opened"))
+    return opened is not None and (opened.data.get("cause") or {}).get("verdict") == "Malicious change"
+
+
 def link_change(db, application, addresses, change):
     """Links a change ({commit_id, revision, analysis_id, verdict}) to the Application's Findings,
     in any state, that its Analysis says it addresses: a commit SHA, full or abbreviated, matches
@@ -943,7 +955,7 @@ def set_finding_artifacts(db, row, revision, files):
     db.refresh(row, with_for_update=True)
     state = artifacts.completeness(files)
     row.artifact_revision = revision
-    row.data = {**row.data, "_artifact_state": {"revision": revision, "state": state}}
+    row.data = {**row.data, "_artifact_state": {"revision": revision, "rules": artifacts.RULES, "state": state}}
     return state
 
 
@@ -951,7 +963,11 @@ def finding_artifact_state(db, row, root):
     if not row.artifact_revision:
         return artifacts.completeness({})
     cached = row.data.get("_artifact_state")
-    if isinstance(cached, dict) and cached.get("revision") == row.artifact_revision:
+    if (
+        isinstance(cached, dict)
+        and cached.get("revision") == row.artifact_revision
+        and cached.get("rules") == artifacts.RULES
+    ):
         return cached["state"]
     return artifacts.resource_completeness(db, root, "finding", row.id, row.artifact_revision)
 

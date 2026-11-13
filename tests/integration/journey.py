@@ -103,7 +103,8 @@ def main():
     suffix = uuid.uuid4().hex[:8]
     fixture.request('POST', '/admin/reset', {})
     client.request('GET', '/api/applications', expect=(401,))
-    session = client.request('POST', '/api/auth/login', {'username': 'admin', 'password': args.password_file.read_text().strip()})
+    password = args.password_file.read_text().strip()
+    session = client.request('POST', '/api/auth/login', {'username': 'admin', 'password': password})
     client.csrf = session['csrf_token']
     assert client.request('GET', '/api/auth/session')['authenticated']
     print('PASS operator login and unauthenticated Application protection')
@@ -227,13 +228,18 @@ def main():
     }, expect=(200, 201))
     assert finding['status'] == 'open'
     assert finding['artifact_state']['status'] == 'draft'
+    # A tiny Node app with no dependencies, so the Lab's `npm ci` needs no registry: its /debug
+    # route leaks a secret, and the PoC reads it through TARGET_URL.
     files = {
-        'poc.py': b'import urllib.request\nprint(urllib.request.urlopen("http://lab:8080/").status)\n',
+        'poc.py': b'import os,sys,time,urllib.request\nfor _ in range(50):\n    try:\n        body=urllib.request.urlopen(os.environ["TARGET_URL"]+"/debug",timeout=1).read();break\n    except OSError:time.sleep(0.2)\nelse:sys.exit("the application never answered")\nsys.exit(0 if b"secret=" in body else 1)\n',
         'report.md': b'# Fixture metadata boundary\n\nControlled integration fixture, not a real finding.\n\nUpstream fixed: 1.2.1. Remote deployment status remains independent.\n',
-        'vulnerable-app/Dockerfile': b'FROM python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c\nWORKDIR /app\nCMD ["python", "-m", "http.server", "8080"]\n',
+        'vulnerable-app/Dockerfile': b'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY . /app/\nCMD ["node", "server.js"]\n',
+        'vulnerable-app/package.json': b'{"name": "journey-fixture", "version": "1.2.0", "private": true}\n',
+        'vulnerable-app/package-lock.json': json.dumps({'name': 'journey-fixture', 'version': '1.2.0', 'lockfileVersion': 3, 'requires': True, 'packages': {'': {'name': 'journey-fixture', 'version': '1.2.0'}}}).encode(),
+        'vulnerable-app/server.js': b'require("http").createServer((q, r) => r.end(q.url === "/debug" ? "secret=fixture" : "ok")).listen(8080);\n',
         'vulnerable-app/compose.yaml': b'services:\n  app:\n    build: .\n    ports: ["127.0.0.1:18080:8080"]\n',
         'vulnerable-app/README.md': b'# Fixture app\nRun docker compose up --build. Version: 1.2.0.\n',
-        'vulnerable-app/application.lock.json': json.dumps({'version': '1.2.0', 'fixture': True, 'local_inputs': {'Dockerfile': 'Controlled integration fixture'}, 'images': ['python:3.12.12-slim-bookworm@sha256:593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c']}).encode(),
+        'vulnerable-app/application.lock.json': json.dumps({'version': '1.2.0', 'fixture': True, 'local_inputs': {'Dockerfile': 'Controlled integration fixture', 'server.js': 'Controlled integration fixture'}, 'images': ['asset-monitor-lab:0.1.0']}).encode(),
     }
     finding = client.upload(f'/api/findings/{finding["id"]}/artifacts', files)
     assert finding['artifact_state']['status'] == 'complete'
@@ -244,6 +250,16 @@ def main():
             assert any(name.endswith(required) for name in names), required
     assert client.request('GET', f'/api/findings/{finding["id"]}')['status'] == 'open'
     print('PASS draft/completed finding bundle integrity and independent upstream status')
+
+    # A15: every Approval carries the password; A07: the Lab builds and runs offline on the real Engine.
+    refused = client.request('POST', f'/api/findings/{finding["id"]}/lab-runs', {'password': 'wrong-' + suffix}, expect=(403,))
+    assert refused['code'] == 'approval_refused'
+    lab = client.wait(client.request('POST', f'/api/findings/{finding["id"]}/lab-runs', {'password': password}, expect=(202,)), timeout=600)
+    finding = client.request('GET', f'/api/findings/{finding["id"]}')
+    assert finding['lab_runs'][0]['status'] == 'verified', finding['lab_runs']
+    assert finding['status'] == 'confirmed' and finding['cause']['by'] == 'proof'
+    assert [e for e in finding['events'] if e.get('action') == 'approved' and e.get('job_id') == lab['id']]
+    print('PASS Approval refuses a wrong password, then a Lab on the real Engine reproduces the Proof and confirms the Finding')
 
     for application in [github, wordpress]:
         client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})

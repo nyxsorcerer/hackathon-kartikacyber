@@ -51,6 +51,7 @@ from .models import (
 )
 from .schemas import (
     AccountInput,
+    ApprovalInput,
     BackfillInput,
     BatchAnalysisInput,
     BatchDeleteInput,
@@ -216,6 +217,24 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     def action(db, resource_type, ident, data):
         db.add(Action(resource_type=resource_type, resource_id=ident, data=data))
 
+    def throttle(request, scope, code, message):
+        """At most 10 attempts per client address in 60 s for each scope (login, approval)."""
+        recent = attempts[(scope, request.client.host if request.client else "unknown")]
+        while recent and recent[0] < time.monotonic() - 60:
+            recent.popleft()
+        if len(recent) >= 10:
+            raise DomainError(code, message, 429, retryable=True)
+        recent.append(time.monotonic())
+
+    def approval(request, db, password):
+        """An Approval (A15): the Operator's password, checked on this very request. There is
+        no window: every Approval, also one straight after another, carries its own password."""
+        throttle(request, "approval", "approval_rate_limited", "Wait before approving again")
+        operator = db.get(Operator, "admin")
+        # 403, not 401: a refused Approval must not sign the Operator out.
+        if not password or not operator or not verify_password(password, operator.password_hash):
+            raise DomainError("approval_refused", "The password is incorrect; nothing was approved", 403)
+
     @app.get("/api/health")
     def health(db=database_dependency):
         db.execute(text("SELECT 1"))
@@ -232,15 +251,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
     @app.post("/api/auth/login")
     def login(body: LoginInput, request: Request, response: Response, db=database_dependency):
-        origin = request.client.host if request.client else "unknown"
-        recent = attempts[origin]
-        while recent and recent[0] < time.monotonic() - 60:
-            recent.popleft()
-        if len(recent) >= 10:
-            raise DomainError(
-                "login_rate_limited", "Wait before trying to sign in again", 429, retryable=True
-            )
-        recent.append(time.monotonic())
+        throttle(request, "login", "login_rate_limited", "Wait before trying to sign in again")
         operator = db.get(Operator, "admin")
         if (
             body.username != "admin"
@@ -1198,9 +1209,20 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
     @router.post("/findings/{ident}/lab-runs")
     def lab(
-        ident: str, key: str | None = Header(None, alias="Idempotency-Key"), db=database_dependency
+        ident: str,
+        request: Request,
+        body: ApprovalInput = ApprovalInput(),
+        key: str | None = Header(None, alias="Idempotency-Key"),
+        db=database_dependency,
     ):
+        approval(request, db, body.password)
         finding = domain.get(db, Finding, ident)
+        if domain.malicious_change(db, finding):
+            raise DomainError(
+                "lab_not_allowed",
+                "A Malicious change never runs: its Proof is static, so it has no Lab",
+                409,
+            )
         files = (
             artifacts.resource_files(
                 db, config.artifact_root, "finding", ident, finding.artifact_revision
@@ -1235,6 +1257,12 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             )
             db.add(row)
             db.flush()
+            action(db, "finding", finding.id, {
+                "action": "approved",
+                "approved": "lab_run",
+                "job_id": job.id,
+                "artifact_revision": finding.artifact_revision,
+            })
         return accepted(job)
 
     @router.get("/artifacts/{ident}/content")
@@ -1404,6 +1432,10 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             raise DomainError(
                 "job_not_retryable", "Only failed or cancelled jobs can be retried", 409
             )
+        if row.kind == "lab_run":
+            raise DomainError(
+                "approval_required", "A Lab needs a new Approval: start it again from its Finding", 409
+            )
         if row.input.get("finding_id") and db.get(Finding, row.input["finding_id"]) is None:
             raise DomainError(
                 "finding_removed", "The finding this job worked on has been deleted", 409
@@ -1413,17 +1445,6 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         commit = db.get(Commit, row.input["commit_id"]) if row.kind == "commit_analysis" else None
         if commit and job.status == "queued":
             commit.analysis_state = {"status": "queued", "job_id": job.id}
-        if row.kind == "lab_run" and not db.scalar(select(LabRun).where(LabRun.job_id == job.id)):
-            original = db.scalar(select(LabRun).where(LabRun.job_id == row.id))
-            db.add(
-                LabRun(
-                    finding_id=original.finding_id,
-                    artifact_revision=original.artifact_revision,
-                    job_id=job.id,
-                    status="queued",
-                    data={},
-                )
-            )
         domain.event(
             db,
             job,
