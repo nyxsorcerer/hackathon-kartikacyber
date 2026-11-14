@@ -396,6 +396,13 @@ export const detectionChecks: Record<string, string> = {
   parent: "Matches nothing in the parent tree",
   baseline: "Matches nothing in the Baseline",
 };
+/** The same checks of a served-content change's rule, scanned against stored fetches. */
+export const servedDetectionChecks: Record<string, string> = {
+  ...detectionChecks,
+  changed: "Matches the changed fetch",
+  parent: "Matches nothing in the previous fetch",
+  baseline: "Matches nothing in the Baseline fetch",
+};
 /** A Malicious change's static Proof: its Detection rule, checked indicators and validation. */
 export const staticProofSchema = z.object({
   analysis_id: z.string().optional(),
@@ -429,12 +436,17 @@ export const staticProofSchema = z.object({
 export type StaticProof = z.infer<typeof staticProofSchema>;
 /** What a Malicious change's cleanup report adds to its indicators; application code computes it. */
 export const cleanupReportSchema = z.object({
-  commits: z.array(
-    z.object({ revision: z.string(), commit_id: z.string().nullable() }),
-  ),
+  commits: z
+    .array(z.object({ revision: z.string(), commit_id: z.string().nullable() }))
+    .default([]),
   commits_truncated: z.boolean().default(false),
   // null: unknown, such as a WordPress plugin or tags that could not be read.
-  releases: z.array(z.string()).nullable(),
+  releases: z.array(z.string()).nullable().default(null),
+  // Served content's (A10): the Watched page and user agent, and the fetches that served the change.
+  page_url: z.string().optional(),
+  user_agent: z.string().optional(),
+  fetch_ids: z.array(z.string()).default([]),
+  first_seen: z.string().optional(),
   secrets: z.array(z.string()),
 });
 export type CleanupReport = z.infer<typeof cleanupReportSchema>;
@@ -542,6 +554,61 @@ export const advisoriesSchema = z.object({
   packages: z.array(advisoryPinSchema),
   matches: z.array(advisoryMatchSchema).default([]),
 });
+/** What changed from one Content fingerprint's summary to another, by summary key. */
+const servedDiffSchema = z.record(
+  z.string(),
+  z.object({ added: z.array(z.string()), removed: z.array(z.string()) }),
+);
+export type ServedDiff = z.infer<typeof servedDiffSchema>;
+/** One user agent's fetch of a Watched page in a Served-content check (A10). */
+const servedFetchSchema = z.object({
+  id: z.string(),
+  /** fetched, or failed: the page did not answer 200. */
+  status: z.string(),
+  fingerprint: z.string().nullable(),
+  created_at: z.string(),
+  error: z
+    .object({
+      status: z.number().nullable().optional(),
+      error: z.string().nullable().optional(),
+    })
+    .nullable(),
+});
+export type ServedFetch = z.infer<typeof servedFetchSchema>;
+/** A fingerprint unlike the Baseline, triaged at most once, with its Analysis and Finding. */
+const servedChangeSchema = z.object({
+  id: z.string(),
+  triage_status: z.string(),
+  triage_result: unknownRecord.nullable(),
+  review_decision: z.string(),
+  verdict: z.string().nullable(),
+  analysis_state: z.object({ status: z.string() }).passthrough().nullable(),
+  finding_id: z.string().nullable(),
+});
+export type ServedChange = z.infer<typeof servedChangeSchema>;
+/** GET /applications/{id}/watched-pages: each page with each user agent's latest fetch and Baseline. */
+export const watchedPageSchema = z.object({
+  id: z.string(),
+  url: z.string(),
+  homepage: z.boolean(),
+  user_agents: z.array(
+    z.object({
+      user_agent: z.string(),
+      latest: servedFetchSchema.nullable(),
+      baseline: z.object({ fetch_id: z.string(), fingerprint: z.string() }).nullable(),
+      state: z.enum(["awaiting_baseline", "matches", "changed", "failed"]),
+      diff: servedDiffSchema.nullable(),
+      change: servedChangeSchema.nullable(),
+      accept_allowed: z.boolean(),
+    }),
+  ),
+});
+export type WatchedPage = z.infer<typeof watchedPageSchema>;
+export const watchedPagesSchema = z.object({ items: z.array(watchedPageSchema) });
+export const userAgentLabels: Record<string, string> = {
+  browser: "Browser",
+  googlebot: "Googlebot",
+};
 export const findingSchema = z.object({
   id: z.string(),
   application_id: z.string(),
@@ -589,6 +656,24 @@ export const findingSchema = z.object({
   malicious_change: z.boolean().default(false),
   static_proof: staticProofSchema.nullable().optional(),
   cleanup_report: cleanupReportSchema.nullable().optional(),
+  /** An exposed Upstream Malicious change's Detection rule run over the Application's stored served content (A06). */
+  served_content_sweep: z
+    .object({
+      job_id: z.string(),
+      status: z.string(),
+      truncated: z.boolean(),
+      matches: z.array(
+        z.object({
+          page_url: z.string(),
+          user_agent: z.string(),
+          url: z.string().nullable(),
+          sha256: z.string(),
+          fetched_at: z.string(),
+        }),
+      ),
+    })
+    .nullable()
+    .optional(),
   /** The steps of the Finding's A06 Playbook cell and where each stands; [] without a cell. */
   playbook: z
     .array(z.object({ step: z.string(), status: z.string() }))
@@ -778,6 +863,8 @@ export const dashboardSchema = z.object({
       revision: z.string(),
       application_id: z.string().nullable(),
       committed_at: z.string().nullable().optional(),
+      /** Where a served-content change is judged; a commit has none and opens its own page. */
+      link: z.string().optional(),
     }),
   ),
   review_queue_count: z.number(),

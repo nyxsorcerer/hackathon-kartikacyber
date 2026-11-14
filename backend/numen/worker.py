@@ -19,6 +19,7 @@ from .models import (
     LabRun,
     Observation,
     Repository,
+    ServedChange,
     VersionRecipe,
     now,
 )
@@ -28,8 +29,8 @@ from .workflows import Workflows, all_secrets
 from .domain import enqueue, event, remediation_job_ended
 
 log = logging.getLogger("numen.worker")
-# Agent, lab, Detection rule, Exposure check (a mirror clone) and interactive login work that can
-# occupy a slot for minutes or hours.
+# Agent, lab, Detection rule and served-content sweep, Exposure check (a mirror clone), Served-content
+# check (a probe per Watched page) and interactive login work that can occupy a slot for minutes or hours.
 LONG_KINDS = (
     "account_login",
     "advisory_check",
@@ -43,10 +44,21 @@ LONG_KINDS = (
     "lab_run",
     "patch_drafting",
     "remediation_draft",
+    "served_analysis",
+    "served_check",
+    "served_content_sweep",
+    "served_triage",
     "version_recipe",
 )
 # Attempts at one Triage of a change; retry n waits n minutes.
 TRIAGE_ATTEMPTS = 3
+
+
+def subject(db, job):
+    """The change a Triage or Analysis job judges: its Commit, or its served-content change."""
+    if job.input.get("served_change_id"):
+        return db.get(ServedChange, job.input["served_change_id"])
+    return db.get(Commit, job.input.get("commit_id"))
 
 
 def run_once(config, factory, broker=None, owner=None, exclude=()):
@@ -142,10 +154,10 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                 )
                 if repository and error["code"] not in ("input_changed", "source_check_superseded"):
                     repository.last_error = error
-                if row.kind in ("commit_triage", "jev_triage"):
+                if row.kind in ("commit_triage", "jev_triage", "served_triage"):
                     # A failed Triage has no decision: it is never read as unrelated. It is retried
                     # unless the attempt was cancelled, lost or overtaken by a source change.
-                    commit = db.get(Commit, row.input.get("commit_id"))
+                    commit = subject(db, row)
                     attempt_number = row.input.get("attempt", 1)
                     if commit:
                         commit.triage_status, commit.triage_result = (
@@ -166,10 +178,10 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                             )
                             retry.not_before = now() + timedelta(seconds=60 * attempt_number)
                             commit.triage_result = {**commit.triage_result, "retry_job_id": retry.id}
-                if row.kind == "commit_analysis":
+                if row.kind in ("commit_analysis", "served_analysis"):
                     # A failed or expired Analysis decides nothing: the review decision and the
                     # Verdict stay as they were, so an expired deadline is never Unrelated.
-                    commit = db.get(Commit, row.input.get("commit_id"))
+                    commit = subject(db, row)
                     if commit:
                         commit.analysis_state = {
                             "status": "timed_out"

@@ -99,7 +99,7 @@ def test_templates_list_their_sections_and_the_operations_using_them(system):
     assert items["attack-path"]["used_by"] == ["commit_analysis", "cve_analysis", "finding_artifacts"]
     assert items["commit_analysis"]["kind"] == "operation"
     assert items["commit_analysis"]["includes"] == ["attack-path", "bundle", "detection-rule", "rules"]
-    assert items["detection-rule"]["used_by"] == ["commit_analysis"]
+    assert items["detection-rule"]["used_by"] == ["commit_analysis", "served_analysis"]
     assert items["audit-context"]["used_by"] == ["cve_analysis", "finding_artifacts"]
     # Patch drafting (A08) starts from the shared rules only and renders within the runner's bound.
     assert (items["patch_drafting"]["kind"], items["patch_drafting"]["includes"]) == ("operation", ["rules"])

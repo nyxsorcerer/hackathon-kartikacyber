@@ -24,6 +24,8 @@ import { mutate, request } from "../api";
 import { useResource } from "../hooks";
 import {
   detectionChecks,
+  servedDetectionChecks,
+  userAgentLabels,
   exposureLabels,
   exposureTones,
   findingDeletionSchema,
@@ -920,13 +922,19 @@ function FindingBody({
         <DisclosureReportPanel report={finding.disclosure_report} />
       )}
       {finding.static_proof && (
-        <StaticProofPanel proof={finding.static_proof} />
+        <StaticProofPanel
+          proof={finding.static_proof}
+          served={finding.source === "served_content"}
+        />
       )}
       {finding.cleanup_report && (
         <CleanupReportPanel
           report={finding.cleanup_report}
           proof={finding.static_proof}
         />
+      )}
+      {finding.served_content_sweep && (
+        <ServedSweepPanel sweep={finding.served_content_sweep} />
       )}
       <Panel
         title="Reproducible artifacts"
@@ -1071,6 +1079,7 @@ const stepLabels: Record<string, string> = {
   cleanup_report: "Cleanup report",
   remediation_pr: "Remediation PR",
   deployed_version_check: "Deployed version check",
+  served_content_sweep: "Detection rule sweep of served content",
 };
 /** Where a step stands, when its bare status does not say it. */
 const stepStates: Record<string, string> = {
@@ -1082,6 +1091,9 @@ const stepStates: Record<string, string> = {
   no_fixed_version: "No fixed version is known yet",
   not_direct: "Not a direct dependency: update the package that pulls it in",
   not_drafted: "Not drafted",
+  matched: "Matched stored served content",
+  no_match: "No stored served content matched",
+  no_served_content: "No stored served content to sweep",
   pending: "Not validated yet",
   ...deployedLabels,
 };
@@ -1097,7 +1109,7 @@ function stepTone(step: string, status: string) {
     ["verified", "validated", "ready", "merged", "serving_fix"].includes(status)
   )
     return "good";
-  return ["failed", "draft_failed", "before_fix"].includes(status)
+  return ["failed", "draft_failed", "before_fix", "matched"].includes(status)
     ? "danger"
     : "neutral";
 }
@@ -1332,7 +1344,7 @@ function ProofState({ proof }: { proof?: StaticProof | null }) {
   return <Badge tone={state.tone}>{state.label}</Badge>;
 }
 /** Strings as escaped text, one per line (A15). */
-function TextList({ items }: { items: string[] }) {
+export function TextList({ items }: { items: string[] }) {
   return items.length ? (
     <ul className="gap-list">
       {items.map((item, i) => (
@@ -1346,7 +1358,13 @@ function TextList({ items }: { items: string[] }) {
   );
 }
 /** A Malicious change's static Proof (A07): the Detection rule, its validation checks and the indicators. */
-function StaticProofPanel({ proof }: { proof: StaticProof }) {
+function StaticProofPanel({
+  proof,
+  served,
+}: {
+  proof: StaticProof;
+  served: boolean;
+}) {
   const indicators = proof.indicators;
   return (
     <Panel
@@ -1363,7 +1381,8 @@ function StaticProofPanel({ proof }: { proof: StaticProof }) {
       {proof.checks.length ? (
         <DetailGrid
           items={proof.checks.map((check) => [
-            detectionChecks[check.name] || humanize(check.name),
+            (served ? servedDetectionChecks : detectionChecks)[check.name] ||
+              humanize(check.name),
             <>
               <Badge tone={checkTones[check.status]}>{check.status}</Badge>{" "}
               {check.message}
@@ -1435,34 +1454,22 @@ function CleanupReportPanel({
   proof?: StaticProof | null;
 }) {
   const indicators = proof?.indicators;
-  return (
-    <Panel
-      title="Cleanup report"
-      description="What to remove and which secrets to rotate. Asset Monitor never sends it."
-      padded
-    >
-      <DetailGrid
-        items={[
-          [
-            "Files the change added",
-            <TextList items={indicators?.files.map((f) => f.path) || []} />,
-          ],
-          [
-            "Indicators the change added",
-            <TextList
-              items={
-                indicators
-                  ? [
-                      ...indicators.hosts,
-                      ...indicators.urls,
-                      ...indicators.commands,
-                    ]
-                  : []
-              }
-            />,
-          ],
-          [
-            "Commits that contained it",
+  // A served-content change (A10) was served by a Watched page; a commit's was contained in commits and releases.
+  const contained: [string, ReactNode][] = report.page_url
+    ? [
+        [
+          "Served at",
+          `${report.page_url} · ${userAgentLabels[report.user_agent || ""] || report.user_agent}`,
+        ],
+        [
+          "First seen",
+          report.first_seen ? <Time value={report.first_seen} absolute /> : "Unknown",
+        ],
+        ["Fetches that served it", String(report.fetch_ids.length)],
+      ]
+    : [
+        [
+          "Commits that contained it",
             <span className="chip-row">
               {report.commits.map((c) =>
                 c.commit_id ? (
@@ -1493,6 +1500,34 @@ function CleanupReportPanel({
               </span>
             ),
           ],
+        ];
+  return (
+    <Panel
+      title="Cleanup report"
+      description="What to remove and which secrets to rotate. Asset Monitor never sends it."
+      padded
+    >
+      <DetailGrid
+        items={[
+          [
+            "Files the change added",
+            <TextList items={indicators?.files.map((f) => f.path) || []} />,
+          ],
+          [
+            "Indicators the change added",
+            <TextList
+              items={
+                indicators
+                  ? [
+                      ...indicators.hosts,
+                      ...indicators.urls,
+                      ...indicators.commands,
+                    ]
+                  : []
+              }
+            />,
+          ],
+          ...contained,
           ["Secrets to rotate", <TextList items={report.secrets} />],
           [
             "Detection rule to run on the server",
@@ -1508,6 +1543,60 @@ function CleanupReportPanel({
           ],
         ]}
       />
+    </Panel>
+  );
+}
+/** An exposed Upstream Malicious change's Detection rule run over the Application's stored served
+ * content (A06): each stored file it matched, with the page and user agent it was served to, as text. */
+function ServedSweepPanel({
+  sweep,
+}: {
+  sweep: NonNullable<Finding["served_content_sweep"]>;
+}) {
+  return (
+    <Panel
+      title="Detection rule sweep of served content"
+      description="The validated Detection rule, run once over the stored bytes of every Served-content check of this Application. Nothing was fetched again."
+      actions={<JobLink id={sweep.job_id} />}
+    >
+      {sweep.truncated && (
+        <p className="hint">
+          The Application has more stored files than one sweep reads: the
+          newest were swept.
+        </p>
+      )}
+      {sweep.matches.length ? (
+        <div className="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Watched page</th>
+                <th scope="col">User agent</th>
+                <th scope="col">File</th>
+                <th scope="col">SHA-256</th>
+                <th scope="col">Fetched</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sweep.matches.map((match) => (
+                <tr key={`${match.sha256}:${match.page_url}:${match.user_agent}`}>
+                  <td className="mono">{match.page_url}</td>
+                  <td>{userAgentLabels[match.user_agent] || match.user_agent}</td>
+                  <td className="mono">{match.url}</td>
+                  <td className="mono">{match.sha256.slice(0, 12)}</td>
+                  <td>
+                    <Time value={match.fetched_at} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="muted panel-body">
+          {stepStates[sweep.status] || humanize(sweep.status)}
+        </p>
+      )}
     </Panel>
   );
 }

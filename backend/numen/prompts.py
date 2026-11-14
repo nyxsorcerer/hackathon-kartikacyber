@@ -22,6 +22,8 @@ ROOT = Path(__file__).with_name("prompt_templates")
 OPERATIONS = (
     "commit_triage",
     "commit_analysis",
+    "served_triage",
+    "served_analysis",
     "cve_analysis",
     "finding_artifacts",
     "version_recipe",
@@ -45,6 +47,8 @@ DESCRIPTIONS = {
     "audit": "Rules shared by the three audit phases.",
     "commit_triage": "Triage: decides, with no tools, whether a commit deserves Analysis.",
     "commit_analysis": "Analyses one commit read-only, returns its Verdict and drafts its Proof bundle or Detection rule.",
+    "served_triage": "Triage: decides, with no tools, whether a served-content change deserves Analysis.",
+    "served_analysis": "Analyses one served-content change from its stored bytes, returns its Verdict and drafts its Detection rule.",
     "cve_analysis": "Drafts an n-day finding bundle for a CVE, read-only.",
     "finding_artifacts": "Regenerates the bundle of an existing finding.",
     "version_recipe": "Writes the script that detects a target's version.",

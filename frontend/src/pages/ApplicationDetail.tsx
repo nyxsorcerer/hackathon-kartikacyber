@@ -70,6 +70,7 @@ import { FindingsList } from "./Findings";
 import { failureGroups } from "./Jobs";
 import { ApplicationRepositories } from "./ApplicationRepositories";
 import { ApplicationAdvisories } from "./ApplicationAdvisories";
+import { ApplicationServedContent } from "./ApplicationServedContent";
 import { jobName, jobOutcome } from "../jobSummary";
 type VersionRecord = NonNullable<Application["version"]>;
 export function ApplicationDetail() {
@@ -264,6 +265,7 @@ function ApplicationBody({
             count: application.repositories.filter((r) => !r.removed_at).length,
           },
           { id: "advisories", label: "Advisories" },
+          { id: "served", label: "Served content" },
           { id: "version", label: "Version" },
           { id: "commits", label: "Commits", count: count(data.commits) },
           { id: "audit", label: "Audit context", count: count(data.audits) },
@@ -329,6 +331,9 @@ function ApplicationBody({
       )}
       {tab === "advisories" && (
         <ApplicationAdvisories application={application} />
+      )}
+      {tab === "served" && (
+        <ApplicationServedContent application={application} />
       )}
       {tab === "version" && (
         <VersionTab

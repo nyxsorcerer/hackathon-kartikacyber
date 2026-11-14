@@ -866,6 +866,88 @@ it("says when no release tag contains the change", async () => {
   );
 });
 
+it("shows the served content sweep matches and a served cleanup report", async () => {
+  const { unmount } = showFinding({
+    ...malicious,
+    source: "served_content",
+    source_ref: "https://shop.test",
+    source_commit_id: null,
+    subject_id: "change-1",
+    playbook: [
+      { step: "static_proof", status: "validated" },
+      { step: "detection_rule", status: "validated" },
+      { step: "cleanup_report", status: "ready" },
+    ],
+    cleanup_report: {
+      analysis_id: "analysis-1",
+      page_url: "https://shop.test",
+      user_agent: "googlebot",
+      fetch_ids: ["fetch-1", "fetch-2"],
+      first_seen: at,
+      secrets: [],
+    },
+  });
+  // A served-content Finding's cleanup report names the page and user agent, not commits.
+  const report = await screen.findByRole("region", { name: "Cleanup report" });
+  const row = (label: string) => within(report).getByText(label).closest("div");
+  expect(row("Served at")).toHaveTextContent("https://shop.test · Googlebot");
+  expect(row("Fetches that served it")).toHaveTextContent("2");
+  expect(within(report).queryByText("Commits that contained it")).toBeNull();
+  expect(within(report).queryByText("Releases")).toBeNull();
+  const proof = screen.getByRole("region", { name: "Static Proof" });
+  expect(
+    within(proof).getByText("Matches nothing in the previous fetch"),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "Detection rule sweep of served content" }),
+  ).toBeNull();
+  unmount();
+
+  // An exposed Upstream Malicious change's rule swept over the stored served content (A06).
+  const markup = "<script>alert('served')</script>";
+  const { container } = showFinding({
+    ...malicious,
+    playbook: [{ step: "served_content_sweep", status: "matched" }],
+    served_content_sweep: {
+      artifact_revision: "revision",
+      job_id: "job-sweep",
+      status: "matched",
+      count: 1,
+      truncated: true,
+      matches: [
+        {
+          page_id: "page-1",
+          page_url: `https://shop.test/${markup}`,
+          user_agent: "googlebot",
+          fetch_id: "fetch-1",
+          url: "https://cdn.shop.test/loader.js",
+          sha256: "f".repeat(64),
+          fetched_at: at,
+        },
+      ],
+    },
+  });
+  const playbook = await screen.findByRole("region", { name: "Playbook" });
+  expect(
+    within(playbook).getByText("Detection rule sweep of served content")
+      .nextElementSibling,
+  ).toHaveTextContent("Matched stored served content");
+  const sweep = screen.getByRole("region", {
+    name: "Detection rule sweep of served content",
+  });
+  const [match] = within(sweep).getAllByRole("row").slice(1);
+  expect(match).toHaveTextContent(`https://shop.test/${markup}`);
+  expect(match).toHaveTextContent("Googlebot");
+  expect(match).toHaveTextContent("https://cdn.shop.test/loader.js");
+  expect(match).toHaveTextContent("ffffffffffff");
+  expect(within(match).queryByRole("link")).toBeNull();
+  expect(sweep).toHaveTextContent("more stored files than one sweep reads");
+  expect(
+    within(sweep).getByRole("link", { name: /View job/ }),
+  ).toHaveAttribute("href", "/jobs/job-sweep");
+  expect(container.querySelector("script")).toBeNull();
+});
+
 it("offers no Lab and no generation for a Malicious change Finding", async () => {
   const { unmount } = showFinding({
     ...malicious,

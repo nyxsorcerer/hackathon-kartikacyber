@@ -127,7 +127,8 @@ CELLS = [
     ("own", MALICIOUS, ["static_proof", "detection_rule", "remediation_pr", "cleanup_report"], ["revert"], 409),
     ("own", FIX, ["report", "deployed_version_check"], [], 409),
     ("upstream", INTRODUCED, ["proof", "disclosure_report", "remediation_pr"], ["pin"], 202),
-    ("upstream", MALICIOUS, ["static_proof", "detection_rule", "cleanup_report", "remediation_pr"], ["pin"], 409),
+    ("upstream", MALICIOUS, ["static_proof", "detection_rule", "cleanup_report", "remediation_pr", "served_content_sweep"],
+     ["pin"], 409),
     ("upstream", FIX, ["proof", "remediation_pr"], ["bump"], 202),
 ]
 

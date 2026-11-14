@@ -494,6 +494,50 @@ it("summarizes an Advisory check", async () => {
   ).toHaveAttribute("href", "/applications/application-1?tab=advisories");
 });
 
+it.each([
+  [
+    "served_check",
+    { pages: 2, fetches: 4, changed: 1, matches: 3, awaiting_baseline: 0, failed: 0 },
+    "Served-content check succeeded: 2 Watched pages checked · 1 changed fingerprint",
+  ],
+  [
+    "served_triage",
+    { decision: "security_candidate" },
+    "Served-content Triage succeeded: Flagged as a security candidate",
+  ],
+  [
+    "served_analysis",
+    { verdict: "Malicious change", confidence: "high", finding_id: "f-1" },
+    "Served-content Analysis succeeded: Malicious change · finding created",
+  ],
+  [
+    "served_content_sweep",
+    { status: "matched", count: 2, matches: [], truncated: false },
+    "Detection rule sweep of served content succeeded: 2 matches in stored served content",
+  ],
+])("summarizes a %s job", async (kind, result, heading) => {
+  serveJobs([
+    {
+      ...triage,
+      id: "job-served",
+      kind,
+      subject: {
+        type: "served",
+        label: "https://shop.test/ · Googlebot",
+        ref: "cccccccccccc",
+        link: "/applications/application-1?tab=served",
+      },
+      result,
+    },
+  ]);
+  renderJob("job-served");
+  const outcome = await screen.findByRole("region", { name: "Job outcome" });
+  expect(outcome).toHaveTextContent(heading);
+  expect(
+    screen.getAllByRole("link", { name: /Open Served content/ })[0],
+  ).toHaveAttribute("href", "/applications/application-1?tab=served");
+});
+
 it("summarizes an Analysis by its Verdict and confidence", async () => {
   serveJobs([
     {

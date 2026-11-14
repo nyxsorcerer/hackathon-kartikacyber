@@ -16,6 +16,11 @@ from urllib.parse import urljoin, urlsplit
 
 # Each provider tunnel is bounded in bytes and lifetime.
 TUNNEL_BYTES, TUNNEL_SECONDS = 64 * 1024 * 1024, 1800
+# A Served-content check (A10) fetches as one of this fixed pair, chosen per request.
+USER_AGENTS = {
+    "browser": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "googlebot": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+}
 
 
 def origin(url):
@@ -32,7 +37,10 @@ def resolve(host, port, policy=None):
     addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     for address in addresses:
         ip = ipaddress.ip_address(address[4][0])
-        if any(ip in cidr for cidr in blocked) or (not ip.is_global and not any(ip in cidr for cidr in allowed)):
+        ip = getattr(ip, "ipv4_mapped", None) or ip
+        # Only a public address: is_global alone still lets multicast through.
+        public = ip.is_global and not ip.is_multicast
+        if any(ip in cidr for cidr in blocked) or (not public and not any(ip in cidr for cidr in allowed)):
             raise ValueError("destination address is not allowed")
     if not addresses:
         raise ValueError("target DNS resolution failed")
@@ -63,11 +71,15 @@ class TargetFetcher:
         self.lock = threading.Lock()
         self.expires = time.monotonic() + min(int(policy.get("expires_seconds", 1800)), 1800)
 
-    def fetch(self, url, method="GET"):
+    def fetch(self, url, method="GET", user_agent=None):
         if method not in {"GET", "HEAD"} or method not in self.policy.get("methods", ["GET", "HEAD"]):
             raise ValueError("target method denied")
+        if user_agent is not None and user_agent not in USER_AGENTS:
+            raise ValueError("target user agent denied")
+        agent = USER_AGENTS.get(user_agent, "Numen-version-fetch/1")
         for _ in range(6):
-            if origin(url) not in self.origins:
+            # The served-content policy (A10) allows any origin; resolve() still allows only public addresses.
+            if origin(url) not in self.origins and not self.policy.get("served_content"):
                 raise ValueError("target origin denied")
             with self.lock:
                 if self.remaining <= 0 or time.monotonic() > self.expires:
@@ -78,7 +90,7 @@ class TargetFetcher:
             ip = resolve(p.hostname, port, self.policy)
             conn = PinnedHTTP(p.hostname, port, ip, p.scheme == "https")
             try:
-                conn.request(method, (p.path or "/") + ("?" + p.query if p.query else ""), headers={"User-Agent": "Numen-version-fetch/1", "Accept-Encoding": "identity"})
+                conn.request(method, (p.path or "/") + ("?" + p.query if p.query else ""), headers={"User-Agent": agent, "Accept-Encoding": "identity"})
                 response = conn.getresponse()
                 if response.status in {301, 302, 303, 307, 308}:
                     location = response.getheader("Location")
@@ -149,7 +161,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not 0 < length <= 16384:
                 raise ValueError("invalid fetch request")
             request = json.loads(self.rfile.read(length))
-            result = self.server.fetcher.fetch(request["url"], request.get("method", "GET"))
+            result = self.server.fetcher.fetch(request["url"], request.get("method", "GET"), request.get("user_agent"))
             data = json.dumps(result).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

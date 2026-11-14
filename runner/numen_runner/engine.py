@@ -185,6 +185,20 @@ def npm_registry():
     return os.getenv("NUMEN_NPM_REGISTRY_URL", "https://registry.npmjs.org")
 
 
+def served_fixture_cidrs(client):
+    """The demo fixture's private range (A10): the subnets of the Docker network the broker's
+    NUMEN_SERVED_CONTENT_FIXTURE_NETWORK names. Only the demo VM sets it; by default it is empty
+    and a served-content fetch reaches public addresses only."""
+    name = os.getenv("NUMEN_SERVED_CONTENT_FIXTURE_NETWORK")
+    if not name:
+        return []
+    try:
+        network = client.networks.get(name)
+    except docker.errors.NotFound:
+        return []
+    return [c["Subnet"] for c in network.attrs.get("IPAM", {}).get("Config") or [] if c.get("Subnet")]
+
+
 def gateway_config(request, profile, interactive):
     """The gateway's CONNECT allowlist: the provider's own hosts, plus herdr.dev for a run that
     hosts a Herdr session, because Herdr fetches its agent-detection manifests from there. A Lab's
@@ -280,14 +294,17 @@ class DockerEngine:
             spec["ulimits"] = [docker.types.Ulimit(name="nofile",soft=4096,hard=4096)]
         return spec
 
-    def start_gateway(self, run_id, request, network, labels, config):
-        """The run's credential-free gateway, on its own egress bridge and reachable from network as `gateway`."""
+    def start_gateway(self, run_id, request, network, labels, config, extra_network=None):
+        """The run's credential-free gateway, on its own egress bridge and reachable from network as `gateway`.
+        extra_network is the demo fixture's network, which a served-content run's gateway joins (A10)."""
         egress = self.client.networks.create("numen-egress-" + run_id, labels=labels)
         proxy_spec = self.spec(request, egress, labels)
         proxy_spec["tmpfs"] = {"/tmp":"rw,nosuid,nodev,size=16777216,uid=10001,gid=10001"}
         proxy = self.client.containers.create("asset-monitor-gateway:" + VERSION, command=["python","-m","numen_runner.gateway"],
                                                environment={"NUMEN_GATEWAY_CONFIG":json.dumps(config)}, **proxy_spec)
         network.connect(proxy, aliases=["gateway"])
+        if extra_network:
+            self.client.networks.get(extra_network).connect(proxy)
         proxy.start()
         return proxy
 
@@ -323,6 +340,7 @@ class DockerEngine:
         interactive = self.hosts_session(request)
         if kind in {"agent","capabilities","account_login","probe"}:
             config = gateway_config(request, profile, interactive)
+            fixture = None
             if request.target_policy:
                 policy = dict(request.target_policy)
                 # An explicit internal asset exception never authorizes application/control subnets.
@@ -331,9 +349,13 @@ class DockerEngine:
                     if network.name != job_network.name and network.name.endswith(("_application","_control")):
                         blocked.extend(c["Subnet"] for c in network.attrs.get("IPAM",{}).get("Config",[]) if c.get("Subnet"))
                 policy["blocked_cidrs"] = blocked
+                if policy.get("served_content"):
+                    # Only the broker's demo setting, never the request, opens a private range to served content.
+                    policy["allowed_private_cidrs"] = served_fixture_cidrs(self.client)
+                    fixture = os.getenv("NUMEN_SERVED_CONTENT_FIXTURE_NETWORK") if policy["allowed_private_cidrs"] else None
                 config.update({"target_policy":policy,"fetch_token":secrets.token_urlsafe(32)})
                 environment.update({"NUMEN_FETCH_URL":"http://gateway:8082/fetch","NUMEN_FETCH_TOKEN":config["fetch_token"]})
-            self.start_gateway(run_id, request, job_network, labels, config)
+            self.start_gateway(run_id, request, job_network, labels, config, fixture)
             environment.update(PROXY_ENVIRONMENT)
         image = "asset-monitor-" + (profile["agent"] if kind in {"agent","capabilities","account_login"} else {"detection_rule":"probe"}.get(kind, kind)) + ":" + VERSION
         lab_image = None

@@ -86,11 +86,33 @@ def static_state(proof):
     }
 
 
-def checks(result, scanned, baseline_skipped):
+# Each tree's check: (tree, whether the rule must match it, passed message, failed message), for a
+# commit and, with served=True, for served content, whose trees are the changed, previous and
+# Baseline fetches' stored bytes (A07).
+COMMIT_CHECKS = (
+    ("changed", True, "The Detection rule matches files this commit added or changed",
+     "The Detection rule matches none of the files this commit added or changed"),
+    ("parent", False, "The Detection rule matches no file in the parent tree",
+     "The Detection rule also matches files in the parent tree"),
+    ("baseline", False, "The Detection rule matches no file in the Baseline tree",
+     "The Detection rule also matches files in the Baseline tree"),
+)
+SERVED_CHECKS = (
+    ("changed", True, "The Detection rule matches the changed fetch's stored bytes",
+     "The Detection rule matches none of the changed fetch's stored bytes"),
+    ("parent", False, "The Detection rule matches none of the previous fetch's stored bytes",
+     "The Detection rule also matches the previous fetch's stored bytes"),
+    ("baseline", False, "The Detection rule matches none of the Baseline fetch's stored bytes",
+     "The Detection rule also matches the Baseline fetch's stored bytes"),
+)
+
+
+def checks(result, scanned, baseline_skipped, served=False):
     """A07's validation checks from a detection_rule run's result: the rule compiles, matches a file
     the commit added or changed, and matches no file in the parent tree or, unless `baseline_skipped`
     says why not, the Baseline tree. `scanned` names the trees sent with files; one sent empty, such
-    as a root commit's parent, matches nothing. Each check is {name, status, message[, files, count]}."""
+    as a root commit's parent, matches nothing. Each check is {name, status, message[, files, count]}.
+    With served, the messages name a served-content change's fetches."""
     malformed = DomainError("invalid_rule_result", "The Detection rule run returned a malformed result", 422)
     if not isinstance(result, dict) or not isinstance(result.get("compiled"), bool):
         raise malformed
@@ -102,14 +124,7 @@ def checks(result, scanned, baseline_skipped):
     if not isinstance(matches, dict):
         raise malformed
     found = [{"name": "rule", "status": "passed", "message": "The Detection rule compiles"}]
-    for tree, wanted, passed, failed in (
-        ("changed", True, "The Detection rule matches files this commit added or changed",
-         "The Detection rule matches none of the files this commit added or changed"),
-        ("parent", False, "The Detection rule matches no file in the parent tree",
-         "The Detection rule also matches files in the parent tree"),
-        ("baseline", False, "The Detection rule matches no file in the Baseline tree",
-         "The Detection rule also matches files in the Baseline tree"),
-    ):
+    for tree, wanted, passed, failed in SERVED_CHECKS if served else COMMIT_CHECKS:
         if tree == "baseline" and baseline_skipped:
             found.append({"name": tree, "status": "skipped", "message": baseline_skipped})
             continue

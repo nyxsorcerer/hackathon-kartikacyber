@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import secrets
 from pathlib import Path
 import subprocess
 import tarfile
@@ -37,6 +38,9 @@ class FixtureState:
         self.refs: dict[str, str] = {}
         self.commits: dict[str, dict] = {}
         self.pulls: list[dict] = []
+        # The Served-content fixture (A10): the variants served and each /served request's user agent.
+        self.served_variants: set[str] = set()
+        self.served_requests: list[dict] = []
 
 
 STATE = FixtureState()
@@ -253,6 +257,38 @@ NVD_NODE = {
 }
 
 
+# The Served-content check journey (A10): judol and ClickFix pages, all inert. Links are never
+# fetched and point at .test hosts, the ClickFix command is a harmless placeholder, and
+# cdn.clickfix-fixture.test is this fixture's own alias on the isolated served network.
+# /served/beacon.js would request /served/executed only if something ran it.
+CLICKFIX_HOST = 'cdn.clickfix-fixture.test'
+SERVED_BEACON = b"fetch('/served/executed');\n"
+SERVED_LOADER = b"/* Asset Monitor fixture: inert ClickFix loader */\nnavigator.clipboard.writeText('echo asset-monitor-fixture');\n"
+JUDOL = ('<section><h2>Slot gacor hari ini</h2><p>Daftar situs togel dan slot gacor maxwin terpercaya, bonus deposit setiap hari.</p>'
+         '<a href="https://slot-gacor.test/daftar">Slot gacor</a> <a href="https://togel-maxwin.test/">Togel maxwin</a></section>')
+CLICKFIX = ('<div id="verify"><h2>Verify you are human</h2><p>Press Win+R, paste the command below and press Enter to finish the check.</p>'
+            f'<code>echo asset-monitor-fixture</code></div><script src="http://{CLICKFIX_HOST}:8090/served/loader.js"></script>')
+
+
+def served_home(judol: bool) -> bytes:
+    """The homepage rotates its CSRF token (meta, hidden _token, inline script and logout link),
+    its script nonce and its bundle's hash on every request; judol adds gambling links."""
+    token, nonce, build = secrets.token_hex(16), secrets.token_hex(12), secrets.token_hex(4)
+    return (f'<!doctype html><html><head><title>Toko Batik Fixture</title><meta name="csrf-token" content="{token}">'
+            f'<script nonce="{nonce}">window.csrfToken = "{token}";</script>'
+            f'<script nonce="{nonce}" src="/served/static/app.{build}.js"></script><script src="/served/beacon.js"></script></head>'
+            '<body><h1>Toko Batik Fixture</h1><p>Batik tulis and cap, made to order.</p>'
+            f'<form method="post" action="/served/cart"><input type="hidden" name="_token" value="{token}"><button>Add to cart</button></form>'
+            f'<a href="/served/verify">Checkout</a> <a href="/served/logout?_token={token}">Log out</a>'
+            f'{JUDOL if judol else ""}</body></html>').encode()
+
+
+def served_app_js() -> bytes:
+    """The same bundle on every request, its minified identifiers renamed."""
+    a, b = secrets.choice(['a', 'n', 'x']), secrets.choice(['t', 'e', 'r'])
+    return f'(function(){{var {a}=document.title,{b}=function({a}){{return {a}.length}};window.appReady={b}({a})}})();\n'.encode()
+
+
 def osv_results(queries: list) -> dict:
     """OSV's querybatch answer: the node record for node 20.11.1 only."""
     node = {'package': {'ecosystem': 'Bitnami', 'name': 'node'}, 'version': '20.11.1'}
@@ -339,7 +375,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({'ok': True})
         if path == '/admin/state':
             with STATE.lock:
-                return self.json({'generation': STATE.generation, 'version': STATE.version, 'score': STATE.score, 'notifications': STATE.notifications, 'requests': STATE.requests, 'pulls': STATE.pulls, 'writes': STATE.writes})
+                return self.json({'generation': STATE.generation, 'version': STATE.version, 'score': STATE.score, 'notifications': STATE.notifications, 'requests': STATE.requests, 'pulls': STATE.pulls, 'writes': STATE.writes,
+                                  'served_variants': sorted(STATE.served_variants), 'served_requests': STATE.served_requests})
+        if path == '/served' or path.startswith('/served/'):
+            return self.served(path)
         if path in ('/target', '/'):
             return self.send(200, f'<html><head><meta name="generator" content="Numen Fixture {version}"></head><body><script src="/assets/app.js"></script></body></html>'.encode(), 'text/html', {'X-Product-Version': version})
         if path == '/assets/app.js':
@@ -490,7 +529,13 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.refs.clear()
                 STATE.commits.clear()
                 STATE.pulls.clear()
+                STATE.served_variants.clear()
+                STATE.served_requests.clear()
             return self.json({'ok': True})
+        if path == '/admin/served':
+            with STATE.lock:
+                STATE.served_variants = set(data.get('variants', []))
+            return self.json({'variants': sorted(STATE.served_variants)})
         if path.startswith('/repos/numen/fixture/'):
             return self.github_write(original, path.removeprefix('/repos/numen/fixture'), data)
         if path.startswith('/webhooks/') or path.startswith('/api/webhooks/'):
@@ -499,6 +544,25 @@ class Handler(BaseHTTPRequestHandler):
                 message_id = str(len(STATE.notifications))
             return self.json({'id': message_id, 'channel_id': 'fixture', 'content': data.get('content', '')})
         return self.json({'message': 'Fixture route not found'}, 404)
+
+    def served(self, path: str) -> None:
+        """The Served-content fixture: each request is recorded with its user agent, so the journey
+        can show that /served/executed is never requested."""
+        agent = self.headers.get('User-Agent', '')
+        with STATE.lock:
+            STATE.served_requests.append({'path': path, 'user_agent': agent})
+            variants = set(STATE.served_variants)
+        html = 'text/html; charset=utf-8'
+        if path == '/served':
+            return self.send(200, served_home('judol' in variants and 'Googlebot' in agent), html)
+        if path == '/served/verify':
+            page = f'<!doctype html><html><head><title>Checkout</title></head><body><h1>Checkout</h1><p>Review your order.</p>{CLICKFIX if "clickfix" in variants else ""}</body></html>'
+            return self.send(200, page.encode(), html)
+        if re.fullmatch(r'/served/static/app\.[0-9a-f]+\.js', path):
+            return self.send(200, served_app_js(), 'application/javascript')
+        if path in ('/served/beacon.js', '/served/loader.js'):
+            return self.send(200, SERVED_BEACON if path == '/served/beacon.js' else SERVED_LOADER, 'application/javascript')
+        return self.send(404, b'Not found', 'text/plain')
 
     def github_write(self, original: str, path: str, data: dict) -> None:
         """The git data and pull request writes of a Remediation PR (A08), kept in memory."""

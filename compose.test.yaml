@@ -7,7 +7,12 @@ services:
     entrypoint: [/fixtures/start.sh]
     volumes: [./tests/integration:/fixtures:ro]
     ports: ["127.0.0.1:18091:8090"]
-    networks: [application]
+    networks:
+      application:
+      # The Served-content fixture (A10): a check's gateway joins this network and reaches only its
+      # range. cdn.clickfix-fixture.test is the fixture itself, posing as an external script host.
+      served:
+        aliases: [cdn.clickfix-fixture.test]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]
       interval: 3s
@@ -32,8 +37,14 @@ services:
   runner-broker:
     environment:
       NUMEN_NPM_REGISTRY_URL: https://registry.invalid
+      # The demo fixture's private range, opened to Served-content checks by this override only.
+      NUMEN_SERVED_CONTENT_FIXTURE_NETWORK: asset-monitor-test-served
   worker:
     environment: *test-env
     depends_on:
       fixtures:
         condition: service_healthy
+networks:
+  served:
+    name: asset-monitor-test-served
+    internal: true

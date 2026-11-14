@@ -47,7 +47,10 @@ from .models import (
     ApplicationRepository,
     RemediationPR,
     Repository,
+    ServedChange,
+    ServedFetch,
     VersionRecipe,
+    WatchedPage,
     now,
     utc,
 )
@@ -55,6 +58,7 @@ from .schemas import (
     AccountInput,
     ApprovalInput,
     BackfillInput,
+    BaselineInput,
     BatchAnalysisInput,
     BatchDeleteInput,
     BatchReviewInput,
@@ -77,6 +81,7 @@ from .schemas import (
     ReviewInput,
     SessionInput,
     TransitionInput,
+    WatchedPageInput,
     http_url,
 )
 from .security import (
@@ -316,17 +321,38 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 .limit(20)
             )
         )
-        # The Review queue: Insufficient context Verdicts the Operator has not judged yet.
+        # The Review queue: Insufficient context Verdicts the Operator has not judged yet, on commits
+        # and on served-content changes (A10), the newest first: a served-content change dates from
+        # when it was first served.
         # ponytail: sorted in Python because committed_at lives in commit data; index it if it grows.
+        def queued_at(row):
+            return row.data.get("committed_at") if isinstance(row, Commit) else utc(row.created_at).isoformat()
+
         queue = sorted(
-            db.scalars(
-                select(Commit).where(
-                    Commit.verdict == "Insufficient context", Commit.review_decision == "pending"
+            [
+                row
+                for model in (Commit, ServedChange)
+                for row in db.scalars(
+                    select(model).where(model.verdict == "Insufficient context", model.review_decision == "pending")
                 )
-            ),
-            key=lambda c: c.data.get("committed_at") or "",
+            ],
+            key=lambda row: queued_at(row) or "",
             reverse=True,
         )
+
+        def queued(row):
+            if isinstance(row, ServedChange):
+                return {"id": row.id, "title": domain.served_change_label(db, row), "revision": row.fingerprint[:12],
+                        "application_id": row.application_id, "committed_at": queued_at(row),
+                        "link": f"/applications/{row.application_id}?tab=served"}
+            return {
+                "id": row.id,
+                "title": domain.commit_label(row),
+                "revision": row.revision,
+                "application_id": getattr(domain.commit_application(db, row), "id", None),
+                "committed_at": row.data.get("committed_at"),
+            }
+
         due = list(
             db.scalars(
                 select(Application)
@@ -350,16 +376,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 for e in recent
             ],
             "due_applications": [domain.application_json(db, p) for p in due],
-            "review_queue": [
-                {
-                    "id": c.id,
-                    "title": domain.commit_label(c),
-                    "revision": c.revision,
-                    "application_id": getattr(domain.commit_application(db, c), "id", None),
-                    "committed_at": c.data.get("committed_at"),
-                }
-                for c in queue[:20]
-            ],
+            "review_queue": [queued(row) for row in queue[:20]],
             "review_queue_count": len(queue),
         }
 
@@ -417,6 +434,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         application = Application(**data, next_check_at=now())
         db.add(application)
         db.flush()
+        domain.sync_homepage(db, application)
         action(db, "application", application.id, {"action": "created"})
         return domain.application_json(db, application)
 
@@ -457,6 +475,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         for name, value in data.items():
             setattr(row, name, value)
         row.next_check_at = now() if row.monitor_enabled and not row.archived else None
+        domain.sync_homepage(db, row)  # a new Asset URL moves the homepage (A10)
         action(db, "application", row.id, {"action": "updated"})
         for _, repository in domain.links(db, row) if restored else ():
             domain.queue_exposure(db, row, repository)  # Verdicts stored while it was archived (A05)
@@ -820,6 +839,91 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         if repository.cursor is None:
             raise DomainError("source_not_checked", "Check this repository once to set its Baseline first", 422)
         return accepted(domain.queue_advisory(db, row, repository, key))
+
+    def watched_page(db, ident, page_id):
+        page = db.get(WatchedPage, page_id)
+        if page is None or page.application_id != ident or page.removed_at is not None:
+            raise DomainError("not_found", "This Watched page was not found", 404)
+        return page
+
+    @router.get("/applications/{ident}/watched-pages")
+    def list_watched_pages(ident: str, db=database_dependency):
+        application = domain.get(db, Application, ident)
+        return {"items": [domain.watched_page_json(db, page) for page in domain.watched_pages(db, application)]}
+
+    @router.post("/applications/{ident}/watched-pages", status_code=201)
+    def add_watched_page(ident: str, body: WatchedPageInput, db=database_dependency):
+        """Adds a Watched page on the Asset URL's origin (A10); a removed one is restored with its history."""
+        application = domain.get(db, Application, ident)
+        if domain.page_origin(body.url) != domain.page_origin(application.asset_url):
+            raise DomainError("validation_error", "Check the supplied fields", 422, {
+                "url": "A Watched page must have the Asset URL's scheme, host and port"})
+        pages = domain.watched_pages(db, application)
+        if any(page.url == body.url for page in pages):
+            raise DomainError("page_watched", "This page is already a Watched page", 409)
+        if len(pages) >= domain.MAX_WATCHED_PAGES:
+            raise DomainError("too_many_watched_pages",
+                              f"An Asset has at most {domain.MAX_WATCHED_PAGES} Watched pages", 422)
+        page = db.scalar(select(WatchedPage).where(
+            WatchedPage.application_id == application.id, WatchedPage.url == body.url))
+        if page is None:
+            page = WatchedPage(application_id=application.id, url=body.url, baseline={})
+            db.add(page)
+        page.removed_at = None
+        db.flush()
+        action(db, "watched_page", page.id, {"action": "watched_page_added", "url": page.url})
+        return domain.watched_page_json(db, page)
+
+    @router.delete("/applications/{ident}/watched-pages/{page_id}")
+    def remove_watched_page(ident: str, page_id: str, db=database_dependency):
+        """Stops watching the page; its fetches and changes are kept."""
+        page = watched_page(db, ident, page_id)
+        if page.homepage:
+            raise DomainError("homepage_required", "The homepage is always a Watched page", 409)
+        page.removed_at = now()
+        action(db, "watched_page", page.id, {"action": "watched_page_removed", "url": page.url})
+        return domain.watched_page_json(db, page)
+
+    @router.post("/applications/{ident}/served-content-checks")
+    def run_served_check(
+        ident: str, key: str | None = Header(None, alias="Idempotency-Key"), db=database_dependency
+    ):
+        """Check now for the Asset (A10): one Served-content check of every Watched page, reusing one already active."""
+        return accepted(domain.queue_served_check(db, domain.get(db, Application, ident), key))
+
+    @router.post("/served-changes/{ident}/review")
+    def review_served_change(ident: str, body: ReviewInput, db=database_dependency):
+        """The Operator's review decision on a served-content change, such as one in the Review queue."""
+        row = domain.get(db, ServedChange, ident)
+        row.review_decision = body.decision
+        action(db, "served_change", row.id, {"action": "review", "decision": body.decision})
+        return domain.served_change_json(row)
+
+    @router.post("/served-changes/{ident}/analyses")
+    def analyze_served_change(
+        ident: str,
+        body: OperationInput = OperationInput(),
+        key: str | None = Header(None, alias="Idempotency-Key"),
+        db=database_dependency,
+    ):
+        """A manual Analysis of a served-content change (A04): uncapped, on the commit_analysis profile."""
+        row = domain.get(db, ServedChange, ident)
+        application = domain.get(db, Application, row.application_id)
+        profile = domain.resolve_profile(
+            db, application, "commit_analysis", body.profile.model_dump() if body.profile else None)
+        job = domain.enqueue(db, "served_analysis", application, {"served_change_id": row.id}, profile, key)
+        if job.status == "queued":  # An idempotent replay may return a finished job.
+            row.analysis_state = {"status": "queued", "job_id": job.id}
+        action(db, "served_change", row.id, {"action": "analysis_requested", "job_id": job.id})
+        return accepted(job)
+
+    @router.post("/applications/{ident}/watched-pages/{page_id}/baselines")
+    def accept_baseline(ident: str, page_id: str, body: BaselineInput, db=database_dependency):
+        """Accepts a fetch's Content fingerprint as the page's Baseline (A10). The router's CSRF
+        check protects it; it is not an Approval and takes no password."""
+        page = watched_page(db, ident, page_id)
+        domain.accept_baseline(db, page, domain.get(db, ServedFetch, body.fetch_id))
+        return domain.watched_page_json(db, page)
 
     @router.get("/applications/{ident}/version-observations")
     def observations(
@@ -1577,9 +1681,10 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             )
         application = domain.get(db, Application, row.application_id) if row.application_id else None
         job = domain.enqueue(db, row.kind, application, row.input, row.profile, key)
-        commit = db.get(Commit, row.input["commit_id"]) if row.kind == "commit_analysis" else None
-        if commit and job.status == "queued":
-            commit.analysis_state = {"status": "queued", "job_id": job.id}
+        subject = (db.get(Commit, row.input["commit_id"]) if row.kind == "commit_analysis"
+                   else db.get(ServedChange, row.input["served_change_id"]) if row.kind == "served_analysis" else None)
+        if subject and job.status == "queued":
+            subject.analysis_state = {"status": "queued", "job_id": job.id}
         domain.event(
             db,
             job,

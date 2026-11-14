@@ -2,10 +2,17 @@ import { detectionChecks, operationNames } from "./types";
 import type { Job, JobSubject } from "./types";
 import { describeError, humanize, sentence } from "./components/ui";
 
+// Served content (A10) jobs, which are not operations the Operator launches with a profile.
+const kindNames: Record<string, string> = {
+  served_check: "Served-content check",
+  served_triage: "Served-content Triage",
+  served_analysis: "Served-content Analysis",
+  served_content_sweep: "Detection rule sweep of served content",
+};
 export function jobName(kind: string) {
   return kind in operationNames
     ? operationNames[kind as keyof typeof operationNames]
-    : humanize(kind);
+    : kindNames[kind] || humanize(kind);
 }
 /** A title that names what the job acted on, e.g. "CVE analysis: CVE-2026-1234". */
 export function jobTitle(job: Job) {
@@ -21,6 +28,7 @@ const subjectLinks: Record<string, string> = {
   notification: "Open notified item",
   source: "Open repositories",
   advisory: "Open Advisories",
+  served: "Open Served content",
   version: "Open version evidence",
   audit: "Open audit context",
   cves: "Open CVE records",
@@ -164,7 +172,40 @@ function successSummary(job: Job): {
         facts,
       };
     }
-    case "commit_triage": {
+    case "served_check": {
+      const changed = count(r, "changed") || 0;
+      const matches = count(r, "matches") || 0;
+      const awaiting = count(r, "awaiting_baseline") || 0;
+      const failed = count(r, "failed") || 0;
+      facts.push(plural(count(r, "fetches") || 0, "fetch", "fetches"));
+      if (matches) facts.push(`${matches} matching the Baseline`);
+      if (awaiting) facts.push(`${awaiting} with no Baseline yet`);
+      if (failed) facts.push(plural(failed, "failed fetch", "failed fetches"));
+      const pages = `${plural(count(r, "pages") || 0, "Watched page")} checked`;
+      return {
+        summary: changed
+          ? `${pages} · ${plural(changed, "changed fingerprint")}`
+          : pages,
+        facts,
+        tone: changed ? "warm" : undefined,
+      };
+    }
+    case "served_content_sweep": {
+      const matched = count(r, "count") || 0;
+      if (field(r, "truncated") === true)
+        facts.push("Only the newest stored files were swept");
+      return {
+        summary: matched
+          ? `${plural(matched, "match", "matches")} in stored served content`
+          : text(r, "status") === "no_served_content"
+            ? "No stored served content to sweep"
+            : "No stored served content matched",
+        facts,
+        tone: matched ? "warm" : undefined,
+      };
+    }
+    case "commit_triage":
+    case "served_triage": {
       const decision = text(r, "decision") || "";
       return {
         summary:
@@ -174,7 +215,8 @@ function successSummary(job: Job): {
         tone: decision === "security_candidate" ? "warm" : undefined,
       };
     }
-    case "commit_analysis": {
+    case "commit_analysis":
+    case "served_analysis": {
       const verdict = text(r, "verdict") || "Analysis saved";
       if (confidence) facts.push(humanize(confidence));
       return {
@@ -534,7 +576,7 @@ export function jobOutcome(job: Job): JobOutcome {
             ? labFailure
             : pr || draft
               ? failureHints[code] || (pr ? remediationFailure : draftFailure)
-              : job.kind === "commit_analysis" &&
+              : ["commit_analysis", "served_analysis"].includes(job.kind) &&
                   ["timeout", "runtime_timeout"].includes(code)
                 ? analysisTimeout
                 : failureHints[code]) ||

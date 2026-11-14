@@ -14,7 +14,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from sqlalchemy import and_, select
-from . import advisories, artifacts, cves, dependencies, detection, domain, exposure, prompts, remediation
+from . import advisories, artifacts, cves, dependencies, detection, domain, exposure, prompts, remediation, served
 from . import fingerprints as fingerprinting
 from .models import (
     Account,
@@ -38,9 +38,12 @@ from .models import (
     ApplicationRepository,
     RemediationPR,
     Repository,
+    ServedChange,
+    ServedFetch,
     Snapshot,
     Transcript,
     VersionRecipe,
+    WatchedPage,
     now,
     uid,
     utc,
@@ -71,6 +74,22 @@ VERDICT_REVIEW = {
 ANALYSIS_SECONDS = 1800
 # Patch drafting deadline (A08).
 PATCH_SECONDS = 1200
+# A Malicious change's indicators and the secrets its payload reaches (A07). Application code
+# checks them against the change and hashes the files itself. They have no count or length
+# bounds, so a long payload line or a large change never fails the Verdict.
+INDICATORS = {
+    "indicators": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["files", "hosts", "urls", "commands"],
+        "properties": {
+            key: {"type": "array", "items": {"type": "string"}} for key in ("files", "hosts", "urls", "commands")
+        },
+    },
+    "reachable_secrets": {"type": "array", "items": {"type": "string"}},
+}
+MALICIOUS_REQUIRES = {"if": {"properties": {"verdict": {"const": "Malicious change"}}},
+                      "then": {"required": ["indicators", "reachable_secrets"]}}
 SCHEMAS = {
     # Triage decides only whether a change deserves Analysis (A03).
     "commit_triage": {
@@ -101,23 +120,28 @@ SCHEMAS = {
             "open_questions": {"type": "array"},
             "before_after": {"type": "string"},
             "affected_behavior": {"type": "string"},
-            # A Malicious change's indicators and the secrets its payload reaches (A07). Application
-            # code checks them against the commit and hashes the files itself. They have no count or
-            # length bounds, so a long payload line or a large change never fails the Verdict.
-            "indicators": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["files", "hosts", "urls", "commands"],
-                "properties": {
-                    key: {"type": "array", "items": {"type": "string"}} for key in ("files", "hosts", "urls", "commands")
-                },
-            },
-            "reachable_secrets": {"type": "array", "items": {"type": "string"}},
+            **INDICATORS,
         },
         "allOf": [
             {"if": {"properties": {"verdict": {"enum": list(FINDING_VERDICTS)}}}, "then": {"required": ["vulnerable_ref"], "properties": {"vulnerable_ref": {"type": "string", "minLength": 1}, "evidence": {"minItems": 1}}}},
-            {"if": {"properties": {"verdict": {"const": "Malicious change"}}}, "then": {"required": ["indicators", "reachable_secrets"]}},
+            MALICIOUS_REQUIRES,
         ],
+    },
+    # Served-content Analysis (A04, A10) returns one of the four served-content Verdicts; nothing
+    # is drafted for a code revision, so it has no vulnerable_ref, addresses or before/after.
+    "served_analysis": {
+        "type": "object",
+        "required": ["verdict", "confidence", "title", "summary", "evidence", "open_questions"],
+        "properties": {
+            "verdict": {"enum": list(SERVED_CONTENT_VERDICTS)},
+            "confidence": {"enum": list(CONFIDENCES)},
+            "title": {"type": "string", "minLength": 1, "maxLength": 300},
+            "summary": {"type": "string"},
+            "evidence": EVIDENCE_SCHEMA,
+            "open_questions": {"type": "array"},
+            **INDICATORS,
+        },
+        "allOf": [MALICIOUS_REQUIRES],
     },
     "cve_analysis": {
         "type": "object",
@@ -196,12 +220,28 @@ SCHEMAS = {
         },
     },
 }
+# A served-content change's Triage decides as a commit's does (A03).
+SCHEMAS["served_triage"] = SCHEMAS["commit_triage"]
 for _schema in SCHEMAS.values():
     _schema["additionalProperties"] = False
+# The runner's fixed tool profile of each operation that has none of its own (A10): served Triage
+# runs with no tools, served Analysis read-only with no target fetch.
+RUNNER_OPERATIONS = {"served_triage": "commit_triage", "served_analysis": "commit_analysis"}
 # A Triage run is one tool-less call: the change travels in its prompt, its diff capped (a capped
 # diff counts as incomplete), and the run has a deadline.
 TRIAGE_DIFF_CHARS = 100_000
 TRIAGE_SECONDS = 120
+
+
+def triage_cut(diff):
+    """The longest prefix of `diff` whose JSON encoding fits TRIAGE_DIFF_CHARS: the cap counts the
+    diff as the prompt encodes it, so escapes never push it past the runner's prompt bound."""
+    cut = diff[:TRIAGE_DIFF_CHARS]
+
+    def encoded(n):
+        return len(json.dumps(cut[:n], ensure_ascii=False)) - 2
+
+    return cut[: bisect.bisect_right(range(len(cut) + 1), TRIAGE_DIFF_CHARS, key=encoded) - 1]
 
 ISSUE_TYPES = {
     "cross_site_scripting": "Cross-site scripting", "sql_injection": "SQL injection",
@@ -230,6 +270,8 @@ def validate_result(operation, result):
         raise DomainError(
             "invalid_agent_output", "Agent did not produce the structured result object", 422
         )
+    if operation == "served_analysis" and result.get("verdict") in VERDICTS:
+        check_verdict(result, served_content=True)  # refused as a Verdict, before the schema
     schema = SCHEMAS.get(operation)
     if schema:
         from jsonschema import Draft202012Validator
@@ -617,7 +659,7 @@ class Workflows:
         return result or {}, files, state
 
     def agent(self, db, job, operation, files, facts, suffix="", policy=None, limits=None):
-        profile = self.runtime_profile(db, job, job.kind)
+        profile = self.runtime_profile(db, job, RUNNER_OPERATIONS.get(job.kind, job.kind))
         # VCS administrative data is outside source evidence. Ordinary hidden application/config
         # files remain immutable evidence; runtime adapters disable ambient configuration loading.
         omitted = [
@@ -663,8 +705,8 @@ class Workflows:
         result, outputs, state = self.run(
             db, job, "agent", profile, prompt, schema, files, policy=policy, suffix=suffix, limits=limits,
         )
-        if operation == "commit_triage":
-            # The raw reply: commit_triage redacts and validates it, and keeps it with its prompt.
+        if operation in ("commit_triage", "served_triage"):
+            # The raw reply: triage_run redacts and validates it, and keeps it with its prompt.
             return {**result, "prompt": prompt}, outputs, state
         validate_result(operation, result)
         secrets = credential_strings(profile["credential"]) + all_secrets(db, self.vault)
@@ -681,8 +723,10 @@ class Workflows:
         )
         if (
             owner
-            # Their rows pin what they act on: the Finding's revision, or the draft's base_ref.
-            and job.kind not in ("lab_run", "detection_rule", "patch_drafting", "remediation_draft", "remediation_pr")
+            # Their rows pin what they act on: the Finding's revision, or the draft's base_ref. Served
+            # content is read from the Asset (A10), never from a source generation.
+            and job.kind not in ("lab_run", "detection_rule", "patch_drafting", "remediation_draft", "remediation_pr",
+                                 "served_check", "served_triage", "served_analysis", "served_content_sweep")
             and job.input.get("source_generation") != owner.source_generation
         ):
             raise DomainError(
@@ -1071,6 +1115,146 @@ class Workflows:
                 feeds[feed] = {"error": {"code": exc.code, "message": exc.message}}
         return records, feeds, writes
 
+    def served_check(self, db, job, application):
+        """A Served-content check (A10): the fixed probe fetches each Watched page and its scripts
+        through the gateway as browser and as Googlebot, never running them. The bytes are stored
+        once by sha256, each user agent's fetch is recorded with its Content fingerprint, and a
+        fetched fingerprint unlike the Baseline is recorded once as a served-content change, and one
+        that matches it again remediates the Findings of that page and user agent. A page that does
+        not answer 200 is a failed fetch; a runtime failure fails the job."""
+        # ponytail: every page's bytes stay in memory until the fence (at most 20 x 7 MiB); publish
+        # them page by page if a worker's memory matters.
+        checked = []
+        for page in domain.watched_pages(db, application):
+            target = json.dumps({"url": page.url, **SERVED_TARGET}).encode()
+            result, files, _ = self.run(db, job, "probe", files={"recipe.py": served.PROBE.read_bytes(),
+                                                                 "target.json": target},
+                                        policy=SERVED_POLICY, suffix=":" + page.id)
+            checked.append((page.id, served_fetches(result, files), files))
+        self.context.fence(db)
+        db.refresh(application)  # an Asset URL changed meanwhile has already moved the homepage
+        domain.sync_homepage(db, application)
+        # Locked, so a Baseline accepted meanwhile is read before its fingerprints are compared.
+        pages = {page.id: page for page in db.scalars(
+            select(WatchedPage).where(WatchedPage.application_id == application.id, WatchedPage.removed_at.is_(None))
+            .with_for_update().execution_options(populate_existing=True))}
+        checked = [entry for entry in checked if entry[0] in pages]  # a page removed meanwhile is skipped
+        digests = {digest for _, _, files in checked for digest in files}
+        stored = set(db.scalars(select(Artifact.resource_id).where(
+            Artifact.resource_type == "served_content", Artifact.resource_id.in_(sorted(digests)))))
+        counts = dict.fromkeys(("changed", "matches", "awaiting_baseline", "failed"), 0)
+        for page_id, fetched, files in checked:
+            # Evidence is kept as served, so no secret scan: a page's bytes are never sent to the broker again.
+            for digest in files.keys() - stored:
+                artifacts.publish(db, self.config.artifact_root, "served_content", digest, {"content": files[digest]})
+                stored.add(digest)
+            page = pages[page_id]
+            for agent, values in fetched.items():
+                row = ServedFetch(application_id=application.id, page_id=page.id, job_id=job.id, user_agent=agent,
+                                  **values)
+                db.add(row)
+                db.flush()
+                baseline = page.baseline.get(agent)
+                state = ("failed" if row.status == "failed" else "awaiting_baseline" if baseline is None
+                         else "matches" if row.fingerprint == baseline["fingerprint"] else "changed")
+                if state == "changed":
+                    domain.record_served_change(db, page, row)
+                elif state == "matches":  # Served the Baseline again: its Findings are Remediated (A10, A11).
+                    for finding in list(db.scalars(select(Finding).join(
+                            ServedChange, ServedChange.id == Finding.data["subject_id"].as_string()).where(
+                            Finding.source == "served_content", Finding.status.in_(("open", "confirmed")),
+                            ServedChange.page_id == page.id, ServedChange.user_agent == agent))):
+                        domain.transition_finding(db, finding, "remediated", {
+                            "by": "baseline_match", "fetch_id": row.id, "page_id": page.id, "user_agent": agent})
+                counts[state] += 1
+        return {"pages": len(checked), "fetches": sum(len(fetched) for _, fetched, _ in checked), **counts}
+
+    def served_files(self, db, fetch, prefix=""):
+        """The stored bytes of a served fetch (A10), the only thing served Analysis and Detection
+        rules read: {prefix + "page.html": the page, prefix + "scripts/NN.js": each fetched script,
+        NN its place among the page's scripts}."""
+        return {prefix + name: artifacts.resource_files(db, self.config.artifact_root, "served_content",
+                                                        resource["sha256"])["content"]
+                for name, resource in served_names(fetch) if resource["sha256"]}
+
+    def served_analysis(self, db, job, application):
+        """Analysis of a served-content change (A04, A10) from stored bytes only: both user agents'
+        fetches of the check that found it and each user agent's Baseline fetch, read from
+        artifact storage. The run has no target policy, so nothing is fetched again. Only the
+        served-content Verdicts are accepted (validate_result). The Verdict and the review decision
+        are recorded; accept_baseline then allows the fingerprint after Security hardening or
+        Unrelated, Insufficient context leaves the change in the Review queue, and a Malicious
+        change opens its served_content Finding."""
+        change = domain.get(db, ServedChange, job.input["served_change_id"])
+        page = db.get(WatchedPage, change.page_id)
+        found = db.get(ServedFetch, change.fetch_id)
+        changed = db.scalars(select(ServedFetch).where(
+            ServedFetch.job_id == found.job_id, ServedFetch.page_id == page.id).order_by(ServedFetch.user_agent))
+        # The change's own Baseline is the one it was compared with, even after a later acceptance.
+        baselines = {**{agent: value["fetch_id"] for agent, value in page.baseline.items()},
+                     change.user_agent: change.baseline_fetch_id}
+        fetches = [*((f"source/changed/{fetch.user_agent}/", fetch) for fetch in changed),
+                   *((f"source/baseline/{agent}/", db.get(ServedFetch, ident)) for agent, ident in sorted(baselines.items()))]
+        files, listing = {}, {}
+        for prefix, fetch in fetches:
+            files.update(self.served_files(db, fetch, prefix))
+            listing.update({prefix + name: {key: resource.get(key) for key in ("url", "final_url", "status", "sha256", "error")}
+                            for name, resource in served_names(fetch)})
+        files["served-content.json"] = json.dumps(
+            {"page_url": page.url, "user_agent": change.user_agent, "files": listing, "diff": change.diff}, indent=1).encode()
+        result, outputs, _ = self.agent(
+            db, job, "served_analysis", files,
+            {"page_url": page.url, "user_agent": change.user_agent, "fingerprint": change.fingerprint,
+             "baseline_fingerprint": db.get(ServedFetch, change.baseline_fetch_id).fingerprint},
+            limits={"timeout_seconds": ANALYSIS_SECONDS},
+        )
+        if "report.md" not in outputs:
+            raise DomainError("missing_report", "Analysis completed without report.md", 422)
+        verdict = result["verdict"]
+        self.context.fence(db)
+        db.refresh(change, with_for_update=True)
+        analysis = Analysis(id=uid(), application_id=application.id, kind=job.kind, subject_id=change.id, job_id=job.id,
+                            input_hash=job.input_hash, profile=job.profile, result=result)
+        db.add(analysis)
+        artifacts.publish(db, self.config.artifact_root, "analysis", analysis.id, outputs,
+                          {"page_url": page.url, "user_agent": change.user_agent, "fingerprint": change.fingerprint,
+                           "profile": job.profile}, all_secrets(db, self.vault))
+        self.set_commit_decision(db, job, change, VERDICT_REVIEW[verdict])
+        change.verdict = verdict
+        change.analysis_state = {"status": "completed", "analysis_id": analysis.id}
+        entry = {}
+        if verdict == "Malicious change":
+            # The Served content column (A06, A11): a served_content Finding with a static Proof, a
+            # Detection rule and a cleanup report, and never a Remediation PR or a Lab.
+            cause = {"by": "verdict", "verdict": verdict, "confidence": result["confidence"],
+                     "analysis_id": analysis.id, "served_change_id": change.id}
+            finding, _ = domain.open_finding(db, application, "served_content", change.id, result["title"], page.url,
+                                             cause)
+            entry = {"finding_id": finding.id}
+            if finding.status in ("open", "confirmed"):  # A closed Finding keeps what it was closed with.
+                indicators = served.check_indicators(
+                    {path: data for path, data in files.items() if path.startswith("source/changed/")},
+                    {path: data for path, data in files.items() if path.startswith("source/baseline/")},
+                    result["indicators"])
+                served_it = list(db.scalars(select(ServedFetch).where(
+                    ServedFetch.page_id == page.id, ServedFetch.user_agent == change.user_agent,
+                    ServedFetch.fingerprint == change.fingerprint).order_by(ServedFetch.created_at)))
+                finding.data = {
+                    **finding.data, "source_analysis_id": analysis.id, "evidence": result["evidence"],
+                    "static_proof": {"analysis_id": analysis.id, "indicators": indicators},
+                    "cleanup_report": {"analysis_id": analysis.id, "page_url": page.url, "user_agent": change.user_agent,
+                                       "fetch_ids": [fetch.id for fetch in served_it],
+                                       "first_seen": utc(served_it[0].created_at).isoformat(),
+                                       "secrets": [s for s in result["reachable_secrets"] if s.strip()]},
+                }
+                static = {"report.md": outputs["report.md"], "indicators.json": json.dumps(indicators, indent=2).encode()}
+                if "detection-rule.yar" in outputs:
+                    static["detection-rule.yar"] = outputs["detection-rule.yar"]
+                # The static Proof is in the data, so publishing queues its Detection rule validation.
+                entry = self.publish_finding_bundle(db, job, application, finding, change.fingerprint, static, {},
+                                                    require_complete=False)
+        return {"analysis_id": analysis.id, "served_change_id": change.id, **result, **entry}
+
     def import_commits(self, db, repository, records):
         """Stores the records not seen before, each with its Pre-filter result, and queues their
         Triage. A repository shared by several Applications is triaged once, with one of their
@@ -1185,17 +1369,21 @@ class Workflows:
             )
             return None
 
-    def set_commit_decision(self, db, job, commit, decision):
+    def set_commit_decision(self, db, job, subject, decision):
+        """Sets the review decision of a Commit or a ServedChange, unless the Operator reviewed it
+        after `job` was queued."""
         manual = db.scalar(select(Action.id).where(
-            Action.resource_type == "commit", Action.resource_id == commit.id,
+            Action.resource_type == ("served_change" if isinstance(subject, ServedChange) else "commit"),
+            Action.resource_id == subject.id,
             Action.data["action"].as_string() == "review", Action.created_at >= job.created_at,
         ).limit(1))
         if manual is None:
-            commit.review_decision = decision
+            subject.review_decision = decision
 
     def triage_result(self, db, job, commit, result, complete):
-        """Records a validated Triage result and starts the automatic Analysis of a flagged change.
-        `complete` says whether Triage saw the whole diff; without it, unrelated cannot be confirmed."""
+        """Records a validated Triage result of a Commit or a ServedChange and starts the automatic
+        Analysis of a flagged change. `complete` says whether Triage saw the whole diff; without it,
+        unrelated cannot be confirmed."""
         if not complete and result["decision"] == "unrelated":
             result = {
                 **result,
@@ -1206,12 +1394,13 @@ class Workflows:
             }
         self.context.fence(db)
         db.refresh(commit, with_for_update=True)
+        served_change = isinstance(commit, ServedChange)
         commit.triage_status, commit.triage_result = (
             "completed",
             {
                 **result,
                 "profile": job.profile,
-                "revision": commit.revision,
+                **({"fingerprint": commit.fingerprint} if served_change else {"revision": commit.revision}),
                 "input_hash": job.input_hash,
             },
         )
@@ -1220,7 +1409,7 @@ class Workflows:
             # A flagged change is analysed automatically, after the changes already waiting for a
             # cap; an incomplete diff is never left unjudged.
             domain.start_waiting(db)
-            domain.start_analysis(db, commit)
+            (domain.start_served_analysis if served_change else domain.start_analysis)(db, commit)
         return result
 
     def redacted(self, db, value):
@@ -1244,18 +1433,10 @@ class Workflows:
             raise failure
 
     def commit_triage(self, db, job, application):
-        """One tool-less agent run with the change in its prompt (A03). Application code validates
-        the reply; a reply that fails the Triage schema fails the job, which the worker retries."""
+        """One tool-less agent run with the change in its prompt (A03)."""
         commit = domain.get(db, Commit, job.input["commit_id"])
         diff = commit.data.get("diff") or ""
-        cut = diff[:TRIAGE_DIFF_CHARS]
-
-        def encoded(n):
-            return len(json.dumps(cut[:n], ensure_ascii=False)) - 2
-
-        # The cap counts the diff as the prompt encodes it, so escapes never push it past the
-        # runner's prompt bound: the longest prefix whose encoding fits.
-        cut = cut[: bisect.bisect_right(range(len(cut) + 1), TRIAGE_DIFF_CHARS, key=encoded) - 1]
+        cut = triage_cut(diff)
         complete = bool(commit.data.get("diff_complete")) and len(cut) == len(diff)
         change = {
             "message": commit.data.get("message", ""),
@@ -1264,10 +1445,31 @@ class Workflows:
             "diff": cut,
             "diff_complete": complete,
         }
-        result, _, state = self.agent(
-            db, job, "commit_triage", {}, {"revision": commit.revision, "commit": change},
-            limits={"timeout_seconds": TRIAGE_SECONDS},
-        )
+        parsed = self.triage_run(db, job, "commit_triage", commit, {"revision": commit.revision, "commit": change})
+        return self.triage_result(db, job, commit, parsed, complete)
+
+    def served_triage(self, db, job, application):
+        """Triage of a served-content change (A10), as commit_triage: the change's diff from the
+        Baseline travels in the prompt, and the run has no input files and no tools."""
+        change = domain.get(db, ServedChange, job.input["served_change_id"])
+        diff = json.dumps(change.diff, indent=1, sort_keys=True, ensure_ascii=False)
+        cut = triage_cut(diff)
+        facts = {
+            "page_url": db.get(WatchedPage, change.page_id).url,
+            "user_agent": change.user_agent,
+            "fingerprint": change.fingerprint,
+            "baseline_fingerprint": db.get(ServedFetch, change.baseline_fetch_id).fingerprint,
+            "diff": cut,
+            "diff_complete": len(cut) == len(diff),
+        }
+        parsed = self.triage_run(db, job, "served_triage", change, facts)
+        return self.triage_result(db, job, change, parsed, facts["diff_complete"])
+
+    def triage_run(self, db, job, operation, subject, facts):
+        """The one tool-less Triage run of `subject`, a Commit or a ServedChange: its validated reply.
+        The run is kept as a Transcript; a reply that fails the Triage schema fails the job, which
+        the worker retries."""
+        result, _, state = self.agent(db, job, operation, {}, facts, limits={"timeout_seconds": TRIAGE_SECONDS})
         run = self.redacted(db, {
             "prompt": result.get("prompt", ""),
             "reply": str(result.get("reply", "")),
@@ -1278,15 +1480,15 @@ class Workflows:
         reply = run["reply"]
         try:
             # The reply's JSON object, read past any code fence or prose around it.
-            parsed = validate_result("commit_triage", json.loads(reply[reply.index("{") : reply.rindex("}") + 1]))
+            parsed = validate_result(operation, json.loads(reply[reply.index("{") : reply.rindex("}") + 1]))
         except ValueError:
             failure = DomainError("invalid_agent_output", "The Triage reply holds no JSON object", 422)
         except DomainError as exc:
             failure = exc
         else:
             failure = None
-        self.triage_transcript(db, job, commit, run, failure)  # Raises a failure after keeping it.
-        return self.triage_result(db, job, commit, parsed, complete)
+        self.triage_transcript(db, job, subject, run, failure)  # Raises a failure after keeping it.
+        return parsed
 
     def jev_base_url(self):
         return (
@@ -2986,42 +3188,54 @@ class Workflows:
     def detection_rule(self, db, job, application):
         """Validates a static Proof revision's Detection rule (A07) in the runner, where yara only
         reads the trees: it must match a file the commit added or changed, and no file in its parent
-        tree or, for a commit after the Baseline, the Baseline tree. A pass confirms the Finding; a
-        failure leaves its artifacts Draft, names the failed check and keeps the lifecycle state."""
+        tree or, for a commit after the Baseline, the Baseline tree. A served-content change's trees
+        are stored bytes: the rule must match the changed fetch's, and neither the previous fetch's
+        nor the Baseline fetch's. A pass confirms the Finding, and an Upstream Malicious change's
+        then sweeps the Application's stored served content; a failure leaves its artifacts Draft,
+        names the failed check and keeps the lifecycle state."""
         finding = domain.get(db, Finding, job.input["finding_id"])
         revision = job.input["artifact_revision"]
         drafted = artifacts.resource_files(db, self.config.artifact_root, "finding", finding.id, revision)
         _, failed = detection.rule_text(drafted)
         if failed:
             raise DomainError("invalid_rule", failed["message"], 422)
-        commit = domain.get(db, Commit, finding.data.get("source_commit_id") or "")
-        repository = db.get(Repository, commit.repository_id)
-        # Trees come from stored snapshots, or else the read-only GitHub tarball or SVN export.
-        _, tree = self.snapshot(db, repository, commit.revision)
-        parents = commit.data.get("parent_revisions")
-        if repository.source_kind != "github":
-            parents = [str(int(commit.revision) - 1)] if int(commit.revision) > 1 else []
-        elif parents is None:
-            parents = self.source_client(db).commit_parents(repository, commit.revision)
-        parent = parents[0] if parents else None  # A root commit's parent tree is empty.
-        baseline = repository.baseline_revision
-        skipped = (
-            "A Backfill commit is checked against its parent tree only" if commit.data.get("backfill")
-            else "The repository has no Baseline" if not baseline
-            else "The Baseline is the parent tree" if baseline == parent
-            else None
-        )
-        trees = {
-            "changed": {path: tree[path] for path in detection.changed_files(commit, tree).values()},
-            "parent": self.snapshot(db, repository, parent)[1] if parent else {},
-            "baseline": {} if skipped else self.snapshot(db, repository, baseline)[1],
-        }
+        served_content = finding.source == "served_content"
+        if served_content:
+            change = domain.get(db, ServedChange, finding.data.get("subject_id") or "")
+            skipped = "The previous fetch is the Baseline fetch" if change.previous_fetch_id == change.baseline_fetch_id else None
+            fetches = {"changed": change.fetch_id, "parent": change.previous_fetch_id,
+                       "baseline": None if skipped else change.baseline_fetch_id}
+            trees = {name: self.served_files(db, db.get(ServedFetch, ident)) if ident else {}
+                     for name, ident in fetches.items()}
+        else:
+            commit = domain.get(db, Commit, finding.data.get("source_commit_id") or "")
+            repository = db.get(Repository, commit.repository_id)
+            # Trees come from stored snapshots, or else the read-only GitHub tarball or SVN export.
+            _, tree = self.snapshot(db, repository, commit.revision)
+            parents = commit.data.get("parent_revisions")
+            if repository.source_kind != "github":
+                parents = [str(int(commit.revision) - 1)] if int(commit.revision) > 1 else []
+            elif parents is None:
+                parents = self.source_client(db).commit_parents(repository, commit.revision)
+            parent = parents[0] if parents else None  # A root commit's parent tree is empty.
+            baseline = repository.baseline_revision
+            skipped = (
+                "A Backfill commit is checked against its parent tree only" if commit.data.get("backfill")
+                else "The repository has no Baseline" if not baseline
+                else "The Baseline is the parent tree" if baseline == parent
+                else None
+            )
+            trees = {
+                "changed": {path: tree[path] for path in detection.changed_files(commit, tree).values()},
+                "parent": self.snapshot(db, repository, parent)[1] if parent else {},
+                "baseline": {} if skipped else self.snapshot(db, repository, baseline)[1],
+            }
         files = {"rule.yar": drafted["detection-rule.yar"]}
         for name, found in trees.items():
             files.update({f"{name}/{path}": data for path, data in found.items() if path != "manifest.json"})
         result, _, _ = self.run(db, job, "detection_rule", files=files)
         scanned = {path.split("/", 1)[0] for path in files} & set(detection.TREES)
-        checks = detection.checks(result, scanned, skipped)
+        checks = detection.checks(result, scanned, skipped, served=served_content)
         status = "failed" if any(check["status"] == "failed" for check in checks) else "validated"
         self.context.fence(db)
         db.refresh(finding, with_for_update=True)
@@ -3034,8 +3248,64 @@ class Workflows:
                     "by": "detection_rule", "artifact_revision": revision, "job_id": job.id})
             finding.data = {**finding.data, "static_proof": {**proof, "status": status, "checks": checks, "job_id": job.id}}
             finding.updated_at = now()
+            if status == "validated" and domain.finding_cell(db, finding) == ("upstream", "Malicious change"):
+                # A06: the Detection rule sweep of the Asset's stored served content, once per revision.
+                domain.enqueue(db, "served_content_sweep", application,
+                               {"finding_id": finding.id, "artifact_revision": revision},
+                               idempotency_key=f"served-sweep:{finding.id}:{revision}")
         return {"finding_id": finding.id, "artifact_revision": revision, "status": status, "checks": checks,
                 "current": current}
+
+    def served_content_sweep(self, db, job, application):
+        """The Detection rule sweep of an exposed Upstream Malicious change (A06): its validated
+        rule, run through the detection_rule job over the Application's stored served content,
+        each stored file once, the newest first. Nothing is fetched again. The matches are recorded
+        on the Finding with the page and user agent each was served to; the lifecycle is unchanged."""
+        finding = domain.get(db, Finding, job.input["finding_id"])
+        revision = job.input["artifact_revision"]
+        rule = artifacts.resource_files(db, self.config.artifact_root, "finding", finding.id, revision)["detection-rule.yar"]
+        rows = db.execute(select(ServedFetch.id, ServedFetch.page_id, ServedFetch.user_agent, ServedFetch.resources,
+                                 ServedFetch.created_at, WatchedPage.url)
+                          .join(WatchedPage, WatchedPage.id == ServedFetch.page_id)
+                          .where(ServedFetch.application_id == finding.application_id)
+                          .order_by(ServedFetch.created_at.desc(), ServedFetch.id))
+        # ponytail: the swept bytes are held in memory, at most MAX_SUBMISSION, and the newest files
+        # past that bound are left out (truncated); sweep in batches if an Asset's stored content outgrows it.
+        sizes, served_to, total, truncated = {}, {}, 0, False  # served_to: {sha256: {(page, user agent): newest fetch}}
+        for fetch_id, page_id, agent, resources, created_at, page_url in rows:
+            for resource in resources:
+                digest = resource.get("sha256")
+                if resource.get("status") != 200 or not digest:
+                    continue
+                if digest not in sizes:
+                    size = resource.get("size") or 0
+                    if len(sizes) >= artifacts.MAX_SOURCE_FILES or total + size > artifacts.MAX_SUBMISSION:
+                        truncated = True
+                        continue
+                    sizes[digest], total = size, total + size
+                served_to.setdefault(digest, {}).setdefault((page_id, agent), {
+                    "page_id": page_id, "page_url": page_url, "user_agent": agent, "fetch_id": fetch_id,
+                    "url": resource.get("url"), "sha256": digest, "fetched_at": utc(created_at).isoformat()})
+        matches = []
+        if sizes:
+            files = {f"changed/{digest}": artifacts.resource_files(
+                db, self.config.artifact_root, "served_content", digest)["content"] for digest in sizes}
+            result, _, _ = self.run(db, job, "detection_rule", files={"rule.yar": rule, **files})
+            found = (result.get("matches") or {}).get("changed") if isinstance(result, dict) and result.get("compiled") else None
+            if not isinstance(found, dict) or not isinstance(found.get("files"), list) or not isinstance(found.get("count"), int):
+                raise DomainError("invalid_rule_result", "The Detection rule run returned a malformed result", 422)
+            matches = [match for digest in found["files"] for match in served_to.get(digest, {}).values()]
+            truncated = truncated or found["count"] > len(found["files"])  # the runner lists at most 1000
+        self.context.fence(db)
+        db.refresh(finding, with_for_update=True)
+        swept = {"artifact_revision": revision, "job_id": job.id,
+                 "status": "matched" if matches else "no_match" if sizes else "no_served_content",
+                 "matches": matches, "count": len(matches), "truncated": truncated}
+        finding.data = {**finding.data, "served_content_sweep": swept}
+        finding.updated_at = now()
+        db.add(Action(resource_type="finding", resource_id=finding.id,
+                      data={"action": "served_content_swept", "job_id": job.id, "count": len(matches)}))
+        return {"finding_id": finding.id, **swept}
 
     def patch_drafting(self, db, job, application):
         """Drafts a patch Remediation PR (A08) in a one-shot agent run with the fixed tool profile:
@@ -3548,6 +3818,53 @@ def commit_inputs(db, commit):
             {"notice": PRIOR_ANALYSES_NOTICE, "analyses": claims}, default=str, indent=2
         ).encode()
     return files
+
+
+# A Served-content check's gateway capability (A10): any public origin, GET only. A page takes at most
+# 2 x (1 + 20) requests plus redirects, and its stored bytes (max_bytes) stay under the probe's 8 MiB output.
+SERVED_POLICY = {"served_content": True, "methods": ["GET"], "request_budget": 100,
+                 "max_response_bytes": 1024 * 1024, "max_total_bytes": 16 * 1024 * 1024}
+SERVED_TARGET = {"user_agents": list(domain.USER_AGENTS), "max_scripts": 20, "max_bytes": 7 * 1024 * 1024}
+RESOURCE_FIELDS = ("url", "final_url", "status", "sha256", "content_type", "error")
+
+
+def served_names(fetch):
+    """Each resource of a served fetch with its name among the stored bytes: [("page.html", the
+    page), ("scripts/NN.js", the page's NN-th script), ...]."""
+    scripts = [resource for resource in fetch.resources if resource["kind"] == "script"]
+    return [("page.html", fetch.resources[0]), *((f"scripts/{n:02d}.js", r) for n, r in enumerate(scripts))]
+
+
+def served_fetches(result, files):
+    """Each user agent's ServedFetch fields from a served_probe result and its output files: the
+    result must hold exactly the two user agents with at most 20 fetched scripts each (the page's
+    other scripts listed past the limit), the bytes of every resource served with 200 or given a
+    sha256 among the files, and every file named by its own sha256."""
+    fetches = result.get("fetches")
+    if not isinstance(fetches, dict) or sorted(fetches) != sorted(domain.USER_AGENTS) or any(
+            hashlib.sha256(data).hexdigest() != name for name, data in files.items()) or any(
+            not isinstance(fetched, dict) or not isinstance(fetched.get("scripts"), list)
+            or sum(not isinstance(s, dict) or s.get("error") != "limit" for s in fetched["scripts"])
+            > SERVED_TARGET["max_scripts"]
+            or any(not isinstance(r, dict) or (r.get("status") == 200 or r.get("sha256") is not None)
+                   and r.get("sha256") not in files for r in [fetched, *fetched["scripts"]])
+            for fetched in fetches.values()):
+        raise DomainError("invalid_probe_result", "The Served-content probe did not return a valid fetch", 422)
+    summaries = served.summaries(result, files)
+    out = {}
+    for agent in domain.USER_AGENTS:
+        fetched, summary = fetches[agent], summaries[agent]
+        resources = [{"kind": kind, **{name: r.get(name) for name in RESOURCE_FIELDS},
+                      "size": len(files[r["sha256"]]) if r.get("sha256") in files else None}
+                     for kind, r in [("page", fetched), *(("script", s) for s in fetched["scripts"])]]
+        out[agent] = {"status": "fetched" if summary is not None else "failed",
+                      "fingerprint": served.fingerprint(summary) if summary is not None else None,
+                      "summary": summary or {}, "resources": resources,
+                      # An HTTP status only: a page the probe skipped has its reason in error.
+                      "error": None if summary is not None else {
+                          "status": fetched.get("status") if isinstance(fetched.get("status"), int) else None,
+                          "error": fetched.get("error")}}
+    return out
 
 
 FINGERPRINT_BUDGET = 10  # requests for Numen's own fingerprint stage, apart from the recipe's

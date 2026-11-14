@@ -278,7 +278,7 @@ export function Dashboard() {
                     {data.review_queue.map((item) => (
                       <Link
                         key={item.id}
-                        to={`/commits/${item.id}`}
+                        to={item.link ?? `/commits/${item.id}`}
                         className="list-row"
                       >
                         <span className="list-row-main">

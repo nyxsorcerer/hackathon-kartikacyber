@@ -1,11 +1,11 @@
 import json
 import re
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from datetime import timedelta
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
-from . import advisories, artifacts, cves, detection
+from . import advisories, artifacts, cves, detection, served
 from .models import (
     Account,
     Action,
@@ -29,8 +29,11 @@ from .models import (
     ApplicationRepository,
     RemediationPR,
     Repository,
+    ServedChange,
+    ServedFetch,
     Setting,
     Snapshot,
+    WatchedPage,
     now,
     utc,
 )
@@ -429,7 +432,7 @@ def triage_application(db, repository):
 # Automatic Analyses per UTC day (A04), automatic patch drafting (A08) and Proof bundle drafting
 # (draft_bundle) included. Manual runs are neither capped nor counted.
 ANALYSIS_CAPS = {"application": 10, "account": 30}
-CAPPED_KINDS = ("commit_analysis", "patch_drafting", "finding_artifacts")
+CAPPED_KINDS = ("commit_analysis", "served_analysis", "patch_drafting", "finding_artifacts")
 
 
 def over_cap(db, application, profile, shared):
@@ -487,20 +490,36 @@ def start_analysis(db, commit):
     if not users:
         return None
     application, shared = users[0], len(users) > 1  # users[0] is commit_application()
+    inputs = job_input(db, application, commit_id=commit.id, source_ref=commit.revision)
+    return start_automatic(db, commit, "commit_analysis", application, inputs, key, shared)
+
+
+def start_served_analysis(db, change):
+    """Starts the automatic Analysis of a served-content change Triage flagged (A10), once per
+    change, within the same caps as a commit's: the Application's and the Provider account's."""
+    key = f"served-analysis:{change.id}"
+    if db.scalar(select(Job.id).where(Job.idempotency_key == key)):
+        return None
+    return start_automatic(db, change, "served_analysis", db.get(Application, change.application_id),
+                           {"served_change_id": change.id}, key)
+
+
+def start_automatic(db, subject, kind, application, inputs, key, shared=False):
+    """Queues the automatic Analysis `kind` of `subject`, a Commit or a ServedChange, on the
+    Application's commit_analysis profile, or records why it waits for a cap or is blocked."""
     try:
         profile = automated_profile(db, application, "commit_analysis")
     except DomainError as exc:
-        commit.analysis_state = {"status": "blocked", "error": exc.as_dict()}
+        subject.analysis_state = {"status": "blocked", "error": exc.as_dict()}
         return None
     cap = over_cap(db, application, profile, shared)
     if cap:
-        previous = commit.analysis_state or {}
+        previous = subject.analysis_state or {}
         since = previous.get("since") if previous.get("status") == "waiting_for_cap" else now().isoformat()
-        commit.analysis_state = {"status": "waiting_for_cap", "since": since, "cap": cap}
+        subject.analysis_state = {"status": "waiting_for_cap", "since": since, "cap": cap}
         return None
-    inputs = job_input(db, application, commit_id=commit.id, source_ref=commit.revision, automatic=True, shared=shared)
-    job = enqueue(db, "commit_analysis", application, inputs, profile, key)
-    commit.analysis_state = {"status": "queued", "job_id": job.id}
+    job = enqueue(db, kind, application, {**inputs, "automatic": True, "shared": shared}, profile, key)
+    subject.analysis_state = {"status": "queued", "job_id": job.id}
     return job
 
 
@@ -973,16 +992,18 @@ def malicious_change(db, finding):
     return finding_verdict(db, finding) == "Malicious change"
 
 
-# The Own and Upstream columns of the A06 Playbook matrix: the steps each Verdict runs, by the
-# role of the repository it is about, and an Advisory check match's steps. Served content is Phase 9's.
+# The A06 Playbook matrix: the steps each Verdict runs, by the role of the repository it is about
+# (own, upstream) or served_content, and an Advisory check match's steps.
 PLAYBOOKS = {
     ("advisory", None): ("report", "remediation_pr"),
     ("own", "Vulnerability introduced"): ("proof", "report", "remediation_pr"),
     ("own", "Malicious change"): ("static_proof", "detection_rule", "remediation_pr", "cleanup_report"),
     ("own", "Vulnerability fix"): ("report", "deployed_version_check"),
     ("upstream", "Vulnerability introduced"): ("proof", "disclosure_report", "remediation_pr"),
-    ("upstream", "Malicious change"): ("static_proof", "detection_rule", "cleanup_report", "remediation_pr"),
+    ("upstream", "Malicious change"): ("static_proof", "detection_rule", "cleanup_report", "remediation_pr",
+                                       "served_content_sweep"),
     ("upstream", "Vulnerability fix"): ("proof", "remediation_pr"),
+    ("served_content", "Malicious change"): ("static_proof", "detection_rule", "cleanup_report"),
 }
 
 
@@ -1003,11 +1024,12 @@ def finding_role(db, finding):
 
 
 def finding_cell(db, finding):
-    """The Finding's cell of PLAYBOOKS: its (role, Verdict), which for an advisory Finding is that
-    of the exposed Upstream Vulnerability fix that gave it an n-day Proof (A16), else ("advisory",
-    None) for an advisory Finding, or None, as for a Finding the Operator opened on no Verdict,
-    which keeps every step."""
-    cell = (finding_role(db, finding), finding_verdict(db, finding))
+    """The Finding's cell of PLAYBOOKS: its (role, Verdict), the role being served_content for a
+    served_content Finding, which for an advisory Finding is that of the exposed Upstream
+    Vulnerability fix that gave it an n-day Proof (A16), else ("advisory", None) for an advisory
+    Finding, or None, as for a Finding the Operator opened on no Verdict, which keeps every step."""
+    role = "served_content" if finding.source == "served_content" else finding_role(db, finding)
+    cell = (role, finding_verdict(db, finding))
     return cell if cell in PLAYBOOKS else ("advisory", None) if finding.source == "advisory" else None
 
 
@@ -1063,7 +1085,7 @@ def exportable(db, resource_type, resource_id):
         finding = db.get(Finding, resource_id or "")
         return finding is None or finding_role(db, finding) != "upstream"
     analysis = db.get(Analysis, resource_id) if resource_type == "analysis" else None
-    if analysis is None:
+    if analysis is None or analysis.kind == "served_analysis":  # served content has no Upstream Proof
         return True
     if analysis.kind == "commit_analysis":
         commit = db.get(Commit, analysis.subject_id)
@@ -1222,6 +1244,7 @@ def playbook_steps(db, finding, root):
         "cleanup_report": "ready" if finding.data.get("cleanup_report") else "missing",
         "remediation_pr": remediation,
         "deployed_version_check": deployed_version(finding),
+        "served_content_sweep": (finding.data.get("served_content_sweep") or {}).get("status", "pending"),
     }
     return [{"step": step, "status": status[step]} for step in PLAYBOOKS[cell]]
 
@@ -1274,6 +1297,190 @@ def schedule_advisory_checks(db):
         repository = advisory_repository(db, application)
         if repository and repository.cursor and db.scalar(select(Job.id).where(Job.idempotency_key == key)) is None:
             queue_advisory(db, application, repository, key)
+
+
+# A Served-content check (A10) fetches each Watched page as each of this fixed pair (gateway.USER_AGENTS).
+USER_AGENTS = ("browser", "googlebot")
+MAX_WATCHED_PAGES = 20
+
+
+def page_origin(url):
+    parsed = urlparse(url)
+    return parsed.scheme, parsed.hostname, parsed.port or {"http": 80, "https": 443}[parsed.scheme]
+
+
+def sync_homepage(db, application):
+    """Makes the Application's Asset URL its homepage Watched page (A10): a new Asset URL moves the
+    homepage to a page with no Baseline, and the old one is no longer watched, nor is any other
+    page left on an old origin (their history is kept, as for a removed page). A page the Operator
+    already watched at the new URL becomes the homepage with its Baseline."""
+    pages = list(db.scalars(select(WatchedPage).where(WatchedPage.application_id == application.id)))
+    home = next((page for page in pages if page.homepage), None)
+    if home and home.url == application.asset_url:
+        return home
+    if home:
+        home.homepage, home.removed_at = False, home.removed_at or now()
+    page = next((page for page in pages if page.url == application.asset_url), None)
+    if page is None:
+        page = WatchedPage(application_id=application.id, url=application.asset_url, baseline={})
+        db.add(page)
+    page.homepage, page.removed_at = True, None
+    origin = page_origin(application.asset_url)
+    for other in pages:  # Watched pages share the Asset URL's origin: those on the old one are no longer watched.
+        if other is not page and other.removed_at is None and page_origin(other.url) != origin:
+            other.removed_at = now()
+    db.flush()
+    return page
+
+
+def watched_pages(db, application):
+    """The Application's Watched pages that are not removed, the homepage first."""
+    return list(db.scalars(select(WatchedPage).where(
+        WatchedPage.application_id == application.id, WatchedPage.removed_at.is_(None),
+    ).order_by(WatchedPage.homepage.desc(), WatchedPage.created_at, WatchedPage.id)))
+
+
+def queue_served_check(db, application, key=None):
+    """The Application's Served-content check (A10): the one already active, else a new one."""
+    active = db.scalar(select(Job).where(
+        Job.kind == "served_check", Job.application_id == application.id,
+        Job.status.in_(["queued", "running", "cancelling"])).limit(1))
+    return active or enqueue(db, "served_check", application, {}, idempotency_key=key)
+
+
+def schedule_served_checks(db):
+    """Queues the Served-content check of each monitored Application once per window of its
+    interval (A10). It is not part of schedule(), which polls repositories."""
+    for application in db.scalars(select(Application).where(
+            Application.monitor_enabled.is_(True), Application.archived.is_(False))):
+        key = f"served:{application.id}:{int(now().timestamp()) // application.monitor_interval_seconds}"
+        if db.scalar(select(Job.id).where(Job.idempotency_key == key)) is None:
+            queue_served_check(db, application, key)
+
+
+def record_served_change(db, page, fetch):
+    """The served-content change of `fetch`, a fetched fingerprint unlike the page's Baseline for
+    its user agent (A10): one per (page, user agent, fingerprint), kept with the first fetch that
+    served it, the newest fetched one before that, the Baseline's and the diff from the Baseline."""
+    query = select(ServedChange).where(
+        ServedChange.page_id == page.id, ServedChange.user_agent == fetch.user_agent,
+        ServedChange.fingerprint == fetch.fingerprint)
+    row = db.scalar(query)
+    if row is None:
+        baseline = db.get(ServedFetch, page.baseline[fetch.user_agent]["fetch_id"])
+        previous = db.scalar(select(ServedFetch.id).where(
+            ServedFetch.page_id == page.id, ServedFetch.user_agent == fetch.user_agent,
+            ServedFetch.status == "fetched", ServedFetch.id != fetch.id,
+        ).order_by(ServedFetch.created_at.desc()).limit(1))
+        # As record_exposure: a concurrent check that records the fingerprint first wins, and only
+        # it queues the change's one Triage.
+        try:
+            with db.begin_nested():
+                row = ServedChange(application_id=page.application_id, page_id=page.id, user_agent=fetch.user_agent,
+                                   fingerprint=fetch.fingerprint, fetch_id=fetch.id, previous_fetch_id=previous,
+                                   baseline_fetch_id=baseline.id, diff=served.diff(baseline.summary, fetch.summary))
+                db.add(row)
+                db.flush()
+                queue_served_triage(db, db.get(Application, page.application_id), row)
+        except IntegrityError:
+            row = db.scalar(query)
+    return row
+
+
+def queue_served_triage(db, application, change):
+    """Queues the Triage of a served-content change by the Application's Triage settings, as
+    import_commits does for a commit: none with Triage off, and none on Jev, which reads commits
+    only. A profile that cannot run blocks it with the reason."""
+    mode = application.config.get("triage_mode", "disabled")
+    change.triage_status = "disabled" if mode == "disabled" else "pending"
+    if mode == "disabled":
+        return
+    try:
+        if mode == "jev":
+            raise DomainError("jev_triage_unsupported",
+                              "Jev Triage reads commits only; analyse this served-content change by hand", 422)
+        profile = automated_profile(db, application, "commit_triage")
+        if profile["agent"] != mode:
+            raise DomainError("triage_profile_mismatch", "Triage mode and agent profile differ", 422)
+        enqueue(db, "served_triage", application, {"served_change_id": change.id}, profile)
+    except DomainError as exc:
+        change.triage_status = "blocked"
+        change.triage_result = {"decision": "insufficient_context", "reason": exc.message, "error": exc.code}
+
+
+def served_fetch_json(row):
+    return row and {"id": row.id, "status": row.status, "fingerprint": row.fingerprint,
+                    "created_at": utc(row.created_at), "error": row.error, "resources": row.resources}
+
+
+SERVED_CHANGE_FIELDS = ("id", "fingerprint", "fetch_id", "previous_fetch_id", "baseline_fetch_id", "diff",
+                        "triage_status", "triage_result", "review_decision", "verdict", "analysis_state")
+# The Verdicts after which the Operator may accept a changed fingerprint as the Baseline (A06, A10).
+BASELINE_VERDICTS = ("Security hardening", "Unrelated")
+
+
+def served_change_json(row):
+    return {**{name: getattr(row, name) for name in SERVED_CHANGE_FIELDS}, "created_at": utc(row.created_at)}
+
+
+def served_change_label(db, change):
+    """A served-content change's readable name: its page and user agent."""
+    return f"{db.get(WatchedPage, change.page_id).url} · {change.user_agent.capitalize()}"
+
+
+def watched_page_json(db, page):
+    """A Watched page with each user agent's latest fetch, its Baseline, how the two compare
+    (awaiting_baseline, matches, changed or failed), their diff and the change recorded for it."""
+    agents = []
+    for agent in USER_AGENTS:
+        latest = db.scalar(select(ServedFetch).where(ServedFetch.page_id == page.id, ServedFetch.user_agent == agent)
+                           .order_by(ServedFetch.created_at.desc()).limit(1))
+        accepted = page.baseline.get(agent)
+        baseline = accepted and db.get(ServedFetch, accepted["fetch_id"])
+        if latest is not None and latest.status == "failed":
+            state = "failed"
+        elif latest is None or baseline is None:
+            state = "awaiting_baseline"
+        else:
+            state = "matches" if latest.fingerprint == accepted["fingerprint"] else "changed"
+        change = state == "changed" and db.scalar(select(ServedChange).where(
+            ServedChange.page_id == page.id, ServedChange.user_agent == agent,
+            ServedChange.fingerprint == latest.fingerprint))
+        agents.append({
+            "user_agent": agent, "latest": served_fetch_json(latest), "baseline": accepted, "state": state,
+            "diff": served.diff(baseline.summary, latest.summary) if state in ("matches", "changed") else None,
+            # The served_content Finding a Malicious change Verdict opened for it, if any.
+            "change": {**served_change_json(change), "finding_id": db.scalar(select(Finding.id).where(
+                Finding.source == "served_content", Finding.data["subject_id"].as_string() == change.id))}
+            if change else None,
+            "accept_allowed": bool(latest is not None and latest.status == "fetched" and (
+                accepted is None or change and change.verdict in BASELINE_VERDICTS)),
+        })
+    return {"id": page.id, "url": page.url, "homepage": page.homepage, "removed_at": utc(page.removed_at),
+            "created_at": utc(page.created_at), "user_agents": agents}
+
+
+def accept_baseline(db, page, fetch):
+    """The Operator accepts `fetch`'s Content fingerprint as the page's Baseline for its user agent
+    (A10). It is not an Approval and needs no password. A first Baseline is always accepted; a
+    later one only when its fingerprint's served-content change has a Security hardening or
+    Unrelated Verdict. Accepting the Baseline's own fingerprint again changes nothing."""
+    db.refresh(page, with_for_update=True)
+    if fetch.page_id != page.id or fetch.status != "fetched":
+        raise DomainError("invalid_baseline", "Only a fetch of this Watched page that it served can become its Baseline", 422)
+    current = page.baseline.get(fetch.user_agent)
+    if current and current["fingerprint"] == fetch.fingerprint:
+        return
+    if current and db.scalar(select(ServedChange.id).where(
+            ServedChange.page_id == page.id, ServedChange.user_agent == fetch.user_agent,
+            ServedChange.fingerprint == fetch.fingerprint, ServedChange.verdict.in_(BASELINE_VERDICTS))) is None:
+        raise DomainError("baseline_not_allowed",
+                          "A new Baseline needs a Security hardening or Unrelated Verdict on this fingerprint", 409)
+    page.baseline = {**page.baseline, fetch.user_agent: {
+        "fetch_id": fetch.id, "fingerprint": fetch.fingerprint, "accepted_at": now().isoformat()}}
+    db.add(Action(resource_type="watched_page", resource_id=page.id, data={
+        "action": "baseline_accepted", "user_agent": fetch.user_agent, "fetch_id": fetch.id,
+        "fingerprint": fetch.fingerprint, "previous": current}))
 
 
 def store_advisory_cache(db, writes):
@@ -1698,7 +1905,7 @@ def set_finding_artifacts(db, row, revision, files):
     if "static_proof" in row.data or (row.source == "commit" and malicious_change(db, row)):
         # A Malicious change's static Proof: each new revision is a Draft until its Detection rule
         # validates (A07). A commit's Malicious change Finding without one, such as one opened
-        # before Phase 5, starts it here. Served content's static Proof is Phase 9's.
+        # before Phase 5, starts it here.
         rule, failed = detection.rule_text(files)
         proof = {**row.data.get("static_proof", {}), "artifact_revision": revision, "files": sorted(files), "rule": rule,
                  "status": "failed" if failed else "pending", "checks": [failed] if failed else [], "job_id": None}
@@ -1845,6 +2052,7 @@ APPLICATION_SUBJECTS = {
     "version_recipe": ("version", "version"),
     "version_check": ("version", "version"),
     "audit_context": ("audit", "audit"),
+    "served_check": ("served", "served"),
 }
 
 
@@ -1868,6 +2076,12 @@ def job_subject(db, row, application):
             "ref": commit.revision[:10],
             "link": f"/commits/{commit.id}",
         }
+    if data.get("served_change_id"):
+        change = db.get(ServedChange, data["served_change_id"])
+        if not change:
+            return {"type": "served", "label": "Removed served-content change", "ref": None, "link": None}
+        return {"type": "served", "label": served_change_label(db, change), "ref": change.fingerprint[:12],
+                "link": f"/applications/{change.application_id}?tab=served"}
     if data.get("cve_id"):
         cve = db.get(CVE, data["cve_id"])
         query = f"cve={quote(data['cve_id'])}"
@@ -1915,11 +2129,13 @@ def job_subject(db, row, application):
         repository = (
             db.get(Repository, data["repository_id"])
             if data.get("repository_id")
-            else source_repository(db, application)
+            else None if kind == "served" else source_repository(db, application)
         )
         return {
             "type": kind,
-            "label": repository_label(repository) if repository else application.asset_name,
+            # A Served-content check reads the Asset, not a repository.
+            "label": application.asset_url if kind == "served"
+            else repository_label(repository) if repository else application.asset_name,
             "ref": ref[:10] if pinned else None,
             "link": f"/applications/{application.id}?tab={tab}",
         }
@@ -2053,13 +2269,17 @@ def start_waiting(db):
     """Starts the changes waiting for a cap, oldest first. start_analysis re-checks the caps, so
     they start once the caps reset at 00:00 UTC, and only as many as the caps allow. A Triage
     flag runs this before its own change, so a new change never takes a freed slot first."""
-    waiting = db.scalars(
-        select(Commit)
-        .where(Commit.analysis_state["status"].as_string() == "waiting_for_cap")
-        .with_for_update(skip_locked=True)
-    )
-    for commit in sorted(waiting, key=lambda c: c.analysis_state["since"]):
-        start_analysis(db, commit)
+    waiting = [
+        row
+        for model in (Commit, ServedChange)
+        for row in db.scalars(
+            select(model)
+            .where(model.analysis_state["status"].as_string() == "waiting_for_cap")
+            .with_for_update(skip_locked=True)
+        )
+    ]
+    for subject in sorted(waiting, key=lambda s: s.analysis_state["since"]):
+        (start_served_analysis if isinstance(subject, ServedChange) else start_analysis)(db, subject)
     # Then the automatic patch drafts waiting for a cap (A08), oldest first.
     drafts = db.scalars(
         select(RemediationPR).where(RemediationPR.status == "waiting_for_cap").with_for_update(skip_locked=True)

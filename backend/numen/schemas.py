@@ -212,6 +212,20 @@ class BackfillInput(Strict):
     count: int = Field(ge=1, le=100)
 
 
+class WatchedPageInput(Strict):
+    url: str
+
+    @field_validator("url")
+    @classmethod
+    def http(cls, value):
+        return http_url(value)
+
+
+class BaselineInput(Strict):
+    """Accepting a Content fingerprint as a Watched page's Baseline (A10): not an Approval, so no password."""
+    fetch_id: str
+
+
 class FindingInput(Strict):
     application_id: str
     source: Literal[*FINDING_SOURCES]

@@ -27,7 +27,7 @@ type Props = { application: Application; refresh: () => void };
 const path = (application: Application, link?: RepositoryLink) =>
   `/applications/${application.id}/repositories${link ? `/${link.repository_id}` : ""}`;
 /** An API error as text, with each field message (a Pydantic "Value error, " prefix dropped). */
-function errorText(err: unknown) {
+export function errorText(err: unknown) {
   if (!(err instanceof Error)) return "The request failed.";
   const fields =
     err instanceof ApiError

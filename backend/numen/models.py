@@ -369,6 +369,68 @@ class AdvisoryCache(Base):
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class WatchedPage(Base):
+    """A Watched page of an Application's Asset (A10): the homepage (its Asset URL, always one) or a
+    page the Operator added on the Asset URL's origin. `baseline` holds each user agent's accepted
+    Content fingerprint: {user agent: {fetch_id, fingerprint, accepted_at}}."""
+
+    __tablename__ = "watched_pages"
+    __table_args__ = (UniqueConstraint("application_id", "url"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    url: Mapped[str] = mapped_column(Text)
+    homepage: Mapped[bool] = mapped_column(Boolean, default=False)
+    baseline: Mapped[dict] = mapped_column(JSON, default=dict)
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ServedFetch(Base):
+    """One user agent's fetch of a Watched page in a Served-content check (A10). Its bytes are
+    stored as served_content Artifacts keyed by their sha256; `resources` lists them:
+    [{kind: page|script, url, final_url, status, sha256, size, content_type, error}]."""
+
+    __tablename__ = "served_fetches"
+    __table_args__ = (Index("ix_served_fetches_page_id_user_agent_created_at", "page_id", "user_agent", "created_at"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    page_id: Mapped[str] = mapped_column(ForeignKey("watched_pages.id"))
+    job_id: Mapped[str | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+    user_agent: Mapped[str] = mapped_column(String)
+    # fetched, or failed: the page did not answer 200
+    status: Mapped[str] = mapped_column(String)
+    fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    resources: Mapped[list] = mapped_column(JSON, default=list)
+    error: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ServedChange(Base):
+    """A served-content change (A10): a Content fingerprint unlike the Baseline, one per (page, user
+    agent, fingerprint), so each distinct fingerprint is triaged at most once. Its Triage and
+    Analysis fields are named as Commit's."""
+
+    __tablename__ = "served_changes"
+    __table_args__ = (UniqueConstraint("page_id", "user_agent", "fingerprint"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    page_id: Mapped[str] = mapped_column(ForeignKey("watched_pages.id"))
+    user_agent: Mapped[str] = mapped_column(String)
+    fingerprint: Mapped[str] = mapped_column(String)
+    # The first fetch that served it, the newest fetched one before that, and the Baseline's.
+    fetch_id: Mapped[str] = mapped_column(ForeignKey("served_fetches.id"))
+    previous_fetch_id: Mapped[str | None] = mapped_column(ForeignKey("served_fetches.id"), nullable=True)
+    baseline_fetch_id: Mapped[str] = mapped_column(ForeignKey("served_fetches.id"))
+    diff: Mapped[dict] = mapped_column(JSON, default=dict)
+    triage_status: Mapped[str] = mapped_column(String, default="disabled")
+    triage_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    review_decision: Mapped[str] = mapped_column(String, default="pending")
+    verdict: Mapped[str | None] = mapped_column(String, nullable=True)
+    analysis_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Job(Base):
     __tablename__ = "jobs"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)

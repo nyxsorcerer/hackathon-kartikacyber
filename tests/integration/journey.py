@@ -14,8 +14,15 @@ import json
 from pathlib import Path
 import time
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 import uuid
+
+# The gateway's fixed user agent pair for Served-content checks (runner/numen_runner/gateway.py).
+USER_AGENTS = {
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+}
 
 
 class Client:
@@ -436,7 +443,51 @@ def main():
     assert {'/osv/v1/querybatch', '/advisories'} <= feeds <= {'/osv/v1/querybatch', f'/osv/v1/vulns/{osv_id}', '/advisories', '/rest/json/cves/2.0'}, feeds
     print('PASS the Advisory check opens exactly one advisory Finding for a Dockerfile node pin across OSV, GHSA and NVD, and a second check opens none')
 
-    for application in [github, wordpress, own, node, advisory]:
+    # Served-content checks (A10) through the real gateway, which reaches the fixture's judol and
+    # ClickFix pages only because this test override names the isolated asset-monitor-test-served network.
+    served = client.request('POST', '/api/applications', {
+        **common, 'asset_url': 'http://fixtures:8090/served/', 'asset_name': f'Served fixture {suffix}', 'product_kind': 'CMS',
+    }, expect=(200, 201))
+    watched = f'/api/applications/{served["id"]}/watched-pages'
+    (home,) = items(client.request('GET', watched))
+    assert (home['url'], home['homepage']) == (served['asset_url'], True), home
+    verify = client.request('POST', watched, {'url': 'http://fixtures:8090/served/verify'}, expect=(201,))
+    assert client.request('DELETE', f'{watched}/{home["id"]}', expect=(409,))['code'] == 'homepage_required'
+
+    def served_check():
+        """The Asset's Check now: {(page id, user agent): its row on the Served content tab}."""
+        client.wait(client.request('POST', f'/api/applications/{served["id"]}/served-content-checks', {}, expect=(202,)), timeout=300)
+        return {(page['id'], row['user_agent']): row for page in items(client.request('GET', watched)) for row in page['user_agents']}
+
+    rows = served_check()
+    assert len(rows) == 4 and {row['state'] for row in rows.values()} == {'awaiting_baseline'}, rows
+    for (page_id, _), row in rows.items():
+        client.request('POST', f'{watched}/{page_id}/baselines', {'fetch_id': row['latest']['id']})
+    rows = served_check()
+    # AC-A10: the homepage's rotating CSRF token, nonce, bundler hash and minified names change nothing.
+    assert {row['state'] for row in rows.values()} == {'matches'}, rows
+    print('PASS a Served-content check fetches each Watched page as browser and Googlebot, and the accepted Baseline survives rotating tokens and bundler hashes')
+
+    fixture.request('POST', '/admin/served', {'variants': ['judol', 'clickfix']})
+    rows = served_check()
+    googlebot, browser = rows[home['id'], 'googlebot'], rows[home['id'], 'browser']
+    assert googlebot['state'] == 'changed' and 'slot-gacor.test' in googlebot['diff']['link_hosts']['added'], googlebot
+    assert (browser['state'], browser['diff']) == ('matches', {}), browser
+    for agent in ('browser', 'googlebot'):
+        row = rows[verify['id'], agent]
+        assert row['state'] == 'changed' and row['diff']['script_hosts']['added'] == ['cdn.clickfix-fixture.test'], row
+    print('PASS gambling links served only to Googlebot change only its fingerprint, and the ClickFix loader host changes both')
+
+    seen = fixture.request('GET', '/admin/state')['served_requests']
+    assert '/served/executed' not in {r['path'] for r in seen}, seen
+    assert {r['user_agent'] for r in seen if r['path'] == '/served/beacon.js'} == USER_AGENTS, seen
+    # Only the page and its scripts were requested, all from the fixture: no link was followed.
+    hosts = {urlsplit(r['url']).hostname for row in rows.values() for r in row['latest']['resources']}
+    assert hosts == {'fixtures', 'cdn.clickfix-fixture.test'}, hosts
+    assert not [job for job in items(client.request('GET', f'/api/jobs?application_id={served["id"]}')) if job['kind'] == 'served_triage']
+    print('PASS no fetched script ran, both fixed user agents fetched the scripts, and Triage off starts no served Triage')
+
+    for application in [github, wordpress, own, node, advisory, served]:
         client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})
     client.request('POST', '/api/auth/logout', {})
     client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(401,), raw=True)

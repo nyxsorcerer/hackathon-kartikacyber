@@ -256,6 +256,14 @@ it("lists the Review queue on the dashboard", async () => {
         application_id: "application-1",
         committed_at: "2026-10-06T00:00:00Z",
       },
+      {
+        id: "served-change-1",
+        title: "https://shop.test · Googlebot",
+        revision: "0123456789ab",
+        application_id: "application-1",
+        committed_at: "2026-10-05T00:00:00Z",
+        link: "/applications/application-1?tab=served",
+      },
     ],
     review_queue_count: 21,
   };
@@ -277,8 +285,12 @@ it("lists the Review queue on the dashboard", async () => {
     within(queue).getByRole("link", { name: /Rework session cookie handling/ }),
   ).toHaveAttribute("href", "/commits/commit-1");
   expect(within(queue).getByText("cccccccccc")).toBeInTheDocument();
+  // A served-content change links to its Asset's Served content tab.
   expect(
-    within(queue).getByText("Showing the newest 1 of 21."),
+    within(queue).getByRole("link", { name: /shop\.test · Googlebot/ }),
+  ).toHaveAttribute("href", "/applications/application-1?tab=served");
+  expect(
+    within(queue).getByText("Showing the newest 2 of 21."),
   ).toBeInTheDocument();
   cleanup();
   dashboard.review_queue = [];

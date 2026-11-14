@@ -671,6 +671,51 @@ def test_postgres_migration_adds_advisory_check_tables(schema_url):
     engine.dispose()
 
 
+def test_postgres_migration_adds_served_content_tables(schema_url):
+    migrate(schema_url, "d3f4a5b6c7e8")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_generation, monitor_interval_seconds, monitor_enabled, archived, config, cve_cursor)"
+            " VALUES ('a1', 'Site', 'https://shop.test', 'plugin', 'Demo', 1, 300, true, false, '{}', '{}')"
+        ))
+    fetch = text(
+        "INSERT INTO served_fetches (id, application_id, page_id, user_agent, status, fingerprint, summary,"
+        " resources, created_at) VALUES (:id, 'a1', :page, 'googlebot', 'fetched', :fingerprint, '{}', '[]', now())"
+    )
+    change = text(
+        "INSERT INTO served_changes (id, application_id, page_id, user_agent, fingerprint, fetch_id,"
+        " baseline_fetch_id, diff, triage_status, review_decision, created_at)"
+        " VALUES (:id, 'a1', :page, 'googlebot', 'changed', 'f2', 'f1', '{}', 'disabled', 'pending', now())"
+    )
+    for _ in range(2):  # upgrade, then again after a downgrade
+        migrate(schema_url, "head")
+        drift = alembic(schema_url, "check", check=False)
+        assert drift.returncode == 0, drift.stdout + drift.stderr
+        with engine.begin() as db:
+            # The existing Application's homepage is its Watched page, with no Baseline yet.
+            page, url, homepage, baseline = db.execute(text(
+                "SELECT id, url, homepage, baseline FROM watched_pages WHERE application_id = 'a1'")).one()
+            assert (url, homepage, baseline) == ("https://shop.test", True, {})
+            db.execute(fetch, {"id": "f1", "page": page, "fingerprint": "baseline"})
+            db.execute(fetch, {"id": "f2", "page": page, "fingerprint": "changed"})
+            db.execute(change, {"id": "c1", "page": page})
+        # One change per (page, user agent, fingerprint), and one Watched page per (Application, URL).
+        with pytest.raises(IntegrityError), engine.begin() as db:
+            db.execute(change, {"id": "c2", "page": page})
+        with pytest.raises(IntegrityError), engine.begin() as db:
+            db.execute(text("INSERT INTO watched_pages (id, application_id, url, homepage, baseline, created_at)"
+                            " VALUES ('w2', 'a1', 'https://shop.test', false, '{}', now())"))
+        alembic(schema_url, "downgrade", "d3f4a5b6c7e8")
+        with engine.begin() as db:
+            assert db.execute(text(
+                "SELECT to_regclass('watched_pages'), to_regclass('served_fetches'), to_regclass('served_changes')"
+            )).one() == (None, None, None)
+            assert db.execute(text("SELECT id, asset_url FROM applications")).one() == ("a1", "https://shop.test")
+    engine.dispose()
+
+
 def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(postgres, monkeypatch):
     import httpx
     from numen.models import Commit

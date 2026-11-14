@@ -413,6 +413,67 @@ print(json.dumps({'allowed':allowed,'body':json.loads(body),'wrong':wrong,'redir
         engine.cleanup(run_id)
 
 
+def test_served_content_gateway_reaches_a_private_fixture_only_on_the_named_network(engine, monkeypatch):
+    """A10: a served-content run's gateway reaches a private address only on the Docker network the
+    broker's NUMEN_SERVED_CONTENT_FIXTURE_NETWORK names (the demo VM's), whatever the request asks
+    for, and fetches as the user agent the request names. Another private address stays refused."""
+    import time
+    fixture_id = str(uuid.uuid4())
+    labels = {LABEL:fixture_id, INSTANCE:engine.instance}
+    fixtures = engine.client.networks.create("asset-monitor-served-fixture-" + fixture_id, internal=True, labels=labels)
+    echo = '''from http.server import BaseHTTPRequestHandler,HTTPServer
+class H(BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(200);self.end_headers();self.wfile.write(self.headers['User-Agent'].encode())
+HTTPServer(('0.0.0.0',8080),H).serve_forever()
+'''
+    spec = engine.spec(request(''), fixtures, labels)
+    spec["networking_config"] = {fixtures.name: engine.client.api.create_endpoint_config(aliases=["judol-fixture"])}
+    recipe = '''import base64,http.client,json,socket,time
+from numen_runner.fetch import fetch
+for _ in range(50):
+ try:
+  c=http.client.HTTPConnection('gateway',8082,timeout=1);c.request('GET','/health');c.getresponse().read();break
+ except OSError:time.sleep(.2)
+def get(url):
+ try:r=fetch(url,user_agent='googlebot')
+ except Exception as e:return [getattr(getattr(e,'response',None),'status_code',type(e).__name__),None]
+ return [r['status'],base64.b64decode(r['content_base64']).decode()]
+# The gateway's own address on the job network: private, outside the fixture's subnet, and it would answer.
+print(json.dumps({'fixture':get('http://judol-fixture:8080/'),'outside':get('http://%s:8082/health'%socket.gethostbyname('gateway'))}))
+'''
+    try:
+        target = engine.client.containers.create('asset-monitor-probe:0.1.0', ['python','-c',echo], **spec)
+        target.start()
+        for _ in range(50):
+            if not target.exec_run(['python','-c',"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/',timeout=1)"]).exit_code:
+                break
+            time.sleep(.2)
+        fixtures.reload()
+        subnets = [c["Subnet"] for c in fixtures.attrs["IPAM"]["Config"]]
+        observed = {}
+        for setting in ("", fixtures.name):
+            monkeypatch.setenv("NUMEN_SERVED_CONTENT_FIXTURE_NETWORK", setting)
+            run_id = str(uuid.uuid4())
+            # The request's own private range is ignored: only the broker's setting counts.
+            job = RunRequest(attempt_token=run_id, kind="probe", limits={"timeout_seconds":60},
+                             inputs=[{"path":"recipe.py","content_base64":base64.b64encode(recipe.encode()).decode()}],
+                             target_policy={"served_content":True,"methods":["GET"],"request_budget":4,"allowed_private_cidrs":subnets})
+            try:
+                observed[setting] = engine.run(run_id, job, lambda:False, lambda _:None)["result"]
+                gateway = engine.client.containers.list(all=True, filters={"label":[f"{LABEL}={run_id}"], "ancestor":"asset-monitor-gateway:" + VERSION})[0]
+                config = json.loads(dict(e.split("=", 1) for e in gateway.attrs["Config"]["Env"])["NUMEN_GATEWAY_CONFIG"])
+                observed[setting]["allowed"] = config["target_policy"]["allowed_private_cidrs"]
+                observed[setting]["networks"] = fixtures.name in gateway.attrs["NetworkSettings"]["Networks"]
+            finally:
+                engine.cleanup(run_id)
+        assert observed[""] == {"fixture":[403,None], "outside":[403,None], "allowed":[], "networks":False}
+        assert observed[fixtures.name] == {"fixture":[200,"Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"],
+                                           "outside":[403,None], "allowed":subnets, "networks":True}
+    finally:
+        engine.cleanup(fixture_id)
+
+
 def test_immutable_inputs_and_false_poc_result_are_preserved(engine):
     result=execute(engine,request('import json;from pathlib import Path\ntry:Path("/workspace/inputs/recipe.py").write_text("altered");blocked=False\nexcept OSError:blocked=True\nprint(json.dumps({"immutable":blocked}))'))
     assert result['result']['immutable']
