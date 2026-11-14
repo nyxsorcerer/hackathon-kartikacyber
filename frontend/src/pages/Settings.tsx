@@ -760,7 +760,7 @@ function Plugins() {
   return (
     <Panel
       title="Bundled Pi packages"
-      description="Pinned code ships with the runner image. Enablement applies to subsequent jobs."
+      description="Pinned in the runner image by version and integrity hash. The dashboard cannot install, enable, upload or remove a plugin: adding one means editing runner/plugins.lock.json and rebuilding the image."
     >
       <DataState
         loading={resource.loading}
@@ -778,6 +778,9 @@ function Plugins() {
                       plugin.version ||
                       "Version unavailable"}
                   </p>
+                  {plugin.integrity && (
+                    <p className="mono">{plugin.integrity}</p>
+                  )}
                   <ExternalLink href={plugin.source}>
                     {plugin.source}
                   </ExternalLink>
@@ -800,24 +803,6 @@ function Plugins() {
                       label="Provider contribution"
                     />
                   )}
-                </div>
-                <div className="plugin-actions">
-                  <Badge>{plugin.enabled ? "enabled" : "disabled"}</Badge>
-                  <ActionButton
-                    className="secondary"
-                    onAction={async () => {
-                      await mutate(
-                        `/plugins/${plugin.id}`,
-                        z.unknown(),
-                        { enabled: !plugin.enabled },
-                        "PATCH",
-                      );
-                      resource.refresh();
-                      notify("Plugin configuration updated for new jobs.");
-                    }}
-                  >
-                    {plugin.enabled ? "Disable" : "Enable"}
-                  </ActionButton>
                 </div>
               </article>
             ))}

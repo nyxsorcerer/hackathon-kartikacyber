@@ -68,8 +68,7 @@ COPY runner/node/proxy-preload.cjs /opt/numen/proxy-preload.cjs
 ENV PATH="/opt/numen/node_modules/.bin:/opt/runner/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 FROM node-runtime AS pi
 COPY runner/node/pi/package.json runner/node/pi/package-lock.json ./
-COPY runner/node/patch-pi-dependency.py runner/vendor/brace-expansion-5.0.12.tgz ./
-RUN npm ci --omit=dev --ignore-scripts && python patch-pi-dependency.py && npm audit --omit=dev --audit-level=high && ./node_modules/.bin/pi --version && npm cache clean --force
+RUN npm ci --omit=dev --ignore-scripts && npm audit --omit=dev --audit-level=high && ./node_modules/.bin/pi --version && npm cache clean --force
 COPY runner/node/pi-capabilities.mjs runner/node/pi-commandcode-login.mjs runner/node/pi-tools.ts ./
 USER 10001:10001
 CMD ["python", "-m", "numen_runner.workload"]

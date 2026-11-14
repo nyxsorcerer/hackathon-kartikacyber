@@ -2,7 +2,7 @@ import json
 import re
 from urllib.parse import quote, urlparse
 from datetime import timedelta
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from . import advisories, artifacts, cves, detection, served
@@ -23,7 +23,6 @@ from .models import (
     LabRun,
     Notification,
     Observation,
-    Plugin,
     Application,
     ApplicationCVE,
     ApplicationRepository,
@@ -33,6 +32,7 @@ from .models import (
     ServedFetch,
     Setting,
     Snapshot,
+    Transcript,
     WatchedPage,
     now,
     utc,
@@ -81,8 +81,9 @@ def settings(db, config=None):
     return row
 
 
-def plugin_records(db):
-    # The runtime pins the actual bundled package and skill revisions in its build manifest.
+def plugin_records():
+    """The Pi plugins the runner image pins, read-only (A13): runner/plugins.lock.json's records,
+    or one unavailable Command Code provider when the manifest cannot be read."""
     from pathlib import Path
     import os
 
@@ -105,15 +106,7 @@ def plugin_records(db):
                 "provider_contribution": "commandcode",
             }
         ]
-    for record in records:
-        ident = record.get("id", record.get("name"))
-        existing = db.get(Plugin, ident)
-        if not existing:
-            db.add(Plugin(id=ident, enabled=True, data=record))
-        elif existing.data != record:
-            existing.data = record
-    db.flush()
-    return list(db.scalars(select(Plugin)))
+    return records
 
 
 def public_account(account, plugins=None):
@@ -124,10 +117,10 @@ def public_account(account, plugins=None):
         supported = list(account.data["agent_models"])
     selection_error = None
     if account.provider == "commandcode" and plugins is not None:
-        plugin = next((p for p in plugins if p.id == "pi-commandcode-provider"), None)
-        if not plugin or not plugin.enabled or plugin.data.get("health") != "ready":
+        plugin = next((p for p in plugins if p.get("id") == "pi-commandcode-provider"), None)
+        if not plugin or plugin.get("health") != "ready":
             supported = []
-            selection_error = "Command Code provider plugin is disabled or unavailable"
+            selection_error = "Command Code provider plugin is unavailable in the runner image"
     return {
         "selection_error": selection_error,
         "id": account.id,
@@ -146,22 +139,20 @@ def public_account(account, plugins=None):
     }
 
 
-def enabled_plugins(db, provider):
-    # A runtime loads only enabled, healthy bundled plugins that contribute this provider.
+def enabled_plugins(provider):
+    # A runtime loads only the ready bundled plugins that contribute this provider.
     return [
-        p.id
-        for p in plugin_records(db)
-        if p.enabled
-        and p.data.get("health") == "ready"
-        and p.data.get("provider_contribution") == provider
+        p.get("id")
+        for p in plugin_records()
+        if p.get("health") == "ready" and p.get("provider_contribution") == provider
     ]
 
 
-def require_provider_plugin(db, provider):
-    if provider == "commandcode" and not enabled_plugins(db, provider):
+def require_provider_plugin(provider):
+    if provider == "commandcode" and not enabled_plugins(provider):
         raise DomainError(
             "plugin_unavailable",
-            "The Command Code provider plugin is disabled or unavailable",
+            "The Command Code provider plugin is unavailable in the runner image",
             422,
         )
 
@@ -190,7 +181,7 @@ def resolve_profile(db, application, operation, submitted=None):
         raise DomainError(
             "connection_not_ready", "Check or sign in to this connection before using it", 422
         )
-    require_provider_plugin(db, account.provider)
+    require_provider_plugin(account.provider)
     catalog = account.data.get("agent_models", {}).get(
         profile["agent"], account.data.get("models", [])
     )
@@ -1078,13 +1069,17 @@ def exportable(db, resource_type, resource_id):
     overrides Numen's AC-12 for Upstream Findings. Not exportable: an Upstream Finding (a cve
     Finding on an Upstream source repository among them) and its Labs' artifacts, an Analysis of
     a commit of a repository that any Application links as Upstream, and a CVE analysis of an
-    Application whose source repository is an Upstream one."""
+    Application whose source repository is an Upstream one. An Analysis Transcript is its
+    Analysis's."""
+    if resource_type == "transcript":
+        transcript = db.get(Transcript, resource_id)
+        resource_type, resource_id = "analysis", transcript and transcript.data.get("analysis_id")
     if resource_type == "lab":
         resource_type, resource_id = "finding", getattr(db.get(LabRun, resource_id), "finding_id", None)
     if resource_type == "finding":
         finding = db.get(Finding, resource_id or "")
         return finding is None or finding_role(db, finding) != "upstream"
-    analysis = db.get(Analysis, resource_id) if resource_type == "analysis" else None
+    analysis = db.get(Analysis, resource_id or "") if resource_type == "analysis" else None
     if analysis is None or analysis.kind == "served_analysis":  # served content has no Upstream Proof
         return True
     if analysis.kind == "commit_analysis":
@@ -1419,6 +1414,20 @@ SERVED_CHANGE_FIELDS = ("id", "fingerprint", "fetch_id", "previous_fetch_id", "b
 BASELINE_VERDICTS = ("Security hardening", "Unrelated")
 
 
+def baseline_allowed(change):
+    """Whether a served-content change's fingerprint may become the Baseline (A10, decision 14):
+    after a Security hardening or Unrelated Verdict, or, while it stays dismissed, after Triage
+    declined it with no Analysis asked for, or its Insufficient context Verdict was dismissed
+    from the Review queue."""
+    if change.verdict in BASELINE_VERDICTS:
+        return True
+    if change.review_decision != "dismissed":
+        return False
+    declined = (change.verdict is None and change.analysis_state is None and change.triage_status == "completed"
+                and (change.triage_result or {}).get("decision") == "unrelated")
+    return declined or change.verdict == "Insufficient context"
+
+
 def served_change_json(row):
     return {**{name: getattr(row, name) for name in SERVED_CHANGE_FIELDS}, "created_at": utc(row.created_at)}
 
@@ -1454,7 +1463,7 @@ def watched_page_json(db, page):
                 Finding.source == "served_content", Finding.data["subject_id"].as_string() == change.id))}
             if change else None,
             "accept_allowed": bool(latest is not None and latest.status == "fetched" and (
-                accepted is None or change and change.verdict in BASELINE_VERDICTS)),
+                accepted is None or change and baseline_allowed(change))),
         })
     return {"id": page.id, "url": page.url, "homepage": page.homepage, "removed_at": utc(page.removed_at),
             "created_at": utc(page.created_at), "user_agents": agents}
@@ -1463,19 +1472,20 @@ def watched_page_json(db, page):
 def accept_baseline(db, page, fetch):
     """The Operator accepts `fetch`'s Content fingerprint as the page's Baseline for its user agent
     (A10). It is not an Approval and needs no password. A first Baseline is always accepted; a
-    later one only when its fingerprint's served-content change has a Security hardening or
-    Unrelated Verdict. Accepting the Baseline's own fingerprint again changes nothing."""
+    later one only when its fingerprint's served-content change is baseline_allowed. Accepting
+    the Baseline's own fingerprint again changes nothing."""
     db.refresh(page, with_for_update=True)
     if fetch.page_id != page.id or fetch.status != "fetched":
         raise DomainError("invalid_baseline", "Only a fetch of this Watched page that it served can become its Baseline", 422)
     current = page.baseline.get(fetch.user_agent)
     if current and current["fingerprint"] == fetch.fingerprint:
         return
-    if current and db.scalar(select(ServedChange.id).where(
-            ServedChange.page_id == page.id, ServedChange.user_agent == fetch.user_agent,
-            ServedChange.fingerprint == fetch.fingerprint, ServedChange.verdict.in_(BASELINE_VERDICTS))) is None:
-        raise DomainError("baseline_not_allowed",
-                          "A new Baseline needs a Security hardening or Unrelated Verdict on this fingerprint", 409)
+    change = current and db.scalar(select(ServedChange).where(
+        ServedChange.page_id == page.id, ServedChange.user_agent == fetch.user_agent,
+        ServedChange.fingerprint == fetch.fingerprint))
+    if current and not (change and baseline_allowed(change)):
+        raise DomainError("baseline_not_allowed", "A new Baseline needs a Security hardening or Unrelated Verdict on"
+                          " this fingerprint, a Triage that declined it, or its dismissal from the Review queue", 409)
     page.baseline = {**page.baseline, fetch.user_agent: {
         "fetch_id": fetch.id, "fingerprint": fetch.fingerprint, "accepted_at": now().isoformat()}}
     db.add(Action(resource_type="watched_page", resource_id=page.id, data={
@@ -1982,6 +1992,55 @@ def finding_summaries(db, rows, root):
     ]
 
 
+def finding_subjects(db, findings):
+    """What the Findings are about, as Transcripts name it (`subject_id`, A14): each one's source
+    commit, the fix commit that gave an advisory Finding its Proof, a served_content Finding's
+    change, a cve Finding's CVE for its Application, and every commit linked to them."""
+    subjects = {value for row in findings for value in (
+        row.data.get("source_commit_id"), row.data.get("fix_commit_id"),
+        row.data.get("subject_id") if row.source == "served_content" else None,
+        f"{row.application_id}:{row.cve_id}" if row.source == "cve" else None) if value}
+    subjects.update(db.scalars(select(Action.data["commit_id"].as_string()).where(
+        Action.resource_type == "finding", Action.resource_id.in_([row.id for row in findings]),
+        Action.data["action"].as_string() == "linked")))
+    return subjects - {None}
+
+
+TRANSCRIPT_DAYS = 30
+TRIAGE_TRANSCRIPT_BYTES = 256 * 1024 * 1024
+
+
+def prune_transcripts(db):
+    """Transcript retention (A14), run by the scheduler. A Triage Transcript goes after 30 days, or
+    oldest first while all Triage ones pass 256 MB. An Analysis one is kept while a Finding is
+    about its subject, and otherwise goes after 30 days with its Artifact rows. Returns those
+    Artifacts' revisions, whose folders the caller removes once this is committed."""
+    unlinked = Transcript.subject_id.not_in(list(finding_subjects(db, list(db.scalars(select(Finding))))))
+    old = Transcript.created_at < now() - timedelta(days=TRANSCRIPT_DAYS)
+    triage = Transcript.kind == "triage"
+    db.execute(delete(Transcript).where(triage, old))
+    total = db.scalar(select(func.coalesce(func.sum(Transcript.size), 0)).where(triage))
+    over = []
+    for ident, size in db.execute(select(Transcript.id, Transcript.size).where(triage)
+                                  .order_by(Transcript.created_at, Transcript.id)):
+        if total <= TRIAGE_TRANSCRIPT_BYTES:
+            break
+        over.append(ident)
+        total -= size
+    analyses = list(db.scalars(select(Transcript.id).where(Transcript.kind == "analysis", unlinked, old)))
+    owned = and_(Artifact.resource_type == "transcript", Artifact.resource_id.in_(analyses))
+    revisions = set(db.scalars(select(Artifact.revision).where(owned)))
+    db.execute(delete(Artifact).where(owned))
+    db.execute(delete(Transcript).where(Transcript.id.in_(over + analyses)))
+    return revisions
+
+
+def transcript_json(row):
+    return {"id": row.id, "kind": row.kind, "job_id": row.job_id, "subject_id": row.subject_id,
+            "analysis_id": row.data.get("analysis_id"), "status": row.data.get("status"),
+            "created_at": utc(row.created_at)}
+
+
 def finding_json(db, row, root):
     labs = list(
         db.scalars(
@@ -2031,6 +2090,10 @@ def finding_json(db, row, root):
         "remediation_prs": [remediation_json(r) for r in db.scalars(
             select(RemediationPR).where(RemediationPR.finding_id == row.id)
             .order_by(RemediationPR.created_at, RemediationPR.id))],
+        # The Triage and Analysis Transcripts of what it is about, oldest first (A14).
+        "transcripts": [transcript_json(t) for t in db.scalars(
+            select(Transcript).where(Transcript.subject_id.in_(finding_subjects(db, [row])))
+            .order_by(Transcript.created_at, Transcript.id))],
         "created_at": utc(row.created_at),
         "updated_at": utc(row.updated_at),
     }

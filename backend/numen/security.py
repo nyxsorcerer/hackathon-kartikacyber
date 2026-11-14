@@ -211,3 +211,38 @@ class RequestLimits:
             return message
 
         return await self.app(scope, bounded_receive, send)
+
+
+# A15: no inline script anywhere; img data: is the select arrow's SVG in styles.css.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+)
+SECURITY_HEADERS = {
+    b"content-security-policy": CONTENT_SECURITY_POLICY.encode(),
+    b"x-content-type-options": b"nosniff",
+    b"referrer-policy": b"no-referrer",
+}
+
+
+class SecurityHeaders:
+    """Sets the A15 response headers on every HTTP response, replacing a route's own copy."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def secured_send(message):
+            if message["type"] == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in SECURITY_HEADERS
+                ]
+                message = {**message, "headers": headers + list(SECURITY_HEADERS.items())}
+            await send(message)
+
+        return await self.app(scope, receive, secured_send)

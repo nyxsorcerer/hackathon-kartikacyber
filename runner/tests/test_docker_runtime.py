@@ -144,7 +144,7 @@ def test_output_limit_and_symlink_are_truthful_failures(engine):
         assert error.value.code == "workload_failed"
 
 
-@pytest.mark.parametrize("agent,version", [("pi","1.0.0"),("claude","2.1.288"),("codex","0.160.0")])
+@pytest.mark.parametrize("agent,version", [("pi","1.3.0"),("claude","2.1.288"),("codex","0.160.0")])
 def test_actual_native_cli_version(engine,agent,version):
     output = engine.client.containers.run("asset-monitor-"+agent+":0.1.0",[agent,"--version"],network_mode="none",user="10001:10001",cap_drop=["ALL"],security_opt=["no-new-privileges:true"],remove=True)
     assert version in output.decode()
@@ -526,21 +526,74 @@ print(json.dumps({'ready':ready}))
         engine.cleanup(run_id)
 
 
-def test_pi_fixed_dependency_and_bundled_entrypoint_are_verified(engine):
+# The vulnerable expand that Pi 1.0.0 shrinkwrapped (brace-expansion 5.0.9) and bundled into its CLI.
+OLD_EXPAND = r'''function expand(str2,options={}){if(!str2)return[];let{max=EXPANSION_MAX,maxLength=EXPANSION_MAX_LENGTH}=options;return str2.slice(0,2)==="{}"&&(str2="\\{\\}"+str2.slice(2)),expand_(escapeBraces(str2),max,maxLength,!0).map(unescapeBraces)}'''
+
+
+def test_pi_carries_the_fixed_brace_expansion(engine):
+    """Pi 1.3.0 pins brace-expansion 5.0.12 itself, so no dependency patch is applied: it publishes no
+    shrinkwrap, it and the image's lock pin the fixed version, and its CLI bundles the fixed expand."""
     script='''import {expand} from '/opt/numen/node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion/dist/esm/index.js';
-import {readFileSync} from 'node:fs';
-import {createHash} from 'node:crypto';
+import {existsSync,readFileSync,readdirSync} from 'node:fs';
 const root='/opt/numen/node_modules/@earendil-works/pi-coding-agent';
-const version=JSON.parse(readFileSync(root+'/node_modules/brace-expansion/package.json')).version;
-const bundle=readFileSync(root+'/dist/bundle/chunks/chunk-33XOIQ5N.js');
+const json=path=>JSON.parse(readFileSync(path));
+const version=json(root+'/node_modules/brace-expansion/package.json').version;
+const pinned=[json(root+'/package.json').dependencies['brace-expansion'],
+  json('/opt/numen/package-lock.json').packages['node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion'].version];
+const bundled={old:false,fixed:false};
+for(const e of readdirSync(root+'/dist',{recursive:true,withFileTypes:true}).filter(e=>e.isFile())){
+  const s=readFileSync(e.parentPath+'/'+e.name,'utf8');
+  bundled.old||=s.includes(process.argv[1]);
+  bundled.fixed||=s.includes('maxDepth=EXPANSION_MAX_DEPTH,maxRewrites=EXPANSION_MAX_REWRITES');
+}
 const deep=expand('{'.repeat(2000)+'a,b'+'}'.repeat(2000));
 const depthBound=deep.some(x=>x.includes('a,b')) && JSON.stringify(expand('{a,{b,c}}',{maxDepth:0}))===JSON.stringify(['a','{b,c}']);
-console.log(JSON.stringify({version,normal:expand('a{b,c}d'),numbers:expand('{1..3}'),depthBound,bundleHash:createHash('sha256').update(bundle).digest('hex')}));
+console.log(JSON.stringify({version,pinned,shrinkwrap:existsSync(root+'/npm-shrinkwrap.json'),bundled,normal:expand('a{b,c}d'),numbers:expand('{1..3}'),depthBound}));
 '''
-    output=engine.client.containers.run('asset-monitor-pi:0.1.0',['node','--input-type=module','-e',script],network_mode='none',user='10001:10001',remove=True,mem_limit='256m',nano_cpus=1000000000,pids_limit=32)
+    output=engine.client.containers.run('asset-monitor-pi:0.1.0',['node','--input-type=module','-e',script,OLD_EXPAND],network_mode='none',user='10001:10001',remove=True,mem_limit='256m',nano_cpus=1000000000,pids_limit=32)
     result=json.loads(output)
-    assert result['version']=='5.0.12' and result['normal']==['abd','acd'] and result['numbers']==['1','2','3']
-    assert result['depthBound'] and result['bundleHash']=='140daad3badc613549342760f22fade24121fb332cdbead61fa6719479df85f0'
+    assert result['version']=='5.0.12' and result['pinned']==['5.0.12','5.0.12'] and result['shrinkwrap'] is False
+    assert result['bundled']=={'old':False,'fixed':True}
+    assert result['normal']==['abd','acd'] and result['numbers']==['1','2','3'] and result['depthBound']
+
+
+def test_a_pi_job_records_its_pinned_image_agent_and_plugin_versions(engine, monkeypatch):
+    """AC-A13 (Numen's AC-13): a real Pi run on the image records the image digest, the Pi version
+    and the plugin versions it used. A probe replaces the workload, so no provider is contacted."""
+    from docker.models.containers import ContainerCollection
+    run_id = str(uuid.uuid4())
+    job = RunRequest(attempt_token=run_id, kind="agent", limits={"timeout_seconds":60},
+                     profile={"agent":"pi","provider_id":"commandcode","model_id":"m","operation":"commit_analysis",
+                              "enabled_plugins":["pi-commandcode-provider"],"credential":{"api_key":"fixture-key-no-real-access"}})
+    create = ContainerCollection.create
+    def probe(self, image, command=None, **kwargs):
+        if command == ["python","-m","numen_runner.workload"]:
+            command = ["python","-c","print('{\"envelope\":{\"outputs\":[],\"result\":{}}}')"]
+        return create(self, image, command, **kwargs)
+    monkeypatch.setattr(ContainerCollection, "create", probe)
+    seen = []
+    execution = execute(engine, job, run_id, seen.append)["execution"]
+    assert execution["image_digest"] == engine.client.images.get("asset-monitor-pi:" + VERSION).id
+    assert (execution["agent_version"], execution["plugin_versions"]) == ("1.3.0", {"pi-commandcode-provider": "0.7.8"})
+    assert [e["execution"] for e in seen if e.get("type") == "workload_started"] == [execution]
+
+
+def test_pi_image_carries_the_pinned_plugin(engine):
+    """Defaulted decision 13: the image installs exactly the provider version and registry integrity
+    runner/plugins.lock.json pins, beside the Pi version it names."""
+    script='''import json
+from pathlib import Path
+manifest=json.loads(Path('/opt/runner/plugins.lock.json').read_text())
+lock=json.loads(Path('/opt/numen/package-lock.json').read_text())['packages']
+installed=json.loads(Path('/opt/numen/node_modules/pi-commandcode-provider/package.json').read_text())['version']
+pi=json.loads(Path('/opt/numen/node_modules/@earendil-works/pi-coding-agent/package.json').read_text())['version']
+print(json.dumps({'manifest':manifest,'installed':installed,'locked':lock['node_modules/pi-commandcode-provider'],'pi':pi}))
+'''
+    result=json.loads(engine.client.containers.run('asset-monitor-pi:0.1.0',['python','-c',script],network_mode='none',user='10001:10001',remove=True))
+    plugin=result['manifest']['plugins'][0]
+    assert plugin['id']=='pi-commandcode-provider' and plugin['version']==result['installed']=='0.7.8'
+    assert plugin['integrity']==result['locked']['integrity'] and result['locked']['version']=='0.7.8'
+    assert result['manifest']['agents']['pi']['version']==result['pi']=='1.3.0'
 
 
 def test_completed_lab_stays_nonterminal_until_application_cleanup_is_confirmed(engine, tmp_path):

@@ -18,7 +18,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import func, select, update
 
-from conftest import application, connection
+from conftest import SESSION_SCREEN, application, connection
 from numen import domain
 from numen.models import Action, Analysis, Artifact, Finding, Job, Notification, RemediationPR, ServedFetch, Transcript, now, utc
 from numen.schemas import SERVED_CONTENT_VERDICTS
@@ -240,6 +240,58 @@ def test_each_served_content_verdict_runs_only_its_cell(system, verdict):
     with app.state.factory() as db:
         (action,) = db.scalars(select(Action).where(Action.resource_type == "served_change"))
         assert (action.resource_id, action.data) == (change.id, {"action": "review", "decision": "dismissed"})
+    # Decision 14: once dismissed from the Review queue, it may become the Baseline.
+    latest = googlebot(client, ident)
+    assert latest["accept_allowed"] is True
+    accepted = accept(client, ident, latest["latest"])
+    assert accepted.status_code == 200, accepted.text
+
+
+NOT_ALLOWED = ("A new Baseline needs a Security hardening or Unrelated Verdict on this fingerprint, a Triage that"
+               " declined it, or its dismissal from the Review queue")
+
+
+def test_a_change_triage_declined_can_become_the_baseline(system):
+    """Decision 14 (A10): a change Triage declined to analyse may become the Baseline, unless the
+    Operator has since marked it a candidate."""
+    app, client, _ = system
+    ident, site = judol(system)
+    check(system, served_broker(site, agents(triage={"decision": "unrelated", "title": "Copy edit", "reason": "Text only"})), ident)
+    (change,) = changes(app)
+    assert (change.triage_status, change.review_decision, change.verdict, change.analysis_state) == (
+        "completed", "dismissed", None, None)
+    assert jobs(app, "served_analysis") == []
+    assert client.post(f"/api/served-changes/{change.id}/review", json={"decision": "candidate"}).status_code == 200
+    latest = googlebot(client, ident)
+    assert latest["accept_allowed"] is False
+    refused = accept(client, ident, latest["latest"])
+    assert (refused.status_code, refused.json()["code"], refused.json()["message"]) == (409, "baseline_not_allowed", NOT_ALLOWED)
+    assert client.post(f"/api/served-changes/{change.id}/review", json={"decision": "dismissed"}).status_code == 200
+    latest = googlebot(client, ident)
+    assert latest["accept_allowed"] is True
+    accepted = accept(client, ident, latest["latest"])
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["user_agents"][1]["baseline"]["fingerprint"] == change.fingerprint
+
+
+@pytest.mark.parametrize("case", ["malicious", "untriaged"])
+def test_a_malicious_change_or_untriaged_change_cannot_become_the_baseline(system, case):
+    """Decision 14 (A10): a Malicious change Verdict, even dismissed from review, and a change with
+    Triage off and no Verdict cannot become the Baseline."""
+    app, client, _ = system
+    ident, site = judol(system, mode="pi" if case == "malicious" else "disabled")
+    check(system, served_broker(site, malicious()), ident)
+    (change,) = changes(app)
+    if case == "malicious":
+        assert change.verdict == "Malicious change"
+        assert client.post(f"/api/served-changes/{change.id}/review", json={"decision": "dismissed"}).status_code == 200
+    else:
+        assert (change.triage_status, change.verdict) == ("disabled", None)
+    latest = googlebot(client, ident)
+    assert latest["accept_allowed"] is False
+    refused = accept(client, ident, latest["latest"])
+    assert (refused.status_code, refused.json()["code"], refused.json()["message"]) == (
+        409, "baseline_not_allowed", NOT_ALLOWED)
 
 
 @pytest.mark.parametrize("verdict", ["Vulnerability fix", "Vulnerability introduced"])
@@ -429,6 +481,10 @@ def test_a_malicious_change_in_served_content_gets_a_static_proof_detection_rule
     assert {a["path"] for a in finding["artifacts"]} == {"report.md", "indicators.json", "detection-rule.yar",
                                                          "manifest.json"}
     assert (finding["status"], finding["cause"]["by"]) == ("confirmed", "detection_rule")
+    # A14: the served Triage and Analysis Transcripts are listed with it, the Analysis one linked to its Verdict.
+    assert [(t["kind"], t["subject_id"], t["analysis_id"]) for t in finding["transcripts"]] == [
+        ("triage", change.id, None), ("analysis", change.id, analysis.id)]
+    assert client.get(f"/api/transcripts/{finding['transcripts'][1]['id']}").json()["text"] == SESSION_SCREEN
 
     # No Remediation PR and no Lab: a Malicious change never runs.
     assert (finding["remediation_prs"], finding["remediation_actions"]) == ([], [])

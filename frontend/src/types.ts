@@ -609,6 +609,20 @@ export const userAgentLabels: Record<string, string> = {
   browser: "Browser",
   googlebot: "Googlebot",
 };
+/** The stored record of one Triage or Analysis run, with secrets removed (A14). */
+export const transcriptSummarySchema = z.object({
+  id: z.string(),
+  kind: z.enum(["triage", "analysis"]),
+  job_id: z.string(),
+  subject_id: z.string(),
+  /** The Analysis, and so the Verdict, an Analysis Transcript belongs to. */
+  analysis_id: z.string().nullable(),
+  status: z.string().nullable(),
+  created_at: z.string(),
+});
+export const transcriptSchema = transcriptSummarySchema.extend({
+  text: z.string(),
+});
 export const findingSchema = z.object({
   id: z.string(),
   application_id: z.string(),
@@ -694,6 +708,8 @@ export const findingSchema = z.object({
   /** The drafts the Operator may start by hand: patch and/or revert, or a pin or bump. */
   remediation_actions: z.array(z.string()).default([]),
   remediation_prs: z.array(remediationPRSchema).default([]),
+  /** The Triage and Analysis Transcripts of what it is about, oldest first (A14). */
+  transcripts: z.array(transcriptSummarySchema).default([]),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -765,7 +781,7 @@ export const pluginSchema = z.object({
   source: z.string(),
   version: z.string().nullable().optional(),
   pinned_version: z.string().nullable().optional(),
-  enabled: z.boolean(),
+  integrity: z.string().optional(),
   health: z.unknown(),
   provider: z.string().nullable().optional(),
   provider_contribution: z.unknown().optional(),

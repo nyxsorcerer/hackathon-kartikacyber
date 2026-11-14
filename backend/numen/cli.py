@@ -2,7 +2,7 @@ import argparse
 import getpass
 from .config import Config, secret_env
 from .db import make_database
-from .domain import plugin_records, settings
+from .domain import settings
 from .models import LoginSession, Operator
 from .security import hash_password
 from sqlalchemy import delete
@@ -28,7 +28,6 @@ def main():
             db.add(Operator(id="admin", password_hash=hash_password(password)))
         db.execute(delete(LoginSession))
         settings(db, config)
-        plugin_records(db)
     print("Operator configured; previous sessions revoked")
 
 

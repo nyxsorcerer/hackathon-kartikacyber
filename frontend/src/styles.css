@@ -2270,11 +2270,6 @@ form > .hint,
   font-size: 13px;
   overflow-wrap: anywhere;
 }
-.plugin-actions {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-}
 .cadence-form {
   display: flex;
   flex-wrap: wrap;

@@ -64,13 +64,6 @@ class Account(Base):
     data: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
-class Plugin(Base):
-    __tablename__ = "plugins"
-    id: Mapped[str] = mapped_column(String, primary_key=True)
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    data: Mapped[dict] = mapped_column(JSON, default=dict)
-
-
 class Application(Base):
     __tablename__ = "applications"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
@@ -465,14 +458,17 @@ class JobEvent(Base):
 
 class Transcript(Base):
     """The stored record of one agent run (its prompt, reply and metadata) with secrets removed.
-    `subject_id` is what the run judged, such as the commit a Triage run belongs to."""
+    `subject_id` is what the run judged, such as the commit a Triage run belongs to, or for a CVE
+    Analysis, which runs per Application, `<application id>:<CVE id>`. `size` is
+    its stored bytes: a Triage one's data as JSON, an Analysis one's transcript.txt."""
 
     __tablename__ = "transcripts"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"))
     kind: Mapped[str] = mapped_column(String)
-    subject_id: Mapped[str] = mapped_column(String)
+    subject_id: Mapped[str] = mapped_column(String, index=True)
     data: Mapped[dict] = mapped_column(JSON)
+    size: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 

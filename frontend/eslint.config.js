@@ -26,5 +26,29 @@ export default tseslint.config(
         process: "readonly",
       },
     },
+    rules: {
+      // A15: diffs, reports, agent output and Transcripts render as escaped text, never raw HTML.
+      "no-restricted-syntax": [
+        "error",
+        {
+          // The JSX attribute, a props object key (createElement, spreads) or a member access.
+          selector:
+            ":matches(JSXIdentifier, Identifier)[name='dangerouslySetInnerHTML'], Literal[value='dangerouslySetInnerHTML']",
+          message:
+            "A15: render as escaped text; dangerouslySetInnerHTML is not allowed.",
+        },
+        {
+          selector:
+            "AssignmentExpression[left.property.name=/^(innerHTML|outerHTML)$/]",
+          message:
+            "A15: render as escaped text; writing innerHTML or outerHTML is not allowed.",
+        },
+        {
+          selector: "CallExpression[callee.property.name='insertAdjacentHTML']",
+          message:
+            "A15: render as escaped text; insertAdjacentHTML is not allowed.",
+        },
+      ],
+    },
   },
 );

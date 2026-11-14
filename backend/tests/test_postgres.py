@@ -716,6 +716,53 @@ def test_postgres_migration_adds_served_content_tables(schema_url):
     engine.dispose()
 
 
+def test_postgres_migration_drops_the_plugins_table(schema_url):
+    """A13: the plugin list is read-only, read from runner/plugins.lock.json, so the table that kept
+    the Operator's enable or disable choice goes."""
+    migrate(schema_url, "e5f6a7b8c9d0")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text("INSERT INTO plugins (id, enabled, data) VALUES ('pi-commandcode-provider', false, '{}')"))
+    migrate(schema_url, "head")
+    drift = alembic(schema_url, "check", check=False)
+    assert drift.returncode == 0, drift.stdout + drift.stderr
+    with engine.begin() as db:
+        assert db.execute(text("SELECT to_regclass('plugins')")).scalar() is None
+    alembic(schema_url, "downgrade", "e5f6a7b8c9d0")
+    with engine.begin() as db:
+        assert db.execute(text("SELECT count(*) FROM plugins")).scalar() == 0
+    engine.dispose()
+
+
+def test_postgres_migration_adds_transcript_size(schema_url):
+    """A14 retention weighs Triage Transcripts by size: an existing one's is its stored data's,
+    in bytes. What a Transcript is about is indexed, as retention looks it up by Finding."""
+    migrate(schema_url, "f6a7b8c9d0e1")
+    engine = create_engine(schema_url)
+    data = '{"reply": "é"}'
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO jobs (id, kind, status, input, input_hash, progress, created_at, attempts)"
+            " VALUES ('j1', 'commit_triage', 'succeeded', '{}', 'h', '{}', now(), 1)"
+        ))
+        db.execute(text("INSERT INTO transcripts (id, job_id, kind, subject_id, data, created_at)"
+                        " VALUES ('t1', 'j1', 'triage', 'c1', :data, now())"), {"data": data})
+    migrate(schema_url, "head")
+    drift = alembic(schema_url, "check", check=False)
+    assert drift.returncode == 0, drift.stdout + drift.stderr
+    columns = text("SELECT column_name FROM information_schema.columns WHERE table_name = 'transcripts'"
+                   " AND table_schema = current_schema()")
+    with engine.begin() as db:
+        assert db.execute(text("SELECT size FROM transcripts")).scalar() == len(data.encode())
+        assert db.execute(text("SELECT to_regclass('ix_transcripts_subject_id')")).scalar() is not None
+    alembic(schema_url, "downgrade", "f6a7b8c9d0e1")
+    with engine.begin() as db:
+        assert "size" not in set(db.scalars(columns))
+        assert db.execute(text("SELECT to_regclass('ix_transcripts_subject_id')")).scalar() is None
+        assert db.execute(text("SELECT data FROM transcripts")).scalar() == {"reply": "é"}
+    engine.dispose()
+
+
 def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(postgres, monkeypatch):
     import httpx
     from numen.models import Commit

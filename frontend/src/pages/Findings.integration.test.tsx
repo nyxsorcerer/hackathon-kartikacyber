@@ -1668,3 +1668,69 @@ it("shows an advisory Finding's report, aliases, ranges, pinned version and bump
     unmount();
   }
 });
+
+it("shows a Finding's Transcripts as text", async () => {
+  // A14, A15: the agent's own words, markup included, are only ever text.
+  const text = "[assistant]\n<script>alert('transcript')</script>\npi> done";
+  const transcripts = [
+    {
+      id: "triage-run",
+      kind: "triage",
+      job_id: "job-triage",
+      analysis_id: null,
+    },
+    {
+      id: "analysis-run",
+      kind: "analysis",
+      job_id: "job-analysis",
+      analysis_id: "analysis",
+    },
+  ].map((row) => ({
+    ...row,
+    subject_id: "commit",
+    status: "completed",
+    created_at: at,
+  }));
+  const fetch = vi.fn(
+    async (url: string) =>
+      new Response(
+        JSON.stringify(
+          url.startsWith("/api/applications/")
+            ? application
+            : url.startsWith("/api/transcripts/")
+              ? { ...transcripts[1], text }
+              : { ...detail, transcripts },
+        ),
+      ),
+  );
+  vi.stubGlobal("fetch", fetch);
+  const { container } = render(
+    <MemoryRouter initialEntries={["/findings/finding"]}>
+      <Routes>
+        <Route path="/findings/:id" element={<FindingDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  const panel = await screen.findByRole("region", { name: "Transcripts" });
+  const [triage, analysis] = within(panel).getAllByRole("article");
+  expect(triage).toHaveTextContent("Triage");
+  expect(
+    within(triage).getByRole("link", { name: /View job/ }),
+  ).toHaveAttribute("href", "/jobs/job-triage");
+  expect(analysis).toHaveTextContent("Analysis");
+  expect(panel.querySelector("pre")).toBeNull();
+  await userEvent
+    .setup()
+    .click(within(analysis).getByRole("button", { name: "Show" }));
+  await vi.waitFor(() =>
+    expect(analysis.querySelector("pre")?.textContent).toBe(text),
+  );
+  expect(fetch).toHaveBeenCalledWith(
+    "/api/transcripts/analysis-run",
+    expect.anything(),
+  );
+  expect(container.querySelector("script")).toBeNull();
+  expect(
+    within(analysis).getByRole("button", { name: "Hide" }),
+  ).toHaveAttribute("aria-expanded", "true");
+});

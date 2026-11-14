@@ -413,3 +413,71 @@ def test_job_session_selector_excludes_recorded_non_agent_runtimes(system, monke
         if kind != "agent":
             assert client.get(url, params={"run": run_id}).status_code == 409
     assert calls == ["agent-current"]
+
+
+def test_every_response_is_served_under_a_content_security_policy_that_forbids_inline_script(
+    tmp_path,
+):
+    """A15: the dashboard, its assets and the API carry a CSP that forbids inline script."""
+    from numen.config import Config
+
+    root = tmp_path / "dist"
+    (root / "assets").mkdir(parents=True)
+    (root / "index.html").write_text('<script type="module" src="/assets/app.js"></script>')
+    (root / "assets" / "app.js").write_text("export {};")
+    config = Config(
+        database_url=f"sqlite:///{tmp_path}/db.sqlite",
+        artifact_root=tmp_path / "files",
+        frontend_root=root,
+    )
+    with TestClient(create_app(config=config, admin_password="test-password-long")) as client:
+        for path in ("/", "/assets/app.js", "/api/auth/session"):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            policy = dict(
+                part.strip().split(" ", 1)
+                for part in response.headers["content-security-policy"].split(";")
+            )
+            assert policy["script-src"] == "'self'", path
+            assert "unsafe" not in policy.get("default-src", "")
+            for directive, value in (
+                ("object-src", "'none'"),
+                ("base-uri", "'none'"),
+                ("frame-ancestors", "'none'"),
+                ("form-action", "'self'"),
+            ):
+                assert policy[directive] == value, (path, directive)
+            assert response.headers.get_list("x-content-type-options") == ["nosniff"], path
+            assert response.headers["referrer-policy"] == "no-referrer", path
+        for path in ("/docs", "/openapi.json", "/redoc"):
+            assert "swagger" not in client.get(path).text.lower(), path
+
+
+def test_the_built_dashboard_has_no_inline_script():
+    """A15: the built index.html loads only same-origin script files and has no event handlers."""
+    import os
+    from html.parser import HTMLParser
+    from pathlib import Path
+    from urllib.parse import urlsplit
+
+    index = Path(os.environ.get("NUMEN_FRONTEND_ROOT", "../frontend/dist")) / "index.html"
+    if not index.is_file():
+        pytest.skip("the built frontend is not in this image")
+    scripts, handlers = [], []
+
+    class Index(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            handlers.extend(name for name, _ in attrs if name.startswith("on"))
+            if tag == "script":
+                scripts.append({"src": dict(attrs).get("src"), "body": ""})
+
+        def handle_data(self, data):
+            if self.lasttag == "script" and scripts:
+                scripts[-1]["body"] += data.strip()
+
+    Index().feed(index.read_text())
+    assert scripts, "the dashboard loads its script"
+    for script in scripts:
+        assert script["src"] and not urlsplit(script["src"]).netloc, script
+        assert script["body"] == "", script
+    assert handlers == []

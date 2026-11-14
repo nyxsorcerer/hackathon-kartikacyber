@@ -33,6 +33,7 @@ import {
   findingSummariesSchema,
   applicationSchema,
   applicationsSchema,
+  transcriptSchema,
 } from "../types";
 import type {
   AdvisoryRanges,
@@ -918,6 +919,9 @@ function FindingBody({
           </ol>
         </Panel>
       ) : null}
+      {finding.transcripts.length > 0 && (
+        <TranscriptsPanel transcripts={finding.transcripts} />
+      )}
       {finding.disclosure_report && (
         <DisclosureReportPanel report={finding.disclosure_report} />
       )}
@@ -1131,6 +1135,68 @@ function PlaybookPanel({ steps }: { steps: Finding["playbook"] }) {
         ])}
       />
     </Panel>
+  );
+}
+/** The Triage and Analysis Transcripts of what the Finding is about (A14), each shown on
+ * request as escaped text (A15). */
+function TranscriptsPanel({
+  transcripts,
+}: {
+  transcripts: Finding["transcripts"];
+}) {
+  return (
+    <Panel
+      title="Transcripts"
+      description="The stored record of each Triage and Analysis run, with secrets removed."
+    >
+      <div className="row-list">
+        {transcripts.map((transcript) => (
+          <TranscriptRow key={transcript.id} transcript={transcript} />
+        ))}
+      </div>
+    </Panel>
+  );
+}
+function TranscriptRow({
+  transcript,
+}: {
+  transcript: Finding["transcripts"][number];
+}) {
+  const [shown, setShown] = useState(false);
+  return (
+    <article className="lab-run">
+      <div className="analysis-header">
+        <Badge>{transcript.kind === "triage" ? "Triage" : "Analysis"}</Badge>
+        <span className="analysis-time">
+          <Time value={transcript.created_at} absolute />
+        </span>
+        <JobLink id={transcript.job_id} />
+        <button
+          className="secondary"
+          aria-expanded={shown}
+          onClick={() => setShown(!shown)}
+        >
+          {shown ? "Hide" : "Show"}
+        </button>
+      </div>
+      {shown && <TranscriptText id={transcript.id} />}
+    </article>
+  );
+}
+function TranscriptText({ id }: { id: string }) {
+  const resource = useResource(
+    `/transcripts/${encodeURIComponent(id)}`,
+    transcriptSchema,
+  );
+  return (
+    <DataState
+      loading={resource.loading}
+      error={resource.error}
+      retry={resource.refresh}
+      hasData={!!resource.data}
+    >
+      <pre className="json-view">{resource.data?.text}</pre>
+    </DataState>
   );
 }
 /** The Disclosure report (A06, A15) as escaped text, for the Operator to copy into the Upstream

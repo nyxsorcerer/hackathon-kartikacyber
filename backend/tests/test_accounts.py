@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -103,7 +104,48 @@ def test_partial_anthropic_capabilities_offer_only_successful_runtime(system):
     assert public["capability_errors"]["claude"]["code"] == "unsupported_access"
 
 
-def test_disabled_commandcode_plugin_never_runs_and_enabled_plugin_is_sent(system):
+def test_the_plugin_list_is_read_only(system):
+    """AC-A13: the plugin list is runner/plugins.lock.json's, and no request installs, enables,
+    uploads or removes a plugin."""
+    _, client, _ = system
+    manifest = json.loads((Path(__file__).parents[2] / "runner/plugins.lock.json").read_text())
+    listed = client.get("/api/plugins").json()
+    assert listed == {"items": manifest["plugins"], "next_cursor": None}
+    assert all("enabled" not in item for item in listed["items"])
+    for method, path in [("POST", "/api/plugins"), ("PATCH", "/api/plugins/pi-commandcode-provider"),
+                         ("PUT", "/api/plugins/pi-commandcode-provider"),
+                         ("DELETE", "/api/plugins/pi-commandcode-provider")]:
+        response = client.request(method, path, json={"enabled": False})
+        assert (response.status_code, response.json()["code"]) == (405, "plugins_read_only"), method
+        assert "runner/plugins.lock.json" in response.json()["message"]
+    assert client.get("/api/plugins").json() == listed
+
+
+def test_a_job_records_the_image_agent_and_plugin_versions_it_used(system):
+    """AC-A13 (Numen's AC-13): the runner's provenance for a run is kept as a job event."""
+    app, client, config = system
+    account = client.post(
+        "/api/accounts",
+        json={"label": "Command Code", "provider": "commandcode", "auth_type": "api_key",
+              "api_key": "fixture-commandcode-key"},
+    ).json()
+    job_id = client.post(f"/api/accounts/{account['id']}/capabilities").json()["job_id"]
+    execution = {"image_digest": "sha256:" + "a" * 64, "agent_version": "1.3.0",
+                 "plugin_versions": {"pi-commandcode-provider": "0.7.8"}}
+    catalog = {"models": [{"id": "cc/model", "name": "CC", "reasoning_efforts": ["high"]}]}
+    assert run_once(config, app.state.factory, FixtureBroker(catalog, execution=execution))
+    assert client.get(f"/api/jobs/{job_id}").json()["status"] == "succeeded"
+    events = client.get(f"/api/jobs/{job_id}/events").json()["items"]
+    recorded = [e for e in events if e.get("kind") == "runtime_provenance"]
+    assert len(recorded) == 1 and {k: recorded[0][k] for k in execution} == execution
+
+
+def unavailable_plugins(monkeypatch, tmp_path):
+    """The runner image's manifest is missing, so its Command Code provider is not ready."""
+    monkeypatch.setenv("NUMEN_PLUGIN_MANIFEST", str(tmp_path / "missing-plugins.lock.json"))
+
+
+def test_an_unavailable_commandcode_plugin_never_runs_and_a_ready_one_is_sent(system, monkeypatch, tmp_path):
     app, client, config = system
     account = client.post(
         "/api/accounts",
@@ -114,9 +156,8 @@ def test_disabled_commandcode_plugin_never_runs_and_enabled_plugin_is_sent(syste
             "api_key": "fixture-commandcode-key",
         },
     ).json()
-    plugin = "/api/plugins/pi-commandcode-provider"
     catalog = {"models": [{"id": "cc/model", "name": "CC", "reasoning_efforts": ["high"]}]}
-    assert client.patch(plugin, json={"enabled": False}).json()["enabled"] is False
+    unavailable_plugins(monkeypatch, tmp_path)
     for action in ("check", "capabilities"):
         job_id = client.post(f"/api/accounts/{account['id']}/{action}").json()["job_id"]
         broker = FixtureBroker(catalog)
@@ -127,7 +168,7 @@ def test_disabled_commandcode_plugin_never_runs_and_enabled_plugin_is_sent(syste
     public = client.get("/api/accounts").json()["items"][0]
     assert public["status"] == "unavailable" and public["supported_agents"] == []
 
-    client.patch(plugin, json={"enabled": True})
+    monkeypatch.delenv("NUMEN_PLUGIN_MANIFEST")
     job_id = client.post(f"/api/accounts/{account['id']}/capabilities").json()["job_id"]
     broker = FixtureBroker(catalog)
     assert run_once(config, app.state.factory, broker)
@@ -147,8 +188,8 @@ def test_disabled_commandcode_plugin_never_runs_and_enabled_plugin_is_sent(syste
     }
     endpoint = f"/api/commits/{commit_id}/analyses"
     queued = client.post(endpoint, json={"profile": profile}).json()["job_id"]
-    # Disabling applies to jobs that were queued before the change.
-    client.patch(plugin, json={"enabled": False})
+    # A plugin that stops being ready fails the jobs queued before.
+    unavailable_plugins(monkeypatch, tmp_path)
     assert client.post(endpoint, json={"profile": profile}).status_code == 422
     broker = FixtureBroker()
     assert run_once(config, app.state.factory, broker)
@@ -527,10 +568,10 @@ def test_commandcode_login_runs_pi_plugin_flow_and_relays_pasted_key(system):
     assert key not in json.dumps(client.get("/api/jobs").json())
 
 
-def test_commandcode_login_requires_enabled_plugin(system):
+def test_commandcode_login_requires_a_ready_plugin(system, monkeypatch, tmp_path):
     _, client, _ = system
     account = commandcode_native(client)
-    client.patch("/api/plugins/pi-commandcode-provider", json={"enabled": False})
+    unavailable_plugins(monkeypatch, tmp_path)
     response = client.post(f"/api/accounts/{account['id']}/login")
     assert response.status_code == 422 and response.json()["code"] == "plugin_unavailable"
 

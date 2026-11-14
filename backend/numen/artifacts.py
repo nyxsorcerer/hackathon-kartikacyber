@@ -188,6 +188,16 @@ def publish(db, root, resource_type, resource_id, files, metadata=None, secrets=
     return revision, items
 
 
+def remove_revisions(root, revisions):
+    """Removes the folders of artifact revisions whose rows are already gone. Each publication has
+    its own revision folder, so nothing else shares these files."""
+    root = Path(root).resolve()
+    for revision in revisions:
+        folder = (root / revision).resolve()
+        if folder.parent == root and folder.is_dir():
+            shutil.rmtree(folder, ignore_errors=True)
+
+
 def read_file(root, artifact):
     path = Path(root) / artifact.storage_path
     if not path.is_file() or path.is_symlink():

@@ -2,7 +2,6 @@ import hmac
 import json
 import zipfile
 import secrets
-import shutil
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
@@ -41,7 +40,6 @@ from .models import (
     Notification,
     Observation,
     Operator,
-    Plugin,
     Application,
     ApplicationCVE,
     ApplicationRepository,
@@ -49,6 +47,7 @@ from .models import (
     Repository,
     ServedChange,
     ServedFetch,
+    Transcript,
     VersionRecipe,
     WatchedPage,
     now,
@@ -90,6 +89,7 @@ from .security import (
     hash_password,
     normalize_native_cache,
     RequestLimits,
+    SecurityHeaders,
     token_hash,
     verify_password,
 )
@@ -127,12 +127,13 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     async def lifespan(app):
         with factory.begin() as db:
             domain.settings(db, config)
-            domain.plugin_records(db)
         yield
         engine.dispose()
 
-    app = FastAPI(title="Numen", lifespan=lifespan)
+    # No Swagger UI (/docs, /redoc, /openapi.json): it needs inline script, which the CSP forbids.
+    app = FastAPI(title="Numen", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(RequestLimits)
+    app.add_middleware(SecurityHeaders)
     app.state.config, app.state.factory, app.state.vault = config, factory, vault
 
     @app.exception_handler(DomainError)
@@ -1228,14 +1229,6 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         db.delete(row)
         return revisions
 
-    def remove_revision_folders(revisions):
-        root = Path(config.artifact_root).resolve()
-        for revision in revisions:
-            # Each publication has its own revision folder, so nothing else shares these files.
-            folder = (root / revision).resolve()
-            if folder.parent == root and folder.is_dir():
-                shutil.rmtree(folder, ignore_errors=True)
-
     @router.delete("/findings/{ident}", status_code=204)
     def delete_finding(ident: str, db=database_dependency):
         """Remove a finding recorded in error, such as one a false-positive analysis created:
@@ -1251,7 +1244,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             )
         revisions = remove_finding(db, row)
         db.flush()
-        remove_revision_folders(revisions)
+        artifacts.remove_revisions(config.artifact_root, revisions)
         return Response(status_code=204)
 
     @router.post("/findings/delete")
@@ -1280,7 +1273,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         for ident in ids:
             revisions |= remove_finding(db, rows[ident])
         db.flush()
-        remove_revision_folders(revisions)
+        artifacts.remove_revisions(config.artifact_root, revisions)
         return {"deleted": ids}
 
     @router.post("/findings/{ident}/artifacts")
@@ -1503,10 +1496,21 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             else "application/octet-stream",
             headers={
                 "Content-Disposition": f"attachment; filename=artifact; filename*=UTF-8''{quote(filename)}",
-                "X-Content-Type-Options": "nosniff",
                 "Cache-Control": "private, no-store",
             },
         )
+
+    @router.get("/transcripts/{ident}")
+    def transcript(ident: str, db=database_dependency):
+        """A Transcript with its text, shown in the page and never downloaded (A14, A15): a Triage
+        run's record as JSON, or an Analysis run's session read from artifact storage."""
+        row = domain.get(db, Transcript, ident)
+        if row.kind == "triage":
+            text = json.dumps(row.data, indent=2, ensure_ascii=False)
+        else:
+            text = artifacts.resource_files(db, config.artifact_root, "transcript", row.id,
+                                            row.data["revision"])["transcript.txt"].decode(errors="replace")
+        return {**domain.transcript_json(row), "text": text}
 
     @router.get("/analyses/{ident}/download")
     def download_analysis(ident: str, db=database_dependency):
@@ -1521,7 +1525,6 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                     "attachment; filename=analysis.zip; "
                     f"filename*=UTF-8''{quote(filename, safe='')}"
                 ),
-                "X-Content-Type-Options": "nosniff",
                 "Cache-Control": "private, no-store",
             },
         )
@@ -1859,7 +1862,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             if a.data.get("status") != "deleted"
         ]
         return {
-            "items": [domain.public_account(a, domain.plugin_records(db)) for a in rows],
+            "items": [domain.public_account(a, domain.plugin_records()) for a in rows],
             "next_cursor": None,
         }
 
@@ -1874,7 +1877,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         )
         db.add(row)
         db.flush()
-        return domain.public_account(row, domain.plugin_records(db))
+        return domain.public_account(row, domain.plugin_records())
 
     @router.patch("/accounts/{ident}")
     def patch_account(ident: str, body: dict, db=database_dependency):
@@ -1899,7 +1902,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 "agent_models": {},
                 "error": None,
             }
-        return domain.public_account(row, domain.plugin_records(db))
+        return domain.public_account(row, domain.plugin_records())
 
     @router.delete("/accounts/{ident}", status_code=204)
     def delete_account(ident: str, db=database_dependency):
@@ -1952,7 +1955,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             account.id,
             {"action": "native_cache_imported", "credential_revision": account.revision},
         )
-        return domain.public_account(account, domain.plugin_records(db))
+        return domain.public_account(account, domain.plugin_records())
 
     @router.get("/accounts/{ident}/capabilities")
     def capabilities(ident: str, db=database_dependency):
@@ -1974,7 +1977,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         row = domain.get(db, Account, ident)
         if row.auth_type != "native_oauth":
             raise DomainError("unsupported_login", "API-key accounts do not use native login", 422)
-        domain.require_provider_plugin(db, row.provider)
+        domain.require_provider_plugin(row.provider)
         if not vault.fernet:
             raise DomainError(
                 "vault_unconfigured",
@@ -2075,21 +2078,19 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         }
 
     @router.get("/plugins")
-    def plugins(db=database_dependency):
-        return {
-            "items": [
-                {**p.data, "id": p.id, "enabled": p.enabled} for p in domain.plugin_records(db)
-            ],
-            "next_cursor": None,
-        }
+    def plugins():
+        return {"items": domain.plugin_records(), "next_cursor": None}
 
-    @router.patch("/plugins/{ident}")
-    def patch_plugin(ident: str, body: dict, db=database_dependency):
-        if set(body) != {"enabled"} or type(body["enabled"]) is not bool:
-            raise DomainError("validation_error", "Supply enabled=true or false", 422)
-        row = domain.get(db, Plugin, ident)
-        row.enabled = body["enabled"]
-        return {**row.data, "id": row.id, "enabled": row.enabled}
+    @router.api_route("/plugins", methods=["POST", "PUT", "PATCH", "DELETE"])
+    @router.api_route("/plugins/{ident}", methods=["POST", "PUT", "PATCH", "DELETE"])
+    def change_plugin():
+        """The plugin list is read-only (A13): the runner image pins each plugin."""
+        raise DomainError(
+            "plugins_read_only",
+            "Pi plugins are read-only. Adding or changing one means editing runner/plugins.lock.json"
+            " and rebuilding the runner image.",
+            405,
+        )
 
     app.include_router(router)
     if config.frontend_root.is_dir():

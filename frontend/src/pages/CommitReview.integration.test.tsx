@@ -954,3 +954,28 @@ it("offers no download of an Upstream commit's Analysis (A15)", async () => {
     "/api/artifacts/report/content",
   );
 });
+
+it("renders a commit message containing <script> as text", async () => {
+  const message = "<script>window.__pwned = true</script> Fix login";
+  serveQueue([{ ...records[0], message }]);
+  const { container } = render(
+    <MemoryRouter initialEntries={["/reviews?application=alpha&decision=all"]}>
+      <Routes>
+        <Route path="/reviews" element={<Reviews />} />
+        <Route path="/commits/:id" element={<CommitDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(await screen.findByText(message)).toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.click(
+    screen.getByRole("link", {
+      name: "Potential path traversal through template selection",
+    }),
+  );
+  expect(
+    await screen.findByText(`Upstream commit: ${message}`),
+  ).toBeInTheDocument();
+  expect(container.querySelector("script")).toBeNull();
+  expect(Reflect.get(window, "__pwned")).toBeUndefined();
+});

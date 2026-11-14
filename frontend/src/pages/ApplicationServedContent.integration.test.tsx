@@ -213,7 +213,7 @@ it("lists each Watched page with its fingerprints and Baseline per user agent", 
   expect(
     within(homeGooglebot).getByRole("link", { name: "Open Finding" }),
   ).toHaveAttribute("href", "/findings/finding-1");
-  // A changed fingerprint without a Security hardening or Unrelated Verdict cannot be accepted.
+  // The button follows the server's accept_allowed: false here, so it is not offered.
   for (const row of [homeBrowser, homeGooglebot, verifyGooglebot])
     expect(
       within(row).queryByRole("button", { name: "Accept Baseline" }),

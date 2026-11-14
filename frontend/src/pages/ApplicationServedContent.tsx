@@ -272,7 +272,7 @@ export function ApplicationServedContent({
       >
         <Panel
           title="Watched pages"
-          description="The homepage is always watched. You can accept a fetch's fingerprint as the Baseline when there is none yet, or after a Security hardening or Unrelated Verdict on it. Accepting is not an Approval."
+          description="The homepage is always watched. You can accept a fetch's fingerprint as the Baseline when there is none yet, or after a Security hardening or Unrelated Verdict on it, or after Triage declined it or you dismissed it from the Review queue. Accepting is not an Approval."
         >
           {pages.length ? (
             <div className="table-scroll">

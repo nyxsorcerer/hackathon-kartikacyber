@@ -1,5 +1,6 @@
 """Domain orchestration. Generated code executes only through the isolated broker."""
 
+import base64
 import bisect
 import json
 import hashlib
@@ -550,7 +551,7 @@ class Workflows:
             "auth_type": account.auth_type,
             "credential": self.vault.decrypt(account.credential),
             "operation": operation or job.kind,
-            "enabled_plugins": domain.enabled_plugins(db, account.provider),
+            "enabled_plugins": domain.enabled_plugins(account.provider),
         }
 
     def run(
@@ -1202,12 +1203,13 @@ class Workflows:
                             for name, resource in served_names(fetch)})
         files["served-content.json"] = json.dumps(
             {"page_url": page.url, "user_agent": change.user_agent, "files": listing, "diff": change.diff}, indent=1).encode()
-        result, outputs, _ = self.agent(
+        result, outputs, state = self.agent(
             db, job, "served_analysis", files,
             {"page_url": page.url, "user_agent": change.user_agent, "fingerprint": change.fingerprint,
              "baseline_fingerprint": db.get(ServedFetch, change.baseline_fetch_id).fingerprint},
             limits={"timeout_seconds": ANALYSIS_SECONDS},
         )
+        transcript = self.session_transcript(db, state)
         if "report.md" not in outputs:
             raise DomainError("missing_report", "Analysis completed without report.md", 422)
         verdict = result["verdict"]
@@ -1219,6 +1221,7 @@ class Workflows:
         artifacts.publish(db, self.config.artifact_root, "analysis", analysis.id, outputs,
                           {"page_url": page.url, "user_agent": change.user_agent, "fingerprint": change.fingerprint,
                            "profile": job.profile}, all_secrets(db, self.vault))
+        self.store_analysis_transcript(db, job, change.id, analysis.id, state["run_id"], transcript)
         self.set_commit_decision(db, job, change, VERDICT_REVIEW[verdict])
         change.verdict = verdict
         change.analysis_state = {"status": "completed", "analysis_id": analysis.id}
@@ -1413,12 +1416,48 @@ class Workflows:
         return result
 
     def redacted(self, db, value):
-        """`value` with every configured secret replaced by [redacted], as stored Transcripts need."""
+        """`value` with every configured secret, and its standard base64 form, replaced by
+        [redacted], as stored Transcripts need (A14): artifacts.clean_files refuses either form."""
         text = json.dumps(value, default=str)
         secrets = {s for s in [*all_secrets(db, self.vault), *self.context.secrets] if s and len(s) >= 8}
         for secret in sorted(secrets, key=len, reverse=True):
-            text = text.replace(json.dumps(secret)[1:-1], "[redacted]")
+            for form in (json.dumps(secret)[1:-1], base64.b64encode(secret.encode()).decode()):
+                text = text.replace(form, "[redacted]")
         return json.loads(text)
+
+    def session_transcript(self, db, state):
+        """The run's Herdr session, redacted, for its Analysis Transcript (A14): the broker's final
+        archive: each native JSONL record in order, rendered as its role and content (without its
+        ids, timestamps, usage or encrypted content), and then the latest terminal view.
+        None, with a note, when the run has no session to read. Read before the fence, so no
+        broker call waits under row locks."""
+        try:
+            archive = self.broker.session(state["run_id"])
+        except DomainError as exc:
+            self.context.note("transcript_unavailable",
+                              "The run's agent session could not be read, so it has no Transcript", code=exc.code)
+            return None
+        return self.redacted(db, archive.get("screen", ""))
+
+    def store_analysis_transcript(self, db, job, subject_id, analysis_id, run_id, text):
+        """Keeps an Analysis run's session `text` as its Transcript in artifact storage, linked to
+        its Analysis (A14). A Transcript that cannot be stored is recorded on the job and never
+        fails the Verdict."""
+        if text is None:
+            return
+        ident, content = uid(), text.encode(errors="replace")
+        try:
+            revision, _ = artifacts.publish(db, self.config.artifact_root, "transcript", ident,
+                                            {"transcript.txt": content}, {"analysis_id": analysis_id, "run_id": run_id},
+                                            all_secrets(db, self.vault) + self.context.secrets)
+        except DomainError as exc:
+            # The job row is locked by the fence, so the event joins this transaction.
+            domain.event(db, job, "transcript_not_stored", "The Analysis Transcript was not stored: " + exc.message,
+                         code=exc.code)
+            return
+        db.add(Transcript(id=ident, kind="analysis", job_id=job.id, subject_id=subject_id,
+                          data={"status": "completed", "analysis_id": analysis_id, "run_id": run_id, "revision": revision},
+                          size=len(content)))
 
     def triage_transcript(self, db, job, commit, run, failure=None):
         """Keeps one Triage run as a Transcript. A failed run's Transcript is committed before its
@@ -1427,7 +1466,8 @@ class Workflows:
         data = {**run, "status": "failed" if failure else "completed"}
         if failure:
             data["error"] = failure.as_dict()
-        db.add(Transcript(kind="triage", job_id=job.id, subject_id=commit.id, data=data))
+        db.add(Transcript(kind="triage", job_id=job.id, subject_id=commit.id, data=data,
+                          size=len(json.dumps(data).encode())))
         if failure:
             db.commit()
             raise failure
@@ -1733,7 +1773,7 @@ class Workflows:
         rule = "own_commit" if any(link.role == "own" for _, link in linked) else "minimal"
         locked = next((found for a, link in linked if rule == "minimal" and link.role == "upstream"
                        and (found := domain.locked_packages(db, a, repository))), None)
-        result, outputs, _ = self.agent(
+        result, outputs, state = self.agent(
             db,
             job,
             "commit_analysis",
@@ -1757,6 +1797,7 @@ class Workflows:
             },
             limits={"timeout_seconds": ANALYSIS_SECONDS},
         )
+        transcript = self.session_transcript(db, state)
         check_verdict(result)
         result = {**result, "vulnerable_app": rule}
         if "report.md" not in outputs:
@@ -1811,6 +1852,7 @@ class Workflows:
             },
             all_secrets(db, self.vault),
         )
+        self.store_analysis_transcript(db, job, commit.id, analysis.id, state["run_id"], transcript)
         self.set_commit_decision(db, job, commit, VERDICT_REVIEW[verdict])
         commit.verdict = verdict
         commit.analysis_state = {"status": "completed", "analysis_id": analysis.id}
@@ -2879,9 +2921,10 @@ class Workflows:
             db, application, source_files, snapshot.source_ref
         )
         files["cve.json"] = json.dumps(job.input.get("source_record", row.raw)).encode()
-        result, outputs, _ = self.agent(
+        result, outputs, state = self.agent(
             db, job, "cve_analysis", files, facts, limits={"timeout_seconds": ANALYSIS_SECONDS}
         )
+        transcript = self.session_transcript(db, state)
         if (
             result["cve_id"] != row.id
             or result["source_record_hash"] != job.input["record_hash"]
@@ -2923,6 +2966,9 @@ class Workflows:
             {**facts, "profile": job.profile},
             all_secrets(db, self.vault),
         )
+        # A CVE is analysed per Application, so its Transcript's subject names both.
+        self.store_analysis_transcript(db, job, f"{application.id}:{row.id}", analysis.id,
+                                       state["run_id"], transcript)
         if finding.status not in ("open", "confirmed"):
             # A closed Finding keeps the evidence and bundle it was closed with.
             return {"analysis_id": analysis.id, **result, "finding_id": finding.id}
@@ -3496,9 +3542,9 @@ class Workflows:
             raise DomainError(
                 "credential_required", "Configure credentials or complete native login first", 422
             )
-        # A disabled provider plugin must not run, even to discover its catalog.
-        domain.require_provider_plugin(db, account.provider)
-        plugins = domain.enabled_plugins(db, account.provider)
+        # A provider plugin that is not ready must not run, even to discover its catalog.
+        domain.require_provider_plugin(account.provider)
+        plugins = domain.enabled_plugins(account.provider)
         supported = domain.SUPPORTED.get(account.provider, [])
         if account.auth_type == "native_oauth":
             supported = [domain.NATIVE_AGENTS[account.provider]]
@@ -3634,7 +3680,7 @@ class Workflows:
         if account.auth_type != "native_oauth":
             raise DomainError("unsupported_login", "This connection uses an API key", 422)
 
-        domain.require_provider_plugin(db, account.provider)
+        domain.require_provider_plugin(account.provider)
 
         def progress(state):
             self.context.progress(state)
@@ -3651,7 +3697,7 @@ class Workflows:
                     "auth_type": account.auth_type,
                     "agent": domain.NATIVE_AGENTS[account.provider],
                     "connection_id": account.id,
-                    "enabled_plugins": domain.enabled_plugins(db, account.provider),
+                    "enabled_plugins": domain.enabled_plugins(account.provider),
                 },
                 limits={"timeout_seconds": 900, "memory_mb": 512, "cpus": 1, "pids": 128},
                 progress=progress,

@@ -15,6 +15,7 @@ from numen.config import Config
 from numen.domain import source_repository
 from numen.models import Account, Commit, Application, Repository, Setting, Snapshot
 from numen.artifacts import publish
+from numen.security import DomainError
 
 REPOSITORY_FIELDS = ("role", "source_kind", "source_url", "source_ref", "source_path", "plugin_slug", "locked_version")
 
@@ -222,9 +223,17 @@ def source_snapshot(app, ident, revision="a" * 40, repository_id=None, files=Non
         return commit.id
 
 
+# A finished run's session archive as the broker keeps it: the native JSONL records, then Herdr's view.
+SESSION_SCREEN = ("=== session-transcripts/pi/fixture.jsonl ===\n[user]\nAnalyse the change\n\n"
+                  "[assistant]\nThe report is drafted\n\n=== Latest terminal view ===\npi> done")
+
+
 class FixtureBroker:
-    def __init__(self, result=None, outputs=None, handler=None):
+    """`screen` is every run's final session archive; None means the run has no session to read."""
+
+    def __init__(self, result=None, outputs=None, handler=None, execution=None, screen=SESSION_SCREEN):
         self.result, self.outputs, self.handler = result or {}, outputs or {}, handler
+        self.execution, self.screen = execution, screen
         self.calls, self.states, self.ingress_deleted = [], {}, []
 
     def submit(
@@ -264,6 +273,8 @@ class FixtureBroker:
                 for p, data in outputs.items()
             ],
         }
+        if self.execution:
+            self.states[token]["execution"] = dict(self.execution)
         return {"run_id": token, "status": "queued"}
 
     def wait(self, run_id, heartbeat, progress, deadline=900):
@@ -273,6 +284,11 @@ class FixtureBroker:
 
     def request(self, method, path, **kwargs):
         return self.states[path.split("/")[-1]]
+
+    def session(self, run_id, body=None):
+        if self.screen is None:
+            raise DomainError("session_unavailable", "run has no retained agent session", 409)
+        return {"agent": "pi", "agent_status": "done", "held": False, "live": False, "screen": self.screen}
 
     def cancel(self, run_id):
         self.states[run_id]["status"] = "cancelled"

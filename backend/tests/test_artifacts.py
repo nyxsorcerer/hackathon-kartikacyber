@@ -101,6 +101,9 @@ def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(sy
     assert row["fixed_versions"] == ["2.0.0"] and row["status"] == "open"
     assert row["target_applicability"] == "unknown" and row["lab_runs"] == []
     assert row["artifact_state"]["status"] == "complete"
+    # A14: the CVE analysis run's Transcript is listed with its Finding, linked to that Analysis.
+    assert [(t["kind"], t["subject_id"], t["analysis_id"]) for t in row["transcripts"]] == [
+        ("analysis", f"{p['id']}:{result['cve_id']}", job["result"]["analysis_id"])]
     with zipfile.ZipFile(
         io.BytesIO(client.get(f"/api/findings/{row['id']}/download").content)
     ) as archive:

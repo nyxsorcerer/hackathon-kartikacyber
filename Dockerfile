@@ -26,5 +26,7 @@ CMD ["uvicorn", "numen.api:app", "--host", "0.0.0.0", "--port", "8080"]
 FROM app AS test
 USER root
 RUN uv sync --locked --extra dev
+# The loopback-only port test (A15) reads the compose files.
+COPY compose.yaml compose.test.yaml /app/
 USER 10001:10001
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]
