@@ -14,6 +14,7 @@ from .models import (
     AuditContext,
     CVE,
     Commit,
+    Exposure,
     Finding,
     Job,
     JobEvent,
@@ -27,6 +28,7 @@ from .models import (
     RemediationPR,
     Repository,
     Setting,
+    Snapshot,
     now,
     utc,
 )
@@ -361,11 +363,56 @@ def commit_application(db, commit):
     return next((a for a, link in rows if in_use(a, link)), rows[0][0] if rows else None)
 
 
-def affected_applications(db, repository):
-    """The Applications a Verdict on `repository` reaches: each one that uses it. Own links always
-    count, and Upstream links count because their Exposure is unknown, which counts as exposed."""
-    # ponytail: Exposure is not computed yet; Phase 7 adds the not-exposed filter here.
-    return [a for a, link in linked_applications(db, repository) if in_use(a, link)]
+def affected_applications(db, repository, exposures):
+    """The Applications a Verdict on `repository` reaches: each one that uses it as its Own
+    repository, and each one that uses it as an Upstream repository unless its Exposure in
+    `exposures` ({application_id: Exposure}) is not_exposed. Unknown counts as exposed, and so does
+    an Upstream link with no Exposure, which a Verdict that opens no Finding does not compute."""
+    return [a for a, link in linked_applications(db, repository) if in_use(a, link) and (
+        link.role == "own" or getattr(exposures.get(a.id), "state", "unknown") != "not_exposed")]
+
+
+def record_exposure(db, application, commit, verdict, found):
+    """Stores the Application's Exposure to `verdict` on `commit` (A05): `found` is {state, reason,
+    locked_version, tag, target, analysis_id}. One row per (Application, commit), updated by a
+    repeat Analysis. Returns the row."""
+    query = select(Exposure).where(Exposure.application_id == application.id, Exposure.commit_id == commit.id)
+    row = db.scalar(query)
+    if row is None:
+        # As repository_for: a concurrent writer that creates the key first wins, and this one updates it.
+        try:
+            with db.begin_nested():
+                row = Exposure(application_id=application.id, repository_id=commit.repository_id,
+                               commit_id=commit.id, verdict=verdict, state=found["state"], data={})
+                db.add(row)
+        except IntegrityError:
+            row = db.scalar(query)
+    row.verdict, row.state, row.updated_at = verdict, found["state"], now()
+    row.data = {key: found.get(key) for key in ("reason", "locked_version", "tag", "target", "analysis_id")}
+    return row
+
+
+def queue_exposure(db, application, repository):
+    """Queues the Application's exposure_check for `repository` after its Locked version changed or
+    it was linked (A05), unless one is queued already. Only an in-use Upstream link gets one (Own
+    links never get Exposure), and only once the repository has a Verdict that opens a Finding:
+    before that there is nothing to recompute. Returns the job, or None."""
+    link = next((link for link, r in links(db, application) if r.id == repository.id), None)
+    if link is None or link.role != "upstream" or not in_use(application, link):
+        return None
+    if db.scalar(select(Commit.id).where(
+            Commit.repository_id == repository.id, Commit.source_generation == repository.source_generation,
+            Commit.verdict.in_(OPENING_VERDICTS)).limit(1)) is None:
+        return None
+    queued = db.scalar(select(Job).where(
+        Job.kind == "exposure_check", Job.status == "queued", Job.application_id == application.id,
+        Job.input["repository_id"].as_string() == repository.id).limit(1))
+    return queued or enqueue(db, "exposure_check", application, repository_input(repository))
+
+
+def exposure_json(row, application_name=None):
+    return {"application_id": row.application_id, "application_name": application_name, "verdict": row.verdict,
+            "state": row.state, **{key: row.data.get(key) for key in ("reason", "locked_version", "tag", "target")}}
 
 
 def triage_application(db, repository):
@@ -377,10 +424,10 @@ def triage_application(db, repository):
     return None
 
 
-# Automatic Analyses per UTC day (A04), automatic patch drafting included (A08). Manual runs are
-# neither capped nor counted.
+# Automatic Analyses per UTC day (A04), automatic patch drafting (A08) and Proof bundle drafting
+# (draft_bundle) included. Manual runs are neither capped nor counted.
 ANALYSIS_CAPS = {"application": 10, "account": 30}
-CAPPED_KINDS = ("commit_analysis", "patch_drafting")
+CAPPED_KINDS = ("commit_analysis", "patch_drafting", "finding_artifacts")
 
 
 def over_cap(db, application, profile, shared):
@@ -720,6 +767,7 @@ def analysis_json(db, row, with_artifacts=True):
         result["result"] = {**row.result, "finding_id": None, "finding_removed": True}
     if with_artifacts:
         result["artifacts"] = artifact_rows(db, "analysis", row.id)
+        result["exportable"] = exportable(db, "analysis", row.id)
     return result
 
 
@@ -753,9 +801,26 @@ def commit_findings(db, ids):
     return found
 
 
-def commit_json(db, row, findings=None):
+def commit_exposures(db, ids):
+    """Each commit's Exposures (A05), one per Application its Upstream Verdict was checked for,
+    keyed by commit id. A not-exposed Verdict is recorded only here, on the Upstream repository."""
+    found = {}
+    rows = db.execute(
+        select(Exposure, Application.asset_name)
+        .join(Application, Application.id == Exposure.application_id)
+        .where(Exposure.commit_id.in_(list(ids)))
+        .order_by(Application.asset_name, Exposure.application_id)
+    ) if ids else []
+    for row, name in rows:
+        found.setdefault(row.commit_id, []).append(exposure_json(row, name))
+    return found
+
+
+def commit_json(db, row, findings=None, exposures=None):
     if findings is None:
         findings = commit_findings(db, [row.id])
+    if exposures is None:
+        exposures = commit_exposures(db, [row.id])
     analyses = list(
         db.scalars(
             select(Analysis)
@@ -778,6 +843,7 @@ def commit_json(db, row, findings=None):
         "analysis_state": row.analysis_state,
         "analyses": [analysis_json(db, a) for a in analyses],
         "findings": findings.get(row.id, []),
+        "exposures": exposures.get(row.id, []),
     }
 
 
@@ -879,16 +945,292 @@ def open_finding(db, application, source, subject, title, ref, cause):
     return finding, True
 
 
-def malicious_change(db, finding):
-    """Whether the Finding is for a Malicious change, which never runs (ADR-0004): a Malicious
-    change Verdict opened it, or is its source commit's newest Verdict."""
-    commit = db.get(Commit, finding.data.get("source_commit_id") or "") if finding.source == "commit" else None
+def source_commit(db, finding):
+    return db.get(Commit, finding.data.get("source_commit_id") or "") if finding.source == "commit" else None
+
+
+def finding_verdict(db, finding):
+    """The Verdict the Finding answers to: Malicious change when its source commit's newest
+    Verdict is one, else the Verdict that opened it, else its source commit's newest Verdict.
+    None for a Finding with no Verdict, such as a cve Finding or one the Operator opened."""
+    commit = source_commit(db, finding)
     if commit is not None and commit.verdict == "Malicious change":
-        return True
+        return commit.verdict
     opened = db.scalar(select(Action).where(
         Action.resource_type == "finding", Action.resource_id == finding.id,
         Action.data["action"].as_string() == "opened"))
-    return opened is not None and (opened.data.get("cause") or {}).get("verdict") == "Malicious change"
+    return (opened and (opened.data.get("cause") or {}).get("verdict")) or getattr(commit, "verdict", None)
+
+
+def malicious_change(db, finding):
+    """Whether the Finding is for a Malicious change, which never runs (ADR-0004): a Malicious
+    change Verdict opened it, or is its source commit's newest Verdict."""
+    return finding_verdict(db, finding) == "Malicious change"
+
+
+# The Own and Upstream columns of the A06 Playbook matrix: the steps each Verdict runs, by the
+# role of the repository it is about. Served content is Phase 9's, the Advisory check Phase 8's.
+PLAYBOOKS = {
+    ("own", "Vulnerability introduced"): ("proof", "report", "remediation_pr"),
+    ("own", "Malicious change"): ("static_proof", "detection_rule", "remediation_pr", "cleanup_report"),
+    ("own", "Vulnerability fix"): ("report", "deployed_version_check"),
+    ("upstream", "Vulnerability introduced"): ("proof", "disclosure_report", "remediation_pr"),
+    ("upstream", "Malicious change"): ("static_proof", "detection_rule", "cleanup_report", "remediation_pr"),
+    ("upstream", "Vulnerability fix"): ("proof", "remediation_pr"),
+}
+
+
+def finding_repository(db, finding):
+    """The repository the Finding is about: a commit Finding's source commit's, a cve Finding's
+    Application's source repository; None for any other source."""
+    if finding.source == "cve":
+        return source_repository(db, db.get(Application, finding.application_id))
+    commit = source_commit(db, finding)
+    return db.get(Repository, commit.repository_id) if commit else None
+
+
+def finding_role(db, finding):
+    """own or upstream: the role of the Finding's repository in its Application, or None."""
+    repository = finding_repository(db, finding)
+    return next((link.role for link, r in links(db, db.get(Application, finding.application_id))
+                 if repository is not None and r.id == repository.id), None)
+
+
+def finding_cell(db, finding):
+    """The Finding's (role, Verdict) cell of PLAYBOOKS, or None, as for a Finding the Operator
+    opened on no Verdict, which keeps every step."""
+    cell = (finding_role(db, finding), finding_verdict(db, finding))
+    return cell if cell in PLAYBOOKS else None
+
+
+def finding_exposure(db, finding):
+    """The Exposure (A05) of the Finding's Application to its source commit, or None."""
+    commit = source_commit(db, finding)
+    return commit and db.scalar(select(Exposure).where(
+        Exposure.application_id == finding.application_id, Exposure.commit_id == commit.id))
+
+
+def deployed_version(finding):
+    """The Finding's Deployed version, shown apart from its lifecycle: before_fix, serving_fix or
+    unknown, from its last Deployed version check (A06)."""
+    return (finding.data.get("deployed_version_check") or {}).get("state", "unknown")
+
+
+def deployed_findings(db, application):
+    """The Application's open or confirmed Own-repository Vulnerability fix Findings: the only ones
+    a Deployed version check is for (A06, A11)."""
+    return [finding for finding in db.scalars(select(Finding).where(
+        Finding.application_id == application.id, Finding.source == "commit",
+        Finding.status.in_(("open", "confirmed"))).order_by(Finding.created_at))
+        if finding_cell(db, finding) == ("own", "Vulnerability fix")]
+
+
+def apply_deployed_check(db, finding, check, observation_id):
+    """Records the Deployed version check `check` ({state, version, reason}) of the version check
+    `observation_id` on an Own-repository Vulnerability fix Finding, and remediates it when the
+    Asset serves the fix (A11). Any other Finding is left alone: transition_finding does not check
+    a deployed_version cause, so this caller does. Returns whether it applied."""
+    if finding_cell(db, finding) != ("own", "Vulnerability fix"):
+        return False
+    db.flush()  # Refreshing discards unflushed changes the caller made, such as run_playbook's.
+    db.refresh(finding, with_for_update=True)
+    finding.data = {**finding.data, "deployed_version_check": {
+        **check, "observation_id": observation_id, "checked_at": now().isoformat()}}
+    if check["state"] == "serving_fix":
+        db.flush()
+        transition_finding(db, finding, "remediated", {
+            "by": "deployed_version", "observation_id": observation_id, "version": check["version"]})
+    return True
+
+
+def exportable(db, resource_type, resource_id):
+    """Whether the artifacts of the resource may be exported (A15): never an Upstream Proof, which
+    overrides Numen's AC-12 for Upstream Findings. Not exportable: an Upstream Finding (a cve
+    Finding on an Upstream source repository among them) and its Labs' artifacts, an Analysis of
+    a commit of a repository that any Application links as Upstream, and a CVE analysis of an
+    Application whose source repository is an Upstream one."""
+    if resource_type == "lab":
+        resource_type, resource_id = "finding", getattr(db.get(LabRun, resource_id), "finding_id", None)
+    if resource_type == "finding":
+        finding = db.get(Finding, resource_id or "")
+        return finding is None or finding_role(db, finding) != "upstream"
+    analysis = db.get(Analysis, resource_id) if resource_type == "analysis" else None
+    if analysis is None:
+        return True
+    if analysis.kind == "commit_analysis":
+        commit = db.get(Commit, analysis.subject_id)
+        repository = commit and db.get(Repository, commit.repository_id)
+        return repository is None or all(link.role != "upstream" for _, link in linked_applications(db, repository))
+    application = db.get(Application, analysis.application_id)
+    repository = application and source_repository(db, application)
+    return repository is None or all(link.role != "upstream" for link, r in links(db, application) if r.id == repository.id)
+
+
+def require_lab(db, finding):
+    """Refuses a Lab for a Finding whose Playbook has no Lab Proof (A06): a Malicious change never
+    runs (ADR-0004), and an Own-repository Vulnerability fix gets a report and a Deployed version
+    check instead."""
+    if malicious_change(db, finding):
+        raise DomainError("lab_not_allowed", "A Malicious change never runs: its Proof is static, so it has no Lab", 409)
+    cell = finding_cell(db, finding)
+    if cell and "proof" not in PLAYBOOKS[cell]:
+        raise DomainError("lab_not_allowed", "An Own-repository Vulnerability fix gets a report and a Deployed "
+                          "version check, not a Lab", 409)
+    # AC-A07: no Lab installs an Upstream Malicious change. One built on the Own repository installs
+    # all of its Upstream repositories; a minimal app only the Finding's.
+    application = db.get(Application, finding.application_id)
+    repository = finding_repository(db, finding)
+    minimal = repository is not None and vulnerable_app_rule(db, application, repository) == "minimal"
+    if malicious_exposures(db, application, repository if minimal else None):
+        raise DomainError("lab_not_allowed", "This Lab would install an Upstream Malicious change the Application "
+                          "is exposed to; pin a release without it first", 409)
+
+
+def repository_link(db, application, repository):
+    """The Application's link to `repository`, removed or not, or None."""
+    return next((link for link, r in links(db, application) if repository is not None and r.id == repository.id),
+                None)
+
+
+def locked_packages(db, application, repository):
+    """(ecosystem, names, Locked version) of the packages the Application's Upstream link to
+    `repository` stands for, in its first package's ecosystem, which an Upstream Proof's Lab
+    installs (A07); None for a link with no package or no Locked version."""
+    link = repository_link(db, application, repository)
+    if link is None or link.role != "upstream" or not link.packages or not link.locked_version:
+        return None
+    ecosystem = link.packages[0].split(":", 1)[0]
+    return ecosystem, [p.split(":", 1)[1] for p in link.packages if p.startswith(ecosystem + ":")], link.locked_version
+
+
+def vulnerable_app_rule(db, application, repository):
+    """The vulnerable app a Proof of a change to `repository` builds for the Application (A07):
+    own_commit, the Own repository at the Verdict's commit; own_head, the Own repository at its
+    default-branch head with the Locked version installed, for an Upstream link with a package and
+    a Locked version; else minimal, an app of its own that pins the Locked version, if any."""
+    own = own_repository(db, application)
+    if own is not None and repository is not None and own.id == repository.id:
+        return "own_commit"
+    return "own_head" if own is not None and locked_packages(db, application, repository) else "minimal"
+
+
+def lab_supplied(db, finding):
+    """The vulnerable-app/ paths a Lab adds to the Finding's bundle (A07): an Own-repository Proof's
+    Own repository at the Verdict's commit, from its stored snapshot; an Upstream Proof's
+    package.json, which pins its npm Locked version; else none."""
+    application = db.get(Application, finding.application_id)
+    repository, commit = finding_repository(db, finding), source_commit(db, finding)
+    if repository is None:
+        return ()
+    if vulnerable_app_rule(db, application, repository) == "own_commit":
+        files = commit and db.scalar(select(Snapshot.files).where(
+            Snapshot.repository_id == repository.id, Snapshot.source_generation == repository.source_generation,
+            Snapshot.source_ref == commit.revision))
+        return {"vulnerable-app/" + p for p in files or () if p not in LAB_DROPPED}
+    locked = locked_packages(db, application, repository)
+    return {"vulnerable-app/package.json"} if locked and locked[0] == "npm" else ()
+
+
+# An Own tree's files a Lab leaves out: the artifact manifest's name, and the .dockerignore of the
+# repository's own Dockerfile, which the bundle's replaces (it would drop the fetched node_modules).
+LAB_DROPPED = ("manifest.json", ".dockerignore")
+
+
+def malicious_exposures(db, application, repository=None):
+    """The Malicious change commits (current generation) on the Application's Upstream
+    repositories, through links not removed (on `repository` only, when given), that are exposed or
+    unknown to it (A05). One with no Exposure row for the Application, such as a Verdict stored
+    while its link was off, is unknown, which counts as exposed."""
+    query = select(Commit).join(Repository, and_(
+        Repository.id == Commit.repository_id, Repository.source_generation == Commit.source_generation)).join(
+        ApplicationRepository, ApplicationRepository.repository_id == Commit.repository_id).outerjoin(
+        Exposure, and_(Exposure.application_id == application.id, Exposure.commit_id == Commit.id,
+                       Exposure.verdict == "Malicious change")).where(
+        ApplicationRepository.application_id == application.id, ApplicationRepository.role == "upstream",
+        ApplicationRepository.removed_at.is_(None), Commit.verdict == "Malicious change",
+        or_(Exposure.id.is_(None), Exposure.state != "not_exposed"))
+    if repository is not None:
+        query = query.where(Commit.repository_id == repository.id)
+    return list(db.scalars(query))
+
+
+def upstream_dependency(db, application, repository, target):
+    """What a pin or bump of the Application's Upstream `repository` to the release `target`
+    ({tag, version}) changes in the Own repository's manifest: {ecosystem, names, version}, with
+    every package the link stands for in its first package's ecosystem, or only the one a
+    {package}@ tag names. None without a target, or for a link that stands for no package."""
+    link = next((link for link, r in links(db, application) if r.id == repository.id), None)
+    if not target or link is None or not link.packages:
+        return None
+    ecosystem = link.packages[0].split(":", 1)[0]
+    names = [p.split(":", 1)[1] for p in link.packages if p.split(":", 1)[0] == ecosystem]
+    tagged = [name for name in names if target["tag"] == f"{name}@{target['version']}"]
+    return {"ecosystem": ecosystem, "names": tagged or names, "version": target["version"]}
+
+
+def playbook_steps(db, finding, root):
+    """Where each step of the Finding's Playbook cell stands (A06): [{step, status}], [] without a
+    cell. A step that needs Approval reads waiting_for_approval (a Proof) or ready (a Remediation
+    PR's draft) and blocks no other."""
+    cell = finding_cell(db, finding)
+    if cell is None:
+        return []
+    application = db.get(Application, finding.application_id)
+    paths = {a.path for a in db.scalars(select(Artifact).where(
+        Artifact.resource_type == "finding", Artifact.resource_id == finding.id,
+        Artifact.revision == (finding.artifact_revision or "")))}
+    lab = db.scalar(select(LabRun.status).where(LabRun.finding_id == finding.id)
+                    .order_by(LabRun.created_at.desc(), LabRun.id.desc()).limit(1))
+    draft = db.scalar(select(RemediationPR.status).where(RemediationPR.finding_id == finding.id)
+                      .order_by(RemediationPR.created_at.desc(), RemediationPR.id.desc()).limit(1))
+    if own_repository(db, application) is None:
+        remediation = "no_own_repository"
+    elif draft or cell[0] == "own":
+        remediation = draft or "not_drafted"
+    else:
+        exposure = finding_exposure(db, finding)
+        target = exposure.data.get("target") if exposure else None
+        remediation = (
+            ("waiting_for_release" if cell[1] == "Vulnerability fix" else "no_safe_release") if not target
+            else "not_drafted" if upstream_dependency(db, application, finding_repository(db, finding), target)
+            else "no_package"
+        )
+    proof = (lab or ("waiting_for_approval" if finding_artifact_state(db, finding, root)["status"] == "complete"
+                     else "draft"))
+    static = (finding.data.get("static_proof") or {}).get("status", "pending")
+    status = {
+        "proof": proof,
+        "report": "ready" if "report.md" in paths else "missing",
+        "disclosure_report": "ready" if "disclosure-report.md" in paths else "missing",
+        "static_proof": static,
+        "detection_rule": static,
+        "cleanup_report": "ready" if finding.data.get("cleanup_report") else "missing",
+        "remediation_pr": remediation,
+        "deployed_version_check": deployed_version(finding),
+    }
+    return [{"step": step, "status": status[step]} for step in PLAYBOOKS[cell]]
+
+
+DISCLOSURE_LIMIT = 64 * 1024
+
+
+def disclosure_report(db, finding, root):
+    """The Disclosure report (A06, A15) the Analysis drafted for an Upstream Finding, read from
+    its current revision for the Operator to copy into the Upstream repository's GitHub private
+    vulnerability reporting form: {text, form_url}, or None. Asset Monitor never sends it."""
+    cell = finding_cell(db, finding)
+    if finding_role(db, finding) != "upstream" or (cell and "disclosure_report" not in PLAYBOOKS[cell]):
+        return None
+    row = db.scalar(select(Artifact).where(
+        Artifact.resource_type == "finding", Artifact.resource_id == finding.id,
+        Artifact.revision == (finding.artifact_revision or ""), Artifact.path == "disclosure-report.md"))
+    if row is None:
+        return None
+    repository = finding_repository(db, finding)
+    return {
+        "text": artifacts.read_file(root, row)[:DISCLOSURE_LIMIT].decode(errors="replace"),
+        "form_url": f"{repository.source_url}/security/advisories/new" if repository.source_kind == "github" else None,
+    }
 
 
 def own_repository(db, application):
@@ -898,14 +1240,24 @@ def own_repository(db, application):
 
 
 def remediation_actions(db, finding):
-    """The Remediation PRs the Operator may draft for the Finding (A06 Own column), on a commit of
-    the Own repository: a revert (the Cure) for a Malicious change; a patch or a revert for a
-    Vulnerability introduced, or for a commit with no Verdict yet (a Finding the Operator opened);
-    none for any other Verdict, so a Vulnerability fix is never reverted."""
-    own = own_repository(db, db.get(Application, finding.application_id))
-    commit = db.get(Commit, finding.data.get("source_commit_id") or "") if finding.source == "commit" else None
-    if own is None or commit is None or commit.repository_id != own.id:
+    """The Remediation PRs the Operator may draft for the Finding (A06), with an Own repository.
+    On a commit of the Own repository: a revert (the Cure) for a Malicious change; a patch or a
+    revert for a Vulnerability introduced, or for a commit with no Verdict yet (a Finding the
+    Operator opened); none for any other Verdict, so a Vulnerability fix is never reverted. On an
+    Upstream commit, once its Exposure knows the release to move to: a pin for a Vulnerability
+    introduced or Malicious change, a bump for a Vulnerability fix."""
+    application = db.get(Application, finding.application_id)
+    own = own_repository(db, application)
+    commit = source_commit(db, finding)
+    if own is None or commit is None:
         return []
+    if commit.repository_id != own.id:
+        cell = finding_cell(db, finding)
+        exposure = finding_exposure(db, finding)
+        if (cell is None or cell[0] != "upstream" or exposure is None or upstream_dependency(
+                db, application, db.get(Repository, commit.repository_id), exposure.data.get("target")) is None):
+            return []
+        return ["bump"] if cell[1] == "Vulnerability fix" else ["pin"]
     if malicious_change(db, finding):
         return ["revert"]
     return ["patch", "revert"] if commit.verdict in (None, "Vulnerability introduced") else []
@@ -913,6 +1265,23 @@ def remediation_actions(db, finding):
 
 # A Remediation PR that a new draft leaves alone: it is drafting, or approved or opened.
 REMEDIATION_BUSY = ("drafting", "approved", "open", "merged", "closed")
+
+
+def draft_bundle(db, application, finding):
+    """Queues the automatic finding_artifacts run that drafts the Finding's own Proof bundle (A06,
+    A07) when its Analysis drafted one for another vulnerable app, such as an Upstream Proof built
+    on the Own repository's head. It counts against the Analysis caps like patch drafting. A profile
+    or cap problem leaves the Proof a Draft for the Operator's Generate. Returns the job, or None."""
+    try:
+        profile = automated_profile(db, application, "finding_artifacts")
+    except DomainError:
+        return None
+    # ponytail: over a cap the bundle is not drafted later; add a waiting_for_cap state to
+    # start_waiting if caps often cut it off.
+    if over_cap(db, application, profile, False):
+        return None
+    return enqueue(db, "finding_artifacts", application, job_input(
+        db, application, finding_id=finding.id, source_ref=None, automatic=True, shared=False), profile)
 
 
 def draft_remediation(db, application, finding, subject, action, revision, automatic=False, dependency=None,
@@ -1071,8 +1440,7 @@ def finding_fields(row):
         "title": row.title,
         "status": row.status,
         "cause": row.data.get("cause"),
-        # Phase 7's Deployed version check fills this in; it is shown apart from the lifecycle.
-        "deployed_version": "unknown",
+        "deployed_version": deployed_version(row),
     }
 
 
@@ -1097,8 +1465,10 @@ def set_finding_artifacts(db, row, revision, files):
             ).id
         row.data = {**row.data, "static_proof": proof}
         return detection.static_state(proof)
-    state = artifacts.completeness(files)
-    row.data = {**row.data, "_artifact_state": {"revision": revision, "rules": artifacts.RULES, "state": state}}
+    supplied = lab_supplied(db, row)
+    state = artifacts.completeness(files, supplied)
+    row.data = {**row.data, "_artifact_state": {"revision": revision, "rules": artifacts.RULES,
+                                                "supplied": fingerprint(sorted(supplied)), "state": state}}
     return state
 
 
@@ -1107,14 +1477,17 @@ def finding_artifact_state(db, row, root):
         return detection.static_state(row.data["static_proof"])
     if not row.artifact_revision:
         return artifacts.completeness({})
+    # What the Lab supplies changes with the links, such as a newly set Locked version.
+    supplied = lab_supplied(db, row)
     cached = row.data.get("_artifact_state")
     if (
         isinstance(cached, dict)
         and cached.get("revision") == row.artifact_revision
         and cached.get("rules") == artifacts.RULES
+        and cached.get("supplied") == fingerprint(sorted(supplied))
     ):
         return cached["state"]
-    return artifacts.resource_completeness(db, root, "finding", row.id, row.artifact_revision)
+    return artifacts.resource_completeness(db, root, "finding", row.id, row.artifact_revision, supplied)
 
 
 def finding_summaries(db, rows, root):
@@ -1147,6 +1520,7 @@ def finding_summaries(db, rows, root):
             "source_analysis_id": row.data.get("source_analysis_id"),
             "artifact_revision": row.artifact_revision,
             "artifact_state": finding_artifact_state(db, row, root),
+            "malicious_change": malicious_change(db, row),
             "lab_status": statuses.get(row.id),
             "created_at": utc(row.created_at),
             "updated_at": utc(row.updated_at),
@@ -1177,6 +1551,7 @@ def finding_json(db, row, root):
         "malicious_change": malicious_change(db, row),
         "artifact_revision": row.artifact_revision,
         "artifacts": artifact_rows(db, "finding", row.id, row.artifact_revision),
+        "exportable": exportable(db, "finding", row.id),
         "lab_runs": [
             {
                 "id": a.id,
@@ -1189,6 +1564,10 @@ def finding_json(db, row, root):
             for a in labs
         ],
         "events": [{"id": a.id, "created_at": utc(a.created_at), **a.data} for a in actions],
+        "playbook": playbook_steps(db, row, root),
+        "deployed_version_check": row.data.get("deployed_version_check"),
+        "exposure": exposure_json(exposure) if (exposure := finding_exposure(db, row)) else None,
+        "disclosure_report": disclosure_report(db, row, root),
         # A06: without an Own repository the Remediation PR steps show "no Own repository".
         "own_repository": own_repository(db, db.get(Application, row.application_id)) is not None,
         "remediation_actions": remediation_actions(db, row),
@@ -1211,6 +1590,7 @@ APPLICATION_SUBJECTS = {
     "source_check": ("source", "repositories"),
     "backfill": ("source", "repositories"),
     "derive_upstreams": ("source", "repositories"),
+    "exposure_check": ("source", "repositories"),
     "version_recipe": ("version", "version"),
     "version_check": ("version", "version"),
     "audit_context": ("audit", "audit"),

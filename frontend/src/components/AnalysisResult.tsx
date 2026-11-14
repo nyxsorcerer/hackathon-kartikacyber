@@ -50,6 +50,8 @@ export function AnalysisResult({
   const artifacts = analysis.artifacts || [];
   const report = artifacts.find((a) => a.path === "report.md");
   const poc = artifacts.find((a) => a.path === "poc.py");
+  // An Upstream Proof is never exported (A15): only its reports are shown.
+  const exportable = analysis.exportable !== false;
   const questions = strings(result?.open_questions);
   const artifactsId =
     kind === "cve" ? "cve-analysis-artifacts" : "commit-analysis-artifacts";
@@ -166,7 +168,7 @@ export function AnalysisResult({
               Browse artifacts
             </a>
           )}
-          {analysis.id && artifacts.length > 0 && (
+          {exportable && analysis.id && artifacts.length > 0 && (
             <a
               className="primary button"
               download
@@ -185,7 +187,7 @@ export function AnalysisResult({
               Download report
             </a>
           )}
-          {poc && (
+          {exportable && poc && (
             <a
               className="secondary button"
               download="poc.py"
@@ -207,7 +209,7 @@ export function AnalysisResult({
             <span className="muted">The finding it created was deleted.</span>
           )}
         </div>
-        {artifacts.length > 0 && (
+        {exportable && artifacts.length > 0 && (
           <p className="hint">
             The ZIP contains this run’s saved files and integrity manifest, with
             application directories preserved. Review lab verification on the
@@ -249,7 +251,11 @@ export function AnalysisResult({
       >
         <h3>Report & artifacts</h3>
         {artifacts.length > 0 ? (
-          <ArtifactBrowser artifacts={artifacts} grouped />
+          <ArtifactBrowser
+            artifacts={artifacts}
+            exportable={exportable}
+            grouped
+          />
         ) : analysis.report || result?.report ? (
           <Markdown>{result?.report || analysis.report || ""}</Markdown>
         ) : (

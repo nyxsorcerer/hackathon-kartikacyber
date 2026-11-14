@@ -1,5 +1,7 @@
 """Bounded source collectors; completion cursors are promoted by the worker transaction."""
 
+import base64
+import hashlib
 import io
 import os
 import re
@@ -9,12 +11,13 @@ import tempfile
 import time
 import xml.etree.ElementTree as ET
 import zipfile
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
-from . import fingerprints
+from . import fingerprints, remediation
 from .artifacts import MAX_SET, MAX_FILE, MAX_SOURCE_FILES
 from .cves import compare_versions, cpe_identity
 from .models import now, utc
@@ -22,6 +25,7 @@ from .schemas import safe_path
 from .security import DomainError, retry_delay
 
 TAG_PAGES = 4  # Bounded newest-first tag catalog; vendor release histories are far shorter.
+MIRROR_SECONDS = 300
 
 # Binary media is not source evidence; omitting it keeps CMS-sized snapshots within bounds.
 MEDIA_SUFFIXES = frozenset(
@@ -78,6 +82,12 @@ class Sources:
             if config.test_mode
             else "https://api.github.com"
         )
+        # Where github_mirror clones from.
+        self.git = (
+            os.getenv("NUMEN_GITHUB_GIT_URL", "https://github.com").rstrip("/")
+            if config.test_mode
+            else "https://github.com"
+        )
         self.nvd = (
             os.getenv("NUMEN_NVD_API_URL", "https://services.nvd.nist.gov/rest/json/cves/2.0")
             if config.test_mode
@@ -97,7 +107,7 @@ class Sources:
     def close(self):
         self.client.close()
 
-    def get(self, url, params=None, headers=None):
+    def get(self, url, params=None, headers=None, limit=MAX_SET):
         self.heartbeat()
         for attempt in range(4):
             try:
@@ -106,7 +116,7 @@ class Sources:
                     for chunk in stream.iter_bytes(chunk_size=256 * 1024):
                         self.heartbeat()
                         content.extend(chunk)
-                        if len(content) > MAX_SET:
+                        if len(content) > limit:
                             raise DomainError(
                                 "source_response_limit",
                                 "Upstream response exceeds the bounded source size",
@@ -193,6 +203,21 @@ class Sources:
         registry does not have it."""
         response = self.find(f"{self.npm}/{quote(name, safe='@')}/{quote(version or 'latest', safe='')}")
         return None if response is None else response.json()
+
+    def npm_tarball(self, dist):
+        """The bytes of the npm tarball that `dist` (a version's registry dist) names, at most MAX_FILE:
+        only from the registry Asset Monitor reads, and only when they match dist.integrity's sha512."""
+        url = str((dist or {}).get("tarball") or "")
+        if not url.startswith(self.npm.rstrip("/") + "/"):
+            raise DomainError("package_untrusted", f"The tarball {url[:200]!r} is not on the npm registry {self.npm}", 422)
+        expected = next((h.removeprefix("sha512-") for h in str((dist or {}).get("integrity") or "").split()
+                         if h.startswith("sha512-")), None)
+        if not expected:
+            raise DomainError("package_untrusted", f"The tarball {url[:200]!r} has no sha512 integrity", 422)
+        data = self.get(url, limit=MAX_FILE).content
+        if base64.b64encode(hashlib.sha512(data).digest()).decode() != expected:
+            raise DomainError("package_untrusted", f"The tarball {url[:200]!r} does not match its registry integrity", 422)
+        return data
 
     def npm_repository(self, name, version):
         """The repository field of the npm metadata of `version` (the latest without one), ""
@@ -484,6 +509,39 @@ class Sources:
                 break
         return tags
 
+    @contextmanager
+    def github_mirror(self, repository):
+        """A blobless bare clone of the GitHub repository, read-only (A05): yields run(*args,
+        stdin=None), git's stdout in it. Nothing is ever checked out, so no hook, filter or
+        checkout script runs. The read token reaches git only through its environment, scoped to
+        the GitHub base, never its arguments, and lazy blob fetches use it too."""
+        # ponytail: a fresh blobless clone per job; keep a fetched mirror per repository if large
+        # Upstream clones get slow
+        scheme = urlparse(self.git).scheme
+        env = {"GIT_ALLOW_PROTOCOL": scheme if self.config.test_mode else "https"}
+        if self.github_key:
+            basic = base64.b64encode(f"x-access-token:{self.github_key}".encode()).decode()
+            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0=f"http.{self.git}/.extraheader",
+                       GIT_CONFIG_VALUE_0=f"Authorization: Basic {basic}")
+        elif scheme == "https":
+            raise github_token_required()
+        repo = repository.source_url.removeprefix("https://github.com/")
+        with tempfile.TemporaryDirectory(prefix="asset-monitor-mirror-") as directory:
+            root = Path(directory, "mirror.git")
+            root.mkdir()
+            self.heartbeat()
+            try:
+                remediation.git(root, "clone", "--bare", "--filter=blob:none", "--quiet",
+                                f"{self.git}/{repo}.git", ".", env=env, timeout=MIRROR_SECONDS)
+            except DomainError as exc:
+                raise DomainError("mirror_unavailable", f"{repo} could not be cloned: {exc.message}", 502) from exc
+
+            def run(*args, stdin=None):
+                self.heartbeat()
+                return remediation.git(root, *args, stdin=stdin, env=env, timeout=MIRROR_SECONDS)
+
+            yield run
+
     def vulnerable_tag(self, repository, bound, inclusive, scheme):
         """Newest release tag a record still reports as affected, pinned to its own commit."""
         best = None
@@ -544,14 +602,33 @@ class Sources:
                 retryable=True,
             ) from exc
 
-    def svn_url(self, repository):
-        base = repository.source_url
+    def svn_root(self, repository):
+        """The plugin's SVN root, holding trunk and tags."""
         if self.config.test_mode and os.getenv("NUMEN_WORDPRESS_SVN_URL"):
-            base = os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + repository.plugin_slug
+            return os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + repository.plugin_slug
+        return repository.source_url
+
+    def svn_url(self, repository):
         path = repository.source_ref or "trunk"
         if repository.source_path:
             path += "/" + repository.source_path
-        return base + "/" + path
+        return self.svn_root(repository) + "/" + path
+
+    def svn_tags(self, repository):
+        """{tag: revision} of the plugin's tags/ (A05): a tag copied from trunk counts at the
+        revision it was copied from, and one added without a copy at the revision that added it."""
+        log = ET.fromstring(self.svn("log", "-v", "--xml", self.svn_root(repository) + "/tags"))
+        tags = {}
+        for entry in reversed(log.findall("logentry")):  # oldest first, so a later copy wins
+            for path in entry.findall("paths/path"):
+                match = re.search(r"/tags/([^/]+)$", path.text or "")
+                if not match:
+                    continue
+                if path.attrib.get("action") == "D":
+                    tags.pop(match.group(1), None)
+                elif path.attrib.get("action") in ("A", "R"):
+                    tags[match.group(1)] = int(path.attrib.get("copyfrom-rev") or entry.attrib["revision"])
+        return tags
 
     def wordpress_commits(self, repository):
         """(head, new revisions oldest first, None). The first check only sets the Baseline."""
@@ -727,12 +804,9 @@ class Sources:
             except DomainError as exc:
                 corpus["limitations"].append("Release catalog unavailable: " + exc.code)
         else:
-            base = repository.source_url
-            if self.config.test_mode and os.getenv("NUMEN_WORDPRESS_SVN_URL"):
-                base = os.environ["NUMEN_WORDPRESS_SVN_URL"].rstrip("/") + "/" + repository.plugin_slug
             try:
                 catalog = ET.fromstring(
-                    self.svn("list", "--xml", "-r", repository.cursor, base + "/tags")
+                    self.svn("list", "--xml", "-r", repository.cursor, self.svn_root(repository) + "/tags")
                 )
                 tags = [
                     entry.findtext("name")

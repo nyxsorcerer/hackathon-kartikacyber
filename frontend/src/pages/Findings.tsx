@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import {
   Link,
   useNavigate,
@@ -23,6 +24,8 @@ import { mutate, request } from "../api";
 import { useResource } from "../hooks";
 import {
   detectionChecks,
+  exposureLabels,
+  exposureTones,
   findingDeletionSchema,
   findingSchema,
   findingSummariesSchema,
@@ -52,6 +55,7 @@ import {
   Empty,
   ErrorNote,
   Evidence,
+  ExternalLink,
   humanize,
   JobLink,
   Modal,
@@ -94,6 +98,16 @@ const causeLabels: Record<string, string> = {
   baseline_match: "Served content matches the Baseline",
   deployed_version: "Deployed version serves the fix",
   numen: "Carried over from Numen",
+};
+/** What the Deployed version check reports (A06): never a guess. */
+const deployedLabels: Record<string, string> = {
+  before_fix: "Still serving code from before the fix",
+  serving_fix: "Serving the fix",
+  unknown: "Unknown",
+};
+const deployedTones: Record<string, string> = {
+  before_fix: "danger",
+  serving_fix: "good",
 };
 /** A string field of a stored record, such as a cause or a history event. */
 function text(record: unknown, key: string) {
@@ -319,7 +333,12 @@ export function FindingsList({ application }: { application?: Application }) {
                       <td>
                         <Badge>{finding.artifact_state.status}</Badge>
                         <div className="table-subtitle">
-                          <Badge tone={lab.tone}>{lab.label}</Badge>
+                          {/* A Malicious change never runs: no Lab (ADR-0004). */}
+                          {finding.malicious_change ? (
+                            <Badge>Static Proof</Badge>
+                          ) : (
+                            <Badge tone={lab.tone}>{lab.label}</Badge>
+                          )}
                         </div>
                       </td>
                       <td>
@@ -612,8 +631,35 @@ function FindingBody({
     applicationSchema,
   );
   const complete = finding.artifact_state.status === "complete";
-  // A Malicious change never runs (ADR-0004): its Proof is static, with no Lab.
+  // A Malicious change never runs (ADR-0004): its Proof is static, with no Lab. Nor does an
+  // Own-repository Vulnerability fix: its Playbook cell has no Proof step (A06).
   const malicious = finding.malicious_change;
+  const labbed =
+    !malicious &&
+    (!finding.playbook.length ||
+      finding.playbook.some((step) => step.step === "proof"));
+  const exposure = finding.exposure;
+  const exposureRows: [string, ReactNode][] = exposure
+    ? [
+        [
+          "Exposure",
+          <>
+            <Badge tone={exposureTones[exposure.state]}>
+              {exposureLabels[exposure.state]}
+            </Badge>{" "}
+            {exposure.reason}
+          </>,
+        ],
+        [
+          "Locked version",
+          exposure.locked_version ? (
+            `${exposure.locked_version}${exposure.tag ? ` (tag ${exposure.tag})` : ""}`
+          ) : (
+            <span className="muted">None</span>
+          ),
+        ],
+      ]
+    : [];
   const observed = application.data?.version;
   const lab = labState(finding.lab_runs[0]?.status);
   return (
@@ -664,7 +710,8 @@ function FindingBody({
               <Trash2 size={15} aria-hidden="true" />
               Delete finding
             </ActionButton>
-            {finding.artifacts.length > 0 && (
+            {/* An Upstream Proof is never exported (A15). */}
+            {finding.exportable && finding.artifacts.length > 0 && (
               <a
                 className={`${complete ? "primary" : "secondary"} button`}
                 download
@@ -686,7 +733,7 @@ function FindingBody({
             <span>
               Artifacts <Badge>{finding.artifact_state.status}</Badge>
             </span>
-            {!malicious && <Badge tone={lab.tone}>{lab.label}</Badge>}
+            {labbed && <Badge tone={lab.tone}>{lab.label}</Badge>}
           </>
         }
       />
@@ -704,10 +751,15 @@ function FindingBody({
           Missing: {finding.artifact_state.missing.join(", ")}.{" "}
           {malicious
             ? "The static Proof is complete once its Detection rule validates."
-            : "Lab verification is available once the bundle is complete."}
+            : labbed
+              ? "Lab verification is available once the bundle is complete."
+              : ""}
         </Callout>
       )}
       <Lifecycle finding={finding} refresh={refresh} />
+      {finding.playbook.length > 0 && (
+        <PlaybookPanel steps={finding.playbook} />
+      )}
       <div className="detail-columns even">
         <Panel
           title="Upstream remediation"
@@ -753,6 +805,7 @@ function FindingBody({
                 "Target exposure",
                 <Badge>{finding.target_applicability}</Badge>,
               ],
+              ...exposureRows,
               [
                 "Observed version",
                 observed ? (
@@ -768,7 +821,16 @@ function FindingBody({
                   <span className="muted">Not observed</span>
                 ),
               ],
-              ["Deployed version", <Badge>{finding.deployed_version}</Badge>],
+              [
+                "Deployed version",
+                <>
+                  <Badge tone={deployedTones[finding.deployed_version]}>
+                    {deployedLabels[finding.deployed_version] ||
+                      humanize(finding.deployed_version)}
+                  </Badge>{" "}
+                  {finding.deployed_version_check?.reason}
+                </>,
+              ],
               [
                 "Vulnerable lab version",
                 finding.artifact_state.vulnerable_version || (
@@ -843,6 +905,9 @@ function FindingBody({
           </ol>
         </Panel>
       ) : null}
+      {finding.disclosure_report && (
+        <DisclosureReportPanel report={finding.disclosure_report} />
+      )}
       {finding.static_proof && (
         <StaticProofPanel proof={finding.static_proof} />
       )}
@@ -878,6 +943,7 @@ function FindingBody({
           <ArtifactBrowser
             key={finding.artifact_revision}
             artifacts={finding.artifacts}
+            exportable={finding.exportable}
             grouped
           />
         ) : (
@@ -891,7 +957,7 @@ function FindingBody({
           />
         )}
       </Panel>
-      {!malicious && (
+      {labbed && (
         <Panel
           title="Lab"
           description="Builds the vulnerable application and runs this Proof in a disposable Lab, only after your Approval."
@@ -982,6 +1048,91 @@ function FindingBody({
         />
       )}
     </>
+  );
+}
+/** A06's Playbook steps. */
+const stepLabels: Record<string, string> = {
+  proof: "Proof",
+  report: "Report",
+  disclosure_report: "Disclosure report",
+  static_proof: "Static Proof",
+  detection_rule: "Detection rule",
+  cleanup_report: "Cleanup report",
+  remediation_pr: "Remediation PR",
+  deployed_version_check: "Deployed version check",
+};
+/** Where a step stands, when its bare status does not say it. */
+const stepStates: Record<string, string> = {
+  waiting_for_approval: "Waiting for your Approval",
+  waiting_for_release: "Waiting for a release that contains the fix",
+  no_own_repository: "No Own repository: skipped",
+  no_safe_release: "No release without the change to pin",
+  no_package: "The Upstream link names no package to change",
+  not_drafted: "Not drafted",
+  pending: "Not validated yet",
+  ...deployedLabels,
+};
+function stepState(step: string, status: string) {
+  // A ready Remediation PR draft waits for the Approval of its diff.
+  if (step === "remediation_pr" && status === "ready")
+    return stepStates.waiting_for_approval;
+  return stepStates[status] || humanize(status);
+}
+function stepTone(step: string, status: string) {
+  if (stepState(step, status).startsWith("Waiting")) return "warm";
+  if (
+    ["verified", "validated", "ready", "merged", "serving_fix"].includes(status)
+  )
+    return "good";
+  return ["failed", "draft_failed", "before_fix"].includes(status)
+    ? "danger"
+    : "neutral";
+}
+/** The steps of the Finding's Playbook cell (A06). A step that needs Approval waits, visibly,
+ * without blocking the others. */
+function PlaybookPanel({ steps }: { steps: Finding["playbook"] }) {
+  return (
+    <Panel
+      title="Playbook"
+      description="The steps this Verdict runs. A step that needs your Approval waits without blocking the others."
+      padded
+    >
+      <DetailGrid
+        items={steps.map(({ step, status }) => [
+          stepLabels[step] || humanize(step),
+          <Badge tone={stepTone(step, status)}>
+            {stepState(step, status)}
+          </Badge>,
+        ])}
+      />
+    </Panel>
+  );
+}
+/** The Disclosure report (A06, A15) as escaped text, for the Operator to copy into the Upstream
+ * repository's GitHub private vulnerability reporting form. Asset Monitor never sends it. */
+function DisclosureReportPanel({
+  report,
+}: {
+  report: NonNullable<Finding["disclosure_report"]>;
+}) {
+  return (
+    <Panel
+      title="Disclosure report"
+      description="For the Upstream repository's maintainers: copy it into their GitHub private vulnerability reporting form. Asset Monitor never sends it."
+      actions={
+        <>
+          <CopyButton value={report.text} label="Copy the Disclosure report" />
+          {report.form_url && (
+            <ExternalLink className="secondary button" href={report.form_url}>
+              Open the reporting form
+            </ExternalLink>
+          )}
+        </>
+      }
+      padded
+    >
+      <pre className="json-view">{report.text}</pre>
+    </Panel>
   );
 }
 /** The Finding's lifecycle state, its cause and the Operator's actions on it (A11). */
@@ -1217,14 +1368,12 @@ function CleanupReportPanel({
           ],
           [
             "Releases",
-            // Containment is approximate (stored commits only), so none found is not none.
+            // From release-tag containment; null when the tags could not be read.
             report.releases?.length ? (
               <TextList items={report.releases} />
             ) : (
               <span className="muted">
-                {report.releases
-                  ? "None found among the stored commits; not ruled out"
-                  : "Unknown"}
+                {report.releases ? "No release tag contains it" : "Unknown"}
               </span>
             ),
           ],
@@ -1396,8 +1545,7 @@ const hiddenCharacters =
 const revealHidden = (text: string) =>
   text.replace(
     hiddenCharacters,
-    (c) =>
-      `⟨U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}⟩`,
+    (c) => `⟨U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}⟩`,
   );
 /** A pull request link only for an http(s) URL. */
 function pullLink(pr: RemediationPR) {
@@ -1418,10 +1566,11 @@ function RemediationPRs({
 }) {
   const [approving, setApproving] = useState<RemediationPR>();
   const rows = finding.remediation_prs;
+  const step = finding.playbook.find((s) => s.step === "remediation_pr");
   return (
     <Panel
       title="Remediation PRs"
-      description="Draft pull requests on the Own repository. Each opens only after your Approval of its exact diff, and you merge it."
+      description="Draft pull requests on the Own repository: a patch, a revert, or a dependency pin or bump. Each opens only after your Approval of its exact diff, and you merge it."
       actions={finding.remediation_actions.map((action) => (
         <ActionButton
           key={action}
@@ -1454,11 +1603,23 @@ function RemediationPRs({
       {finding.own_repository && !rows.length && (
         <Empty
           icon={GitPullRequest}
-          title="No Remediation PR drafted"
+          title={
+            step && step.status !== "not_drafted"
+              ? stepState(step.step, step.status)
+              : "No Remediation PR drafted"
+          }
           description={
-            finding.remediation_actions.length
-              ? "A Vulnerability introduced or Malicious change Verdict drafts one automatically, or draft one here."
-              : "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a patch or revert."
+            step?.status === "waiting_for_release"
+              ? "The bump is drafted once a release tag contains the fix."
+              : step?.status === "no_safe_release"
+                ? "Every known release contains the change, or the release tags could not be read."
+                : step?.status === "no_package"
+                  ? "Only an Upstream link derived from a manifest or lockfile names the packages a pin or bump changes."
+                  : finding.playbook.length && !step
+                    ? "This Verdict's Playbook has no Remediation PR."
+                    : finding.remediation_actions.length
+                      ? "Its Verdict drafts one automatically, or draft one here."
+                      : "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a patch or revert, and an exposed Upstream Verdict a pin or bump."
           }
         />
       )}

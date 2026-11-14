@@ -175,3 +175,22 @@ def test_dependency_files_pins_and_bumps_npm_and_composer():
         with pytest.raises(DomainError) as error:
             remediation.dependency_files(files, ecosystem, name, "1.0.0", "pin")
         assert error.value.code == "dependency_not_found" and error.value.status == 422
+
+
+@offline_test
+def test_dependency_files_with_a_spec_keeps_the_lock_entrys_version():
+    """A Lab installs the Locked version from a vendored tarball (A07): the manifest and the lock
+    root name the file: spec, and the lock entry keeps the version it resolves to."""
+    npm = {
+        "package.json": json.dumps({"name": "app", "dependencies": {"react": "^19.0.0"}}).encode(),
+        "package-lock.json": lock(packages={"": {"name": "app", "dependencies": {"react": "^19.0.0"}},
+                                            "node_modules/react": {"version": "19.0.0", "integrity": "sha512-old"}}),
+    }
+    spec = "file:.asset-monitor/react-19.0.0.tgz"
+    edited = remediation.dependency_files(npm, "npm", "react", "19.0.0", "pin",
+                                          {"tarball": spec, "integrity": "sha512-vendored"}, spec=spec)
+    assert json.loads(edited["package.json"])["dependencies"] == {"react": spec}
+    locked = json.loads(edited["package-lock.json"])
+    assert locked["packages"][""]["dependencies"] == {"react": spec}
+    assert locked["packages"]["node_modules/react"] == {"version": "19.0.0", "resolved": spec,
+                                                         "integrity": "sha512-vendored"}

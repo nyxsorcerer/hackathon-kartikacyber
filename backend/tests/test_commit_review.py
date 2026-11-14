@@ -15,10 +15,12 @@ from numen.worker import run_once
 TRIAGED = {"reply": json.dumps({"decision": "security_candidate", "title": "Potential path traversal", "reason": "A trust boundary changed"})}
 
 
-def prepared(system):
+def prepared(system, **source):
+    """An Application whose repository, Upstream unless `source` says otherwise, has one stored
+    commit. (Application, commit id, the Analysis profile)"""
     app, client, _ = system
     profile = connection(app)
-    monitored = application(client)
+    monitored = application(client, **source)
     ident = source_snapshot(app, monitored["id"])
     with app.state.factory.begin() as db:
         commit = db.get(Commit, ident)
@@ -90,7 +92,8 @@ def test_late_manual_review_is_not_overwritten_by_triage(system):
 @pytest.mark.parametrize("verdict,ref", [("Vulnerability fix", "f" * 40), ("Vulnerability introduced", "a" * 40)])
 def test_supported_commit_finding_publishes_a_linked_immutable_bundle(system, verdict, ref):
     app, client, config = system
-    _, ident, _ = prepared(system)
+    # An Own repository's commit: an Upstream one's Proof is never exported (A15).
+    _, ident, _ = prepared(system, role="own")
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     broker = FixtureBroker(assessment(verdict, ref=ref), pinned_bundle(ref))
     run_once(config, app.state.factory, broker)
@@ -114,7 +117,7 @@ def test_supported_commit_finding_publishes_a_linked_immutable_bundle(system, ve
     client.patch(f"/api/findings/{finding['id']}", json={"title": "Operator-reviewed title"})
     client.post(f"/api/findings/{finding['id']}/transitions", json={"state": "remediated", "reason": "Patched"})
     again = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
-    run_once(config, app.state.factory, FixtureBroker(assessment(verdict, ref=ref), {**pinned_bundle(ref), "report.md": b"# Updated review"}), exclude=("notification",))
+    run_once(config, app.state.factory, FixtureBroker(assessment(verdict, ref=ref), {**pinned_bundle(ref), "report.md": b"# Updated review"}), exclude=("notification", "patch_drafting"))
     assert client.get(f"/api/jobs/{again}").json()["result"]["finding_id"] == finding["id"]
     current = client.get(f"/api/findings/{finding['id']}").json()
     assert current["title"] == "Operator-reviewed title" and current["status"] == "remediated"
@@ -350,7 +353,7 @@ def test_analysis_reads_the_pinned_snapshot_without_a_repository_or_build(system
 
 def test_a_false_positive_finding_can_be_deleted_with_its_artifacts(system):
     app, client, config = system
-    _, ident, _ = prepared(system)
+    _, ident, _ = prepared(system, role="own")  # whose Analysis downloads (A15)
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker(assessment(), pinned_bundle()))
     job = client.get(f"/api/jobs/{queued}").json()

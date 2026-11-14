@@ -20,6 +20,7 @@ def bundle(version="1.0.0"):
         "vulnerable-app/Dockerfile": b"FROM asset-monitor-lab:0.1.0\nCOPY fixture /fixture\n",
         "vulnerable-app/compose.yaml": b"services:\n  app:\n    build: .\n",
         "vulnerable-app/README.md": b"Use the supplied local fixture",
+        "vulnerable-app/package.json": b'{"name": "fixture", "version": "1.0.0", "private": true}\n',
         "vulnerable-app/fixture": b"fixture bytes",
         "vulnerable-app/application.lock.json": json.dumps(
             {"version": version, "local_inputs": {"fixture": "immutable local bytes"}, "images": []}
@@ -49,11 +50,14 @@ def upload(client, ident, files):
     )
 
 
-def queue_cve_analysis(system, extra_config=None, body=None):
+def queue_cve_analysis(system, extra_config=None, body=None, **source):
+    """A CVE analysis queued for an Application whose one repository, Upstream unless `source`
+    says otherwise, the CVE matches. (Application, job id, the result its agent returns)"""
     app, client, _ = system
     connection(app)
     p = application(
         client,
+        **source,
         config={
             "cve_selectors": [{"type": "cpe", "value": "cpe:2.3:a:demo:plugin:*:*:*:*:*:*:*:*"}],
             "cve_min_score": 7,
@@ -83,7 +87,8 @@ def queue_cve_analysis(system, extra_config=None, body=None):
 
 def test_cve_analysis_produces_downloadable_finding_bundle_and_reuses_finding(system):
     app, client, config = system
-    p, queued, result = queue_cve_analysis(system)
+    # On an Own repository: an Upstream one's Proof is never exported (A15).
+    p, queued, result = queue_cve_analysis(system, role="own")
     broker = FixtureBroker(result, bundle())
     run_once(config, app.state.factory, broker)
     job = client.get(f"/api/jobs/{queued}").json()
@@ -170,7 +175,7 @@ def test_analysis_download_retains_drafts_and_enforces_auth_and_integrity(system
     from numen.models import Artifact
 
     app, client, config = system
-    _, queued, result = queue_cve_analysis(system)
+    _, queued, result = queue_cve_analysis(system, role="own")
     run_once(config, app.state.factory, FixtureBroker(result, {"report.md": b"# Draft evidence"}))
     job = client.get(f"/api/jobs/{queued}").json()
     assert job["status"] == "failed"
@@ -509,6 +514,186 @@ def test_a_malicious_change_never_gets_a_lab(system):
     refused = client.post(f"/api/findings/{page_id}/lab-runs", json=APPROVAL)
     assert refused.status_code == 409 and refused.json()["code"] == "lab_not_allowed"
     assert len(lab_records(app)["labs"]) == 1
+
+
+NODE_ONLY = "Labs run only Node applications: the Proof bundle needs vulnerable-app/package.json"
+
+
+def without_package(files):
+    return {path: data for path, data in files.items() if path != "vulnerable-app/package.json"}
+
+
+def automatic_bundle(system, finding_id, outputs):
+    """Runs the Finding's queued automatic Proof bundle draft (domain.draft_bundle), whose fixture
+    agent writes `outputs`, leaving every other job queued. (The job, the broker)"""
+    from numen.models import Job
+
+    app, client, config = system
+    with app.state.factory() as db:
+        (ident,) = db.scalars(select(Job.id).where(Job.kind == "finding_artifacts", Job.status == "queued",
+                                                   Job.input["finding_id"].as_string() == finding_id))
+        assert db.get(Job, ident).input["automatic"] is True
+        others = tuple(set(db.scalars(select(Job.kind).where(Job.status == "queued", Job.id != ident))))
+    broker = FixtureBroker({"summary": "Drafted for this Application's vulnerable app"}, outputs)
+    assert run_once(config, app.state.factory, broker, exclude=others)
+    return client.get(f"/api/jobs/{ident}").json(), broker
+
+
+def test_a_non_node_bundle_is_refused_before_approval(system):
+    """Labs are Node only (A07): a bundle without vulnerable-app/package.json, which its Lab does
+    not supply either, stays a Draft, and its Lab is refused before any Approval is recorded. An
+    Own-repository Proof's package.json comes from the Own repository's snapshot."""
+    from numen.models import Commit
+    from test_analysis import analyze
+    from test_commit_review import assessment, pinned_bundle
+
+    app, client, _ = system
+    connection(app)
+    row = finding(client, application(client)["id"])
+    php = {**without_package(bundle()), "vulnerable-app/index.php": b"<?php echo 1;\n"}
+    state = upload(client, row["id"], php).json()["artifact_state"]
+    assert (state["status"], state["missing"]) == ("draft", []) and NODE_ONLY in state["limitations"]
+    refused = client.post(f"/api/findings/{row['id']}/lab-runs", json=APPROVAL)
+    assert (refused.status_code, refused.json()["code"]) == (422, "incomplete_bundle")
+    records = lab_records(app)
+    assert records["labs"] == [] and records["jobs"] == []
+    assert not [a for a in records["actions"] if a["action"] == "approved"]
+    shop = application(client, asset_name="Shop", role="own", source_url="https://github.com/acme/shop")["id"]
+    ident = source_snapshot(app, shop, files={"package.json": b'{"name": "shop"}\n', "server.js": b"1;\n"})
+    with app.state.factory.begin() as db:
+        commit = db.get(Commit, ident)
+        commit.data = {**commit.data, "parent_revisions": ["f" * 40]}
+    job, _ = analyze(system, ident, assessment("Vulnerability introduced", "a" * 40),
+                     without_package(pinned_bundle("a" * 40)))
+    own = client.get(f"/api/findings/{job['result']['finding_id']}").json()
+    assert own["artifact_state"]["status"] == "complete", own["artifact_state"]
+
+
+def test_a_lab_whose_tree_contains_a_known_malicious_change_is_refused(system, local_sources):
+    """AC-A07: no job ever executes a Malicious change payload. A Lab built on the Own repository
+    is refused while the tree it builds reaches a Malicious change commit, unless the merged Cure
+    revert is in that tree; a hand revert keeps it refused. An exposed or unknown Upstream
+    Malicious change refuses it at the API, and one with no Exposure row for the Application is
+    unknown."""
+    from conftest import git_repository
+    from numen import domain
+    from numen.models import Application, Commit, Exposure, RemediationPR, Repository
+    from test_analysis import analyze
+    from test_commit_review import assessment, pinned_bundle
+
+    app, client, config = system
+    connection(app)
+    repo = git_repository(local_sources, "acme/shop")
+    repo.commit("Shop", {"package.json": '{"name": "shop"}\n', "server.js": "1;\n"})
+    loader = repo.commit("Add a loader", {"loader.js": "module.exports = 'payload';\n"})
+    repo.git("revert", "--no-edit", loader)  # by hand, through no Remediation PR
+    reverted = repo.git("rev-parse", "HEAD")
+    vulnerable = repo.commit("Serve any file", {"server.js": "2;\n"})
+    shop = application(client, asset_name="Shop", role="own", source_url="https://github.com/acme/shop")["id"]
+    ident = source_snapshot(app, shop, vulnerable, files={"package.json": b'{"name": "shop"}\n', "server.js": b"2;\n"})
+    with app.state.factory.begin() as db:
+        commit = db.get(Commit, ident)
+        commit.data = {**commit.data, "parent_revisions": [reverted]}
+        malicious = Commit(repository_id=commit.repository_id, source_generation=commit.source_generation,
+                           revision=loader, verdict="Malicious change", data={})
+        db.add(malicious)
+        db.flush()
+        malicious_id, own_id = malicious.id, commit.repository_id
+    job, _ = analyze(system, ident, assessment("Vulnerability introduced", vulnerable),
+                     without_package(pinned_bundle(vulnerable)))
+    path = f"/api/findings/{job['result']['finding_id']}/lab-runs"
+
+    def lab():
+        queued = client.post(path, json=APPROVAL)
+        assert queued.status_code == 202, queued.text
+        broker = FixtureBroker({"verified": True, "status": "verified", "exit_code": 0})
+        run_once(config, app.state.factory, broker,
+                 exclude=("notification", "detection_rule", "patch_drafting", "remediation_draft"))
+        return client.get(f"/api/jobs/{queued.json()['job_id']}").json(), broker
+
+    refused, broker = lab()
+    assert broker.calls == [] and (refused["status"], refused["error"]["code"]) == ("failed", "lab_not_allowed")
+    with app.state.factory.begin() as db:
+        cure, _ = domain.open_finding(db, db.get(Application, shop), "commit", malicious_id, "Loader", loader[:7],
+                                      {"by": "verdict", "verdict": "Malicious change", "confidence": "high"})
+        db.add(RemediationPR(application_id=shop, finding_id=cure.id, repository_id=own_id, subject=malicious_id,
+                             action="revert", status="merged", data={"merge_commit_sha": reverted}))
+    allowed, broker = lab()
+    assert allowed["status"] == "succeeded" and [call["kind"] for call in broker.calls] == ["lab"]
+    # Every Upstream Malicious change the Application is exposed to reaches the Own repository's Lab.
+    linked = client.post(f"/api/applications/{shop}/repositories",
+                         json={"source_kind": "github", "source_url": "https://github.com/numen/lib"})
+    lib = linked.json()["repository_id"]
+    with app.state.factory.begin() as db:
+        change = Commit(repository_id=lib, source_generation=db.get(Repository, lib).source_generation,
+                        revision="b" * 40, verdict="Malicious change", data={})
+        db.add(change)
+        db.flush()
+        db.add(Exposure(application_id=shop, repository_id=lib, commit_id=change.id, verdict="Malicious change",
+                        state="not_exposed", data={}))
+    assert client.post(path, json=APPROVAL).status_code == 202
+    for state in ("unknown", "exposed", None):
+        with app.state.factory.begin() as db:
+            if state:
+                db.scalar(select(Exposure)).state = state
+            else:  # such as a Verdict stored while the link was off
+                db.delete(db.scalar(select(Exposure)))
+        refused = client.post(path, json=APPROVAL)
+        assert (refused.status_code, refused.json()["code"]) == (409, "lab_not_allowed"), state
+
+
+def test_downloading_an_upstream_proof_is_refused(system):
+    """AC-A15: an Upstream Proof is never exported, by bundle, Analysis or artifact download, which
+    overrides Numen's AC-12 for Upstream Findings. Reports stay readable in the page, and an Own
+    Finding still downloads."""
+    from numen.models import Artifact
+    from test_analysis import analyze
+    from test_commit_review import assessment, pinned_bundle, prepared
+
+    app, client, config = system
+    _, ident, _ = prepared(system)  # a commit of the Upstream repository demo/plugin
+    job, _ = analyze(system, ident, assessment(), pinned_bundle())
+    upstream = client.get(f"/api/findings/{job['result']['finding_id']}").json()
+    (analysis,) = client.get(f"/api/commits/{ident}").json()["analyses"]
+    assert (upstream["exportable"], analysis["exportable"]) == (False, False)
+    # Its approved Lab's artifacts are part of the Proof.
+    assert client.post(f"/api/findings/{upstream['id']}/lab-runs", json=APPROVAL).status_code == 202
+    run_once(config, app.state.factory, FixtureBroker({"verified": False, "status": "not_reproduced"},
+                                                      {"lab-output.txt": b"observed"}), exclude=("notification",))
+    # So is a cve Finding on an Upstream source repository, and its CVE analysis.
+    _, queued, result = queue_cve_analysis(system, asset_name="CMS", source_url="https://github.com/demo/cms")
+    run_once(config, app.state.factory, FixtureBroker(result, bundle()), exclude=("notification",))
+    cve = client.get(f"/api/jobs/{queued}").json()["result"]
+    assert client.get(f"/api/findings/{cve['finding_id']}").json()["exportable"] is False
+    with app.state.factory() as db:
+        (lab,) = db.scalars(select(Artifact.id).where(Artifact.resource_type == "lab", Artifact.path == "lab-output.txt"))
+    files = {a["path"]: a["id"] for a in upstream["artifacts"]}
+    proof = {a["path"]: a["id"] for a in analysis["artifacts"]}
+    for url in (f"/api/findings/{upstream['id']}/download", f"/api/analyses/{analysis['id']}/download",
+                f"/api/artifacts/{files['poc.py']}/content", f"/api/artifacts/{proof['poc.py']}/content",
+                f"/api/artifacts/{files['vulnerable-app/Dockerfile']}/content", f"/api/artifacts/{lab}/content",
+                f"/api/artifacts/{files['vulnerable-app/README.md']}/content",
+                f"/api/findings/{cve['finding_id']}/download", f"/api/analyses/{cve['analysis_id']}/download"):
+        refused = client.get(url)
+        assert (refused.status_code, refused.json()["code"]) == (403, "upstream_proof_not_exported"), url
+    for report in (files["report.md"], proof["report.md"]):
+        assert client.get(f"/api/artifacts/{report}/content").content == pinned_bundle()["report.md"]
+    # An Own Finding's bundle and Analysis still download.
+    shop = application(client, asset_name="Shop", role="own", source_url="https://github.com/acme/shop")["id"]
+    own_commit = source_snapshot(app, shop)
+    with app.state.factory.begin() as db:
+        from numen.models import Commit
+
+        row = db.get(Commit, own_commit)
+        row.data = {**row.data, "parent_revisions": ["f" * 40]}
+    job, _ = analyze(system, own_commit, assessment(), pinned_bundle())
+    own = client.get(f"/api/findings/{job['result']['finding_id']}").json()
+    assert own["exportable"] is True
+    for url in (f"/api/findings/{own['id']}/download", f"/api/analyses/{job['result']['analysis_id']}/download"):
+        downloaded = client.get(url)
+        assert (downloaded.status_code, downloaded.headers["content-type"]) == (200, "application/zip"), url
+    poc = next(a["id"] for a in own["artifacts"] if a["path"] == "poc.py")
+    assert client.get(f"/api/artifacts/{poc}/content").content == pinned_bundle()["poc.py"]
 
 
 def test_paths_archives_and_configured_secrets_rejected(system):

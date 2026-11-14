@@ -169,3 +169,48 @@ it("retries a failed preview and lets the reader inspect Markdown source", async
     screen.queryByRole("heading", { name: "Saved report" }),
   ).not.toBeInTheDocument();
 });
+
+it("never offers an Upstream Proof for download and previews only its reports (A15)", async () => {
+  const fetch = vi.fn(
+    async (url: string) =>
+      new Response(url.includes("/report/") ? "# Upstream report" : "print()"),
+  );
+  vi.stubGlobal("fetch", fetch);
+  render(
+    <ArtifactBrowser
+      exportable={false}
+      artifacts={[
+        { id: "report", path: "report.md", size: 40, sha256: "a".repeat(64) },
+        { id: "poc", path: "poc.py", size: 20, sha256: "b".repeat(64) },
+        {
+          id: "readme",
+          path: "vulnerable-app/README.md",
+          size: 20,
+          sha256: "c".repeat(64),
+        },
+      ]}
+    />,
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Upstream report" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("link", { name: "Download file" }),
+  ).not.toBeInTheDocument();
+  const user = userEvent.setup();
+  // Only its reports: not even the bundle's Markdown README is read.
+  for (const name of ["poc.py", "vulnerable-app/README.md"]) {
+    await user.click(screen.getByRole("button", { name }));
+    expect(
+      await screen.findByText(
+        "Upstream Proofs are never exported, so only their reports are shown.",
+      ),
+    ).toBeInTheDocument();
+  }
+  expect(
+    screen.queryByRole("link", { name: "Download file" }),
+  ).not.toBeInTheDocument();
+  expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+    "/api/artifacts/report/content",
+  ]);
+});

@@ -855,14 +855,14 @@ it("names the failed Detection rule check and keeps the artifacts Draft", async 
   );
 });
 
-it("never shows releases none of the stored commits had as none", async () => {
+it("says when no release tag contains the change", async () => {
   showFinding({
     ...malicious,
     cleanup_report: { ...malicious.cleanup_report, releases: [] },
   });
   const report = await screen.findByRole("region", { name: "Cleanup report" });
   expect(within(report).getByText("Releases").closest("div")).toHaveTextContent(
-    "None found among the stored commits; not ruled out",
+    "No release tag contains it",
   );
 });
 
@@ -912,6 +912,227 @@ it("offers no Lab and no generation for a Malicious change Finding", async () =>
   expect(
     screen.queryByRole("region", { name: "Static Proof" }),
   ).not.toBeInTheDocument();
+});
+
+// A06 and A15: an exposed Upstream Vulnerability introduced Finding, whose Lab waits for an
+// Approval while its pin draft is ready, and whose Disclosure report is shown for copying only.
+const disclosure =
+  "# Unchecked module path in index.js\n<script>alert('report')</script>\n";
+const upstreamFinding = {
+  ...detail,
+  source_commit_id: "commit-1",
+  cause: { by: "verdict", verdict: "Vulnerability introduced", at },
+  lab_runs: [],
+  playbook: [
+    { step: "proof", status: "waiting_for_approval" },
+    { step: "disclosure_report", status: "ready" },
+    { step: "remediation_pr", status: "ready" },
+  ],
+  exposure: {
+    application_id: "application",
+    application_name: null,
+    verdict: "Vulnerability introduced",
+    state: "exposed",
+    reason: "v1.1.0 contains the commit",
+    locked_version: "1.1.0",
+    tag: "v1.1.0",
+    target: { tag: "v1.0.0", version: "1.0.0" },
+  },
+  disclosure_report: {
+    text: disclosure,
+    form_url: "https://github.com/numen/lib/security/advisories/new",
+  },
+  own_repository: true,
+  remediation_actions: ["pin"],
+  remediation_prs: [],
+};
+
+it("shows the Playbook steps, the Disclosure report as text to copy and the Exposure", async () => {
+  const { container, unmount } = showFinding(upstreamFinding);
+  const playbook = await screen.findByRole("region", { name: "Playbook" });
+  const state = (step: string) =>
+    within(playbook).getByText(step, { selector: "dt" }).nextElementSibling;
+  expect(state("Proof")).toHaveTextContent("Waiting for your Approval");
+  expect(state("Disclosure report")).toHaveTextContent("Ready");
+  expect(state("Remediation PR")).toHaveTextContent(
+    "Waiting for your Approval",
+  );
+  // The Disclosure report is text: the markup in it is never rendered.
+  const report = screen.getByRole("region", { name: "Disclosure report" });
+  expect(report.querySelector("pre")?.textContent).toBe(disclosure);
+  expect(container.querySelector("script")).toBeNull();
+  expect(report).toHaveTextContent("Asset Monitor never sends it");
+  expect(
+    within(report).getByRole("button", { name: "Copy the Disclosure report" }),
+  ).toBeInTheDocument();
+  expect(
+    within(report).getByRole("link", { name: /Open the reporting form/ }),
+  ).toHaveAttribute(
+    "href",
+    "https://github.com/numen/lib/security/advisories/new",
+  );
+  const exposure = screen.getByRole("region", {
+    name: "Remote target exposure",
+  });
+  expect(
+    within(exposure).getByText("Exposure", { selector: "dt" })
+      .nextElementSibling,
+  ).toHaveTextContent("Exposed v1.1.0 contains the commit");
+  expect(within(exposure).getByText("1.1.0 (tag v1.1.0)")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Start Lab" })).toBeEnabled();
+  unmount();
+  // A bump that waits for a release, and a step skipped without an Own repository.
+  showFinding({
+    ...upstreamFinding,
+    cause: { by: "verdict", verdict: "Vulnerability fix", at },
+    playbook: [
+      { step: "proof", status: "verified" },
+      { step: "remediation_pr", status: "waiting_for_release" },
+    ],
+    disclosure_report: null,
+    remediation_actions: [],
+  });
+  const panel = await screen.findByRole("region", { name: "Remediation PRs" });
+  expect(
+    within(panel).getByText("Waiting for a release that contains the fix"),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("region", { name: "Disclosure report" }),
+  ).not.toBeInTheDocument();
+});
+
+it("offers no Lab for an Own-repository Vulnerability fix and skips Upstream steps without an Own repository", async () => {
+  const { unmount } = showFinding({
+    ...detail,
+    cause: { by: "verdict", verdict: "Vulnerability fix", at },
+    playbook: [
+      { step: "report", status: "ready" },
+      { step: "deployed_version_check", status: "unknown" },
+    ],
+    own_repository: true,
+  });
+  const playbook = await screen.findByRole("region", { name: "Playbook" });
+  expect(
+    within(playbook).getByText("Deployed version check"),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("region", { name: "Lab" })).not.toBeInTheDocument();
+  expect(screen.queryByText(/^Lab /)).not.toBeInTheDocument();
+  expect(
+    within(screen.getByRole("region", { name: "Remediation PRs" })).getByText(
+      "This Verdict's Playbook has no Remediation PR.",
+    ),
+  ).toBeInTheDocument();
+  unmount();
+  showFinding({
+    ...upstreamFinding,
+    playbook: [
+      { step: "proof", status: "draft" },
+      { step: "disclosure_report", status: "missing" },
+      { step: "remediation_pr", status: "no_own_repository" },
+    ],
+    own_repository: false,
+    remediation_actions: [],
+  });
+  const steps = await screen.findByRole("region", { name: "Playbook" });
+  expect(
+    within(steps).getByText("No Own repository: skipped"),
+  ).toBeInTheDocument();
+});
+
+it("shows what the Deployed version check reports, never a guess", async () => {
+  const ownFix = (state: string, reason: string) => ({
+    ...detail,
+    cause: { by: "verdict", verdict: "Vulnerability fix", at },
+    deployed_version: state,
+    deployed_version_check: { state, version: "1.0.0", reason },
+    playbook: [
+      { step: "report", status: "ready" },
+      { step: "deployed_version_check", status: state },
+    ],
+    own_repository: true,
+  });
+  const cases = [
+    ["before_fix", "Still serving code from before the fix"],
+    ["serving_fix", "Serving the fix"],
+    ["unknown", "Unknown"],
+  ];
+  for (const [state, label] of cases) {
+    const { unmount } = showFinding(ownFix(state, `reason for ${state}`));
+    const exposure = await screen.findByRole("region", {
+      name: "Remote target exposure",
+    });
+    expect(
+      within(exposure).getByText("Deployed version", { selector: "dt" })
+        .nextElementSibling,
+    ).toHaveTextContent(`${label} reason for ${state}`);
+    const playbook = screen.getByRole("region", { name: "Playbook" });
+    expect(
+      within(playbook).getByText("Deployed version check", { selector: "dt" })
+        .nextElementSibling,
+    ).toHaveTextContent(label);
+    unmount();
+  }
+});
+
+it("lists a Malicious change with its static Proof, not a Lab badge", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            items: [{ ...summary, malicious_change: true, lab_status: null }],
+            next_cursor: null,
+          }),
+        ),
+    ),
+  );
+  render(
+    <MemoryRouter>
+      <FindingsList />
+    </MemoryRouter>,
+  );
+  expect(
+    await screen.findByRole("link", { name: summary.title }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Static Proof")).toBeInTheDocument();
+  expect(screen.queryByText(/^Lab /)).not.toBeInTheDocument();
+});
+
+it("offers no download of an Upstream Proof (A15)", async () => {
+  const files = [
+    { id: "report", path: "report.md", size: 30, sha256: "a".repeat(64) },
+    { id: "poc", path: "poc.py", size: 30, sha256: "b".repeat(64) },
+  ];
+  const fetch = vi.fn(async (url: string) =>
+    url.startsWith("/api/artifacts/")
+      ? new Response("# Upstream report")
+      : new Response(
+          JSON.stringify(
+            url.startsWith("/api/applications/")
+              ? application
+              : { ...upstreamFinding, exportable: false, artifacts: files },
+          ),
+        ),
+  );
+  vi.stubGlobal("fetch", fetch);
+  render(
+    <MemoryRouter initialEntries={["/findings/finding"]}>
+      <Routes>
+        <Route path="/findings/:id" element={<FindingDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Upstream report" }),
+  ).toBeInTheDocument();
+  expect(screen.queryAllByText(/Download/)).toEqual([]);
+  expect(
+    document.querySelector('a[href*="/download"], a[href*="/content"]'),
+  ).toBeNull();
+  expect(fetch.mock.calls.map(([url]) => url)).not.toContain(
+    "/api/artifacts/poc/content",
+  );
 });
 
 // A08: a ready patch whose diff carries markup, the Approval it needs, and the PR it opened.
@@ -1177,7 +1398,8 @@ it("drafts a Remediation PR by hand and shows why a step failed", async () => {
 
 it("shows a diff's bidi and zero-width characters as visible escapes", async () => {
   // Trojan Source: the comment's right-to-left override hides where the code really ends.
-  const tricky = "+check(user); /* \u202E } \u2066if (admin)\u2069 \u202C */\u200B\n";
+  const tricky =
+    "+check(user); /* \u202E } \u2066if (admin)\u2069 \u202C */\u200B\n";
   serveRemediation(
     { ...remediable, remediation_prs: [{ ...draft, diff: diff + tricky }] },
     accepted,

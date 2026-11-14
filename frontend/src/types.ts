@@ -210,6 +210,8 @@ export const analysisSchema = z
     report: z.string().optional(),
     result: analysisResultSchema.optional(),
     artifacts: z.array(artifactSchema).optional(),
+    /** False for an Upstream Proof, which is never exported (A15): only its reports are shown. */
+    exportable: z.boolean().optional(),
   })
   .passthrough();
 export type Analysis = z.infer<typeof analysisSchema>;
@@ -227,6 +229,33 @@ const commitFileSchema = z.union([
   }),
 ]);
 export type CommitFile = z.infer<typeof commitFileSchema>;
+/** An Application's Exposure to an Upstream Verdict (A05), from release-tag containment. */
+export const exposureSchema = z.object({
+  application_id: z.string(),
+  application_name: z.string().nullable().optional(),
+  verdict: z.string(),
+  /** unknown counts as exposed. */
+  state: z.enum(["exposed", "not_exposed", "unknown"]),
+  reason: z.string().nullable().optional(),
+  locked_version: z.string().nullable().optional(),
+  tag: z.string().nullable().optional(),
+  /** The release a pin or bump moves to. */
+  target: z
+    .object({ tag: z.string(), version: z.string() })
+    .nullable()
+    .optional(),
+});
+export type Exposure = z.infer<typeof exposureSchema>;
+export const exposureLabels: Record<Exposure["state"], string> = {
+  exposed: "Exposed",
+  not_exposed: "Not exposed",
+  unknown: "Unknown (counts as exposed)",
+};
+export const exposureTones: Record<Exposure["state"], string> = {
+  exposed: "danger",
+  not_exposed: "good",
+  unknown: "warm",
+};
 export const commitSchema = z.object({
   id: z.string(),
   repository_id: z.string().optional(),
@@ -275,6 +304,8 @@ export const commitSchema = z.object({
       }),
     )
     .default([]),
+  /** Each Application's Exposure to this Upstream Verdict, not-exposed ones included (A05). */
+  exposures: z.array(exposureSchema).default([]),
 });
 export type Commit = z.infer<typeof commitSchema>;
 /** One decision applied to many revisions; `previous` lets the change be undone. */
@@ -440,8 +471,19 @@ export const findingSchema = z.object({
   status: z.enum(["open", "confirmed", "dismissed", "remediated"]),
   /** Who or what set the current status, and when. */
   cause: unknownRecord.nullable().optional(),
-  /** Shown apart from the lifecycle; unknown until a Deployed version check exists. */
+  /** Shown apart from the lifecycle: before_fix, serving_fix or unknown (A06). */
   deployed_version: z.string().default("unknown"),
+  /** The last Deployed version check of an Own-repository Vulnerability fix. */
+  deployed_version_check: z
+    .object({
+      state: z.string(),
+      version: z.string().nullable().optional(),
+      reason: z.string().nullable().optional(),
+      observation_id: z.string().nullable().optional(),
+      checked_at: z.string().optional(),
+    })
+    .nullable()
+    .optional(),
   // Findings created by a commit analysis may not record version ranges yet.
   affected_versions: z.array(z.union([z.string(), unknownRecord])).default([]),
   fixed_versions: z.array(z.union([z.string(), unknownRecord])).default([]),
@@ -458,14 +500,27 @@ export const findingSchema = z.object({
     vulnerable_version: z.string().nullable(),
   }),
   artifacts: z.array(artifactSchema),
+  /** False for an Upstream Finding, whose Proof is never exported (A15). */
+  exportable: z.boolean().default(true),
   lab_runs: z.array(unknownRecord),
   /** A Malicious change never runs: no Lab and no Lab bundle generation (ADR-0004). */
   malicious_change: z.boolean().default(false),
   static_proof: staticProofSchema.nullable().optional(),
   cleanup_report: cleanupReportSchema.nullable().optional(),
+  /** The steps of the Finding's A06 Playbook cell and where each stands; [] without a cell. */
+  playbook: z
+    .array(z.object({ step: z.string(), status: z.string() }))
+    .default([]),
+  /** Its Application's Exposure to the Upstream commit that opened it. */
+  exposure: exposureSchema.nullable().optional(),
+  /** Shown for the Operator to copy into the Upstream repository's reporting form; never sent. */
+  disclosure_report: z
+    .object({ text: z.string(), form_url: z.string().nullable() })
+    .nullable()
+    .optional(),
   /** Without one, the Remediation PR steps are skipped (A06). */
   own_repository: z.boolean().default(false),
-  /** The drafts the Operator may start by hand: patch and/or revert. */
+  /** The drafts the Operator may start by hand: patch and/or revert, or a pin or bump. */
   remediation_actions: z.array(z.string()).default([]),
   remediation_prs: z.array(remediationPRSchema).default([]),
   created_at: z.string(),
@@ -483,6 +538,7 @@ export const findingSummarySchema = findingSchema
     status: true,
     cause: true,
     deployed_version: true,
+    malicious_change: true,
     affected_versions: true,
     fixed_versions: true,
     target_applicability: true,

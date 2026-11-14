@@ -90,6 +90,9 @@ from .security import (
 from .queue import RUNTIME_EVENTS, runtime_phases
 from .workflows import all_secrets
 
+# The only artifacts of an Upstream Proof the page may read (A15): its report and Disclosure report.
+REPORTS = ("report.md", "disclosure-report.md")
+
 
 def accepted(job):
     return JSONResponse({"job_id": job.id, "status_url": f"/api/jobs/{job.id}"}, status_code=202)
@@ -212,8 +215,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
     def commit_page(db):
         def mapper(page):
-            findings = domain.commit_findings(db, [c.id for c in page])
-            return lambda c: domain.commit_json(db, c, findings)
+            ids = [c.id for c in page]
+            findings, exposures = domain.commit_findings(db, ids), domain.commit_exposures(db, ids)
+            return lambda c: domain.commit_json(db, c, findings, exposures)
 
         return mapper
 
@@ -448,10 +452,13 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 raise DomainError(
                     "invalid_recipe", "Recipe must belong to this Application's source", 422
                 )
+        restored = row.archived and not data["archived"]
         for name, value in data.items():
             setattr(row, name, value)
         row.next_check_at = now() if row.monitor_enabled and not row.archived else None
         action(db, "application", row.id, {"action": "updated"})
+        for _, repository in domain.links(db, row) if restored else ():
+            domain.queue_exposure(db, row, repository)  # Verdicts stored while it was archived (A05)
         for linked in db.scalars(select(ApplicationCVE).where(ApplicationCVE.application_id == row.id)):
             domain.refresh_cve_policy(db, row, domain.get(db, CVE, linked.cve_id), linked)
         return domain.application_json(db, row)
@@ -515,9 +522,11 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 domain.repository_input(repository),
                 idempotency_key=f"derive:{application.id}:{repository.cursor}",
             )
-        return changed_link(
+        linked = changed_link(
             db, application, link, previous, {"action": "repository_added", "role": body.role}
         )
+        domain.queue_exposure(db, application, repository)  # an Upstream link, new or restored (A05)
+        return linked
 
     @router.patch("/applications/{ident}/repositories/{repository_id}")
     def patch_repository(
@@ -526,17 +535,23 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         application = domain.get(db, Application, ident)
         link = application_link(db, ident, repository_id)
         previous = domain.source_repository(db, application)
+        turned_on = body.enabled and not link.enabled
         if body.enabled is not None:
             link.enabled = body.enabled
             if body.enabled and application.monitor_enabled and not application.archived:
                 application.next_check_at = now()  # a link turned on gets its Baseline now
+        relocked = "locked_version" in body.model_fields_set and link.locked_version != (body.locked_version or None)
         if "locked_version" in body.model_fields_set:
             link.locked_version = body.locked_version or None
             link.locked_version_source = "operator" if link.locked_version else None
-        return changed_link(
+        changed = changed_link(
             db, application, link, previous,
             {"action": "repository_updated", "changes": body.model_dump(exclude_unset=True)},
         )
+        if relocked or turned_on:
+            # A05: a Locked version changed, or a link turned on missed the Verdicts stored while it was off.
+            domain.queue_exposure(db, application, db.get(Repository, repository_id))
+        return changed
 
     @router.delete("/applications/{ident}/repositories/{repository_id}")
     def remove_repository(ident: str, repository_id: str, db=database_dependency):
@@ -1221,8 +1236,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
 
     @router.post("/findings/{ident}/remediation-prs")
     def draft_remediation_pr(ident: str, body: RemediationDraftInput, db=database_dependency):
-        """The Operator drafts a patch or revert Remediation PR by hand (A08), such as again after a
-        failed draft. Like a manual Analysis it is neither capped nor counted."""
+        """The Operator drafts a Remediation PR by hand (A08), such as again after a failed draft:
+        a patch or revert on an Own-repository commit, a pin or bump for an Upstream one. Like a
+        manual Analysis it is neither capped nor counted."""
         finding = domain.get(db, Finding, ident)
         application = domain.get(db, Application, finding.application_id)
         actions = domain.remediation_actions(db, finding)
@@ -1230,13 +1246,18 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             raise DomainError("remediation_unavailable", (
                 "No Own repository: Remediation PR steps are skipped"
                 if domain.own_repository(db, application) is None
-                else "A Malicious change gets a revert (the Cure), not a patch"
+                else f"This Finding's Playbook drafts a {' or a '.join(actions)}, not a {body.action}"
                 if actions
                 else "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a "
-                "patch or revert"
+                "patch or revert, and an exposed Upstream Verdict a pin or bump once its release is known"
             ), 422)
         commit = db.get(Commit, finding.data["source_commit_id"])
+        dependency = None
+        if body.action in ("pin", "bump"):
+            dependency = domain.upstream_dependency(db, application, db.get(Repository, commit.repository_id),
+                                                    domain.finding_exposure(db, finding).data["target"])
         row = domain.draft_remediation(db, application, finding, commit.id, body.action, commit.revision,
+                                       dependency=dependency,
                                        submitted=body.profile.model_dump() if body.profile else None)
         return accepted(db.get(Job, row.data["job_id"]))
 
@@ -1286,12 +1307,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     ):
         approval(request, db, body.password)
         finding = domain.get(db, Finding, ident)
-        if domain.malicious_change(db, finding):
-            raise DomainError(
-                "lab_not_allowed",
-                "A Malicious change never runs: its Proof is static, so it has no Lab",
-                409,
-            )
+        domain.require_lab(db, finding)
         files = (
             artifacts.resource_files(
                 db, config.artifact_root, "finding", ident, finding.artifact_revision
@@ -1299,7 +1315,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             if finding.artifact_revision
             else {}
         )
-        if artifacts.completeness(files)["status"] != "complete":
+        if artifacts.completeness(files, domain.lab_supplied(db, finding))["status"] != "complete":
             raise DomainError(
                 "incomplete_bundle",
                 "Complete and pin all required artifacts before verification",
@@ -1334,9 +1350,16 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             })
         return accepted(job)
 
+    def exported(db, resource_type, ident):
+        """Refuses the export of an Upstream Proof (A15), overriding Numen's AC-12 for it."""
+        if not domain.exportable(db, resource_type, ident):
+            raise DomainError("upstream_proof_not_exported", "Upstream Proofs are never exported (A15)", 403)
+
     @router.get("/artifacts/{ident}/content")
     def artifact_content(ident: str, db=database_dependency):
         row = domain.get(db, Artifact, ident)
+        if row.path not in REPORTS:  # Reports stay readable in the page; nothing else of an Upstream Proof.
+            exported(db, row.resource_type, row.resource_id)
         content = artifacts.read_file(config.artifact_root, row)
         filename = Path(row.path).name.replace('"', "")
         return Response(
@@ -1354,6 +1377,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     @router.get("/analyses/{ident}/download")
     def download_analysis(ident: str, db=database_dependency):
         row = domain.get(db, Analysis, ident)
+        exported(db, "analysis", row.id)
         filename = f"{row.subject_id}-{row.id[:8]}-analysis.zip"
         return Response(
             artifacts.resource_zip(db, config.artifact_root, "analysis", row.id),
@@ -1371,6 +1395,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     @router.get("/findings/{ident}/download")
     def download(ident: str, db=database_dependency):
         row = domain.get(db, Finding, ident)
+        exported(db, "finding", row.id)
         return Response(
             artifacts.bundle_zip(db, config.artifact_root, row),
             media_type="application/zip",

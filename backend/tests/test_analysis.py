@@ -14,9 +14,9 @@ from test_audit_context import add_context, events
 from test_commit_review import assessment, pinned_bundle, prepared
 from test_triage import record, reply, triage
 from test_workflows import cve_raw, seed_cve
-from numen import domain
+from numen import artifacts, domain
 from numen.api import create_app
-from numen.models import CVE, Account, Action, Application, ApplicationCVE, Commit, Finding, Job, now
+from numen.models import CVE, Account, Action, Application, ApplicationCVE, Artifact, Commit, Finding, Job, now
 from numen.sources import Sources
 from numen.schemas import SERVED_CONTENT_VERDICTS, VERDICTS
 from numen.security import DomainError
@@ -37,10 +37,10 @@ def analyze(system, ident, result, outputs):
     app, client, config = system
     queued = client.post(f"/api/commits/{ident}/analyses", json={}).json()["job_id"]
     broker = FixtureBroker(result, outputs)
-    # Alerts, the Detection rule validations a Malicious change queues and the Remediation PR drafts
-    # an Own-repository Verdict queues stay queued.
+    # Alerts, the Detection rule validations a Malicious change queues, and the Remediation PR and
+    # Proof bundle drafts a Playbook queues stay queued.
     run_once(config, app.state.factory, broker,
-             exclude=("notification", "detection_rule", "patch_drafting", "remediation_draft"))
+             exclude=("notification", "detection_rule", "patch_drafting", "remediation_draft", "finding_artifacts"))
     return client.get(f"/api/jobs/{queued}").json(), broker
 
 
@@ -120,7 +120,7 @@ def test_a_malicious_change_must_return_indicators_and_reachable_secrets():
 
 
 def test_malicious_change_publishes_its_static_proof_and_cleanup_report_to_the_finding(system):
-    _, client, _ = system
+    app, client, config = system
     _, ident, _ = prepared(system)
     rule = b"rule loader { strings: $a = \"str(value)\" condition: $a }"
     drafts = {"report.md": b"# A postinstall loader", "detection-rule.yar": rule}
@@ -144,7 +144,10 @@ def test_malicious_change_publishes_its_static_proof_and_cleanup_report_to_the_f
     assert (proof["analysis_id"], proof["artifact_revision"]) == (job["result"]["analysis_id"], finding["artifact_revision"])
     assert proof["files"] == ["detection-rule.yar", "indicators.json", "report.md"]
     (indicators,) = [a for a in finding["artifacts"] if a["path"] == "indicators.json"]
-    published = json.loads(client.get(f"/api/artifacts/{indicators['id']}/content").content)
+    # The commit is an Upstream repository's, whose static Proof is never exported (A15).
+    assert client.get(f"/api/artifacts/{indicators['id']}/content").status_code == 403
+    with app.state.factory() as db:
+        published = json.loads(artifacts.read_file(config.artifact_root, db.get(Artifact, indicators["id"])))
     assert published == proof["indicators"] and published["files"][0]["path"] == "main.py"
     report = finding["cleanup_report"]
     assert report["secrets"] == ["The npm publish token in ~/.npmrc"]

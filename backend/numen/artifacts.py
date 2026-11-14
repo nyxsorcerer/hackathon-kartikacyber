@@ -42,7 +42,7 @@ LAB_BASE = re.compile(r"(?:asset-monitor-lab:0\.1\.0|scratch)(?: AS [a-zA-Z][a-z
 LAB_DOCKERFILE_BYTES = 262144  # The verifier's own bound on the file it parses.
 # Findings cache their artifact state; a cache made under other rules is read again. Bump this
 # whenever completeness() changes what it accepts.
-RULES = 2
+RULES = 3
 
 
 def dockerfile_instructions(text):
@@ -207,7 +207,7 @@ def resource_files(db, root, resource_type, resource_id, revision=None):
     return {a.path: read_file(root, a) for a in db.scalars(stmt)}
 
 
-def resource_completeness(db, root, resource_type, resource_id, revision):
+def resource_completeness(db, root, resource_type, resource_id, revision, supplied=()):
     conditions = (
         Artifact.resource_type == resource_type,
         Artifact.resource_id == resource_id,
@@ -226,12 +226,17 @@ def resource_completeness(db, root, resource_type, resource_id, revision):
         )
     )
     files.update({row.path: read_file(root, row) for row in declarations})
-    return completeness(files)
+    return completeness(files, supplied)
 
 
-def completeness(files):
+def completeness(files, supplied=()):
+    """The bundle's artifact state (AC-12): complete, or draft with what is missing and the
+    limitations the Lab would refuse. `supplied` are the vulnerable-app/ paths its Lab adds
+    (domain.lab_supplied), which a Dockerfile may COPY and which may hold package.json."""
     missing = [path for path in REQUIRED if path not in files or not files[path]]
     limitations = []
+    if "vulnerable-app/package.json" not in files and "vulnerable-app/package.json" not in supplied:
+        limitations.append("Labs run only Node applications: the Proof bundle needs vulnerable-app/package.json")
     lock = {}
     if "vulnerable-app/application.lock.json" in files:
         try:
@@ -326,7 +331,8 @@ def completeness(files):
                     if part in (".", "./") or any(c in part for c in "*?["):
                         continue
                     source = "vulnerable-app/" + part.removeprefix("./").rstrip("/")
-                    if source not in files and not any(p.startswith(source + "/") for p in files):
+                    if source not in files and source not in supplied and not any(
+                            p.startswith(source + "/") for p in (*files, *supplied)):
                         limitations.append("A Dockerfile COPY source is missing from the bundle")
         if not bases:
             limitations.append("Dockerfile lacks a pinned base")

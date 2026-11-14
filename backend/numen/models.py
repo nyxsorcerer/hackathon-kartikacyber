@@ -318,6 +318,25 @@ class RemediationPR(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class Exposure(Base):
+    """Whether an Upstream Verdict on a commit reaches an Application (A05), from tag containment at
+    its Locked version. A not-exposed one is recorded here only: it opens no Finding."""
+
+    __tablename__ = "exposures"
+    __table_args__ = (UniqueConstraint("application_id", "commit_id"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    repository_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"))
+    commit_id: Mapped[str] = mapped_column(ForeignKey("commits.id"))
+    verdict: Mapped[str] = mapped_column(String)
+    # exposed, not_exposed or unknown (which counts as exposed)
+    state: Mapped[str] = mapped_column(String)
+    # reason, locked_version, tag, target ({tag, version} a pin or bump would move to, or None),
+    # analysis_id
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
 class Job(Base):
     __tablename__ = "jobs"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)

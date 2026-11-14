@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { Reviews, CommitDetail } from "./Commits";
+import { AnalysisResult } from "../components/AnalysisResult";
 
 afterEach(() => vi.unstubAllGlobals());
 const applications = ["alpha", "beta"].map((id) => ({
@@ -524,6 +525,62 @@ it("links a Verdict to the Findings it opened and was linked to", async () => {
   );
 });
 
+it("lists each Application's Exposure, a not-exposed one with its reason", async () => {
+  const commit = {
+    ...records[0],
+    verdict: "Vulnerability fix",
+    exposures: [
+      {
+        application_id: "alpha",
+        application_name: "Shop",
+        verdict: "Vulnerability fix",
+        state: "exposed",
+        reason: "v19.0.0 does not contain the fix",
+        locked_version: "19.0.0",
+        tag: "v19.0.0",
+        target: { tag: "v19.0.1", version: "19.0.1" },
+      },
+      {
+        application_id: "beta",
+        application_name: "Blog",
+        verdict: "Vulnerability fix",
+        state: "not_exposed",
+        reason: "v19.0.1 contains the fix",
+        locked_version: "19.0.1",
+        tag: "v19.0.1",
+        target: { tag: "v19.0.1", version: "19.0.1" },
+      },
+    ],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string) => {
+      const body =
+        url === "/api/commits/alpha-commit"
+          ? commit
+          : url === "/api/applications/alpha"
+            ? applications[0]
+            : { items: [commit], next_cursor: null };
+      return new Response(JSON.stringify(body));
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={["/commits/alpha-commit"]}>
+      <Routes>
+        <Route path="/commits/:id" element={<CommitDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  const exposure = (
+    await screen.findByText("Exposure", { selector: "dt" })
+  ).closest("div")!;
+  const [shop, blog] = within(exposure).getAllByRole("listitem");
+  expect(shop).toHaveTextContent(
+    "Shop Exposed v19.0.0 does not contain the fix",
+  );
+  expect(blog).toHaveTextContent("Blog Not exposed v19.0.1 contains the fix");
+});
+
 it("queues a detailed analysis for each selected revision and reports skipped ones", async () => {
   const profile = {
     agent: "codex",
@@ -854,4 +911,46 @@ it("shows an Analysis that is queued, waits for a cap, timed out, or was blocked
       "Automated runs use only Provider accounts that hold an API key",
     ),
   ).toBeInTheDocument();
+});
+
+it("offers no download of an Upstream commit's Analysis (A15)", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async () => new Response("# Upstream analysis report")),
+  );
+  render(
+    <MemoryRouter>
+      <AnalysisResult
+        kind="commit"
+        analysis={{
+          id: "upstream-run",
+          exportable: false,
+          result: { verdict: "Vulnerability fix" },
+          artifacts: [
+            {
+              id: "report",
+              path: "report.md",
+              size: 30,
+              sha256: "a".repeat(64),
+            },
+            { id: "poc", path: "poc.py", size: 30, sha256: "b".repeat(64) },
+          ],
+        }}
+      />
+    </MemoryRouter>,
+  );
+  expect(
+    await screen.findByRole("heading", { name: "Upstream analysis report" }),
+  ).toBeInTheDocument();
+  for (const name of [
+    "Download analysis bundle",
+    "Download PoC",
+    "Download file",
+  ])
+    expect(screen.queryByRole("link", { name })).not.toBeInTheDocument();
+  // Its report stays readable, and downloadable as a report.
+  expect(screen.getByRole("link", { name: "Download report" })).toHaveAttribute(
+    "href",
+    "/api/artifacts/report/content",
+  );
 });

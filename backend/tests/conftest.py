@@ -1,6 +1,8 @@
 import base64
 import hashlib
 import json
+import os
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -15,6 +17,62 @@ from numen.models import Account, Commit, Application, Repository, Setting, Snap
 from numen.artifacts import publish
 
 REPOSITORY_FIELDS = ("role", "source_kind", "source_url", "source_ref", "source_path", "plugin_slug", "locked_version")
+
+
+@pytest.fixture(autouse=True)
+def local_sources(tmp_path, monkeypatch):
+    """Git mirrors clone from tmp_path/git and SVN reads go to a missing local repository, so no
+    test reaches github.com or plugins.svn.wordpress.org: a repository a test did not build fails
+    fast, which leaves its Exposure unknown. The base that git_repository builds under."""
+    monkeypatch.setenv("NUMEN_GITHUB_GIT_URL", (tmp_path / "git").as_uri())
+    monkeypatch.setenv("NUMEN_WORDPRESS_SVN_URL", (tmp_path / "svn-missing").as_uri())
+    return tmp_path / "git"
+
+
+class GitRepository:
+    """A working git repository at {base}/{name}.git, which the mirror clones as GitHub's
+    https://github.com/{name}. Every git call runs at its own fixed time, one minute after the
+    last, so commit and tag creatordate order is the order of the steps."""
+
+    def __init__(self, base, name):
+        self.path, self.step = base / f"{name}.git", 0
+        self.path.mkdir(parents=True)
+        self.git("init", "-q", "-b", "main")
+
+    def git(self, *args):
+        self.step += 1
+        when = f"@{1767225600 + 60 * self.step} +0000"
+        env = {"PATH": os.environ["PATH"], "HOME": str(self.path), "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when,
+               **{f"GIT_{who}_{key}": value for who in ("AUTHOR", "COMMITTER")
+                  for key, value in (("NAME", "Fixture"), ("EMAIL", "fixture@example.invalid"))}}
+        return subprocess.run(["git", *args], cwd=self.path, env=env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def commit(self, message, files):
+        """Commits `files` ({path: text}) on the current branch; its SHA."""
+        for path, text in files.items():
+            (self.path / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.path / path).write_text(text)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def tag(self, name, ref="HEAD"):
+        self.git("tag", "-a", "-m", name, name, ref)
+
+    def branch(self, name, start):
+        """Creates the branch `name` at `start` and checks it out."""
+        self.git("checkout", "-q", "-b", name, start)
+
+    def cherry_pick(self, sha):
+        """Applies commit `sha` to the current branch; the new commit's SHA."""
+        self.git("cherry-pick", sha)
+        return self.git("rev-parse", "HEAD")
+
+
+def git_repository(base, name):
+    return GitRepository(base, name)
 
 
 @pytest.fixture

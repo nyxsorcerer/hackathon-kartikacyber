@@ -38,8 +38,9 @@ LATER = {**VULNERABLE, "later.py": b"x = 1\n"}
 FIXED = {"main.py": b"def parse(value):\n    return str(value)\n"}
 PATCH = (b"--- a/main.py\n+++ b/main.py\n@@ -1,2 +1,2 @@\n def parse(value):\n-    return eval(value)\n"
          b"+    return str(value)\n")
-# Analysis' Alerts and Detection rule validations, and the drafts, stay queued until drain().
-QUEUED = ("notification", "detection_rule", "patch_drafting", "remediation_draft")
+# Analysis' Alerts and Detection rule validations, and the drafts (bundle drafts among them), stay
+# queued until drain().
+QUEUED = ("notification", "detection_rule", "patch_drafting", "remediation_draft", "finding_artifacts")
 
 
 def tree(app, repository_id, revision, files, head=False):
@@ -252,6 +253,7 @@ def test_without_an_own_repository_remediation_prs_are_skipped(system):
     ident = source_snapshot(app, p["id"], INTRODUCED, files=VULNERABLE)
     found = analysed(system, ident, agent())
     assert (found["own_repository"], found["remediation_actions"], found["remediation_prs"]) == (False, [], [])
+    assert {s["step"]: s["status"] for s in found["playbook"]}["remediation_pr"] == "no_own_repository"
     with app.state.factory.begin() as db:
         assert domain.draft_remediation(db, db.get(Application, p["id"]), db.get(Finding, found["id"]), ident, "patch",
                                         INTRODUCED, automatic=True) is None
@@ -260,15 +262,21 @@ def test_without_an_own_repository_remediation_prs_are_skipped(system):
     assert refused.status_code == 422
     assert refused.json() == {"code": "remediation_unavailable", "retryable": False,
                                        "message": "No Own repository: Remediation PR steps are skipped"}
-    # With an Own repository, an Upstream commit's Verdict still drafts nothing (Phase 7 does).
+    # With an Own repository, an Upstream Verdict drafts its pin once Exposure knows the release to
+    # pin (A06): this repository's tags cannot be read, so there is none, and nothing is drafted.
     linked = client.post(f"/api/applications/{p['id']}/repositories",
                          json={"role": "own", "source_kind": "github", "source_url": SHOP})
     assert linked.status_code == 201, linked.text
     found = analysed(system, ident, agent())
     assert (found["own_repository"], found["remediation_actions"], found["remediation_prs"]) == (True, [], [])
+    assert found["exposure"]["state"] == "unknown" and found["exposure"]["target"] is None
+    assert {s["step"]: s["status"] for s in found["playbook"]}["remediation_pr"] == "no_safe_release"
+    with app.state.factory() as db:
+        assert not db.scalars(select(Job).where(Job.kind.in_(["patch_drafting", "remediation_draft"]))).all()
     refused = client.post(f"/api/findings/{found['id']}/remediation-prs", json={"action": "revert"})
     assert refused.json()["message"] == (
-        "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a patch or revert")
+        "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a patch or revert, "
+        "and an exposed Upstream Verdict a pin or bump once its release is known")
 
 
 def test_a_bump_draft_edits_package_json_and_the_lockfile(system, monkeypatch):

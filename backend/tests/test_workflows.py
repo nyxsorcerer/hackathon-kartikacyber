@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from conftest import FixtureBroker, check_now, connection, application, github_account, repository_of, source_snapshot
 from numen import artifacts, cves, domain
-from numen.models import Account, CVE, JobAttempt, Application, ApplicationCVE, Repository, VersionRecipe, now
+from numen.models import Account, Artifact, CVE, JobAttempt, Application, ApplicationCVE, Repository, VersionRecipe, now
 from numen.queue import claim, recover
 from numen.security import fingerprint
 from numen.sources import Sources
@@ -1501,7 +1501,10 @@ def test_historical_pinned_commit_job_remains_valid_after_current_head_advances(
     manifest = next(
         artifact for artifact in analysis["artifacts"] if artifact["path"] == "manifest.json"
     )
-    content = client.get(f"/api/artifacts/{manifest['id']}/content").json()
+    # An Upstream commit's Analysis is never exported (A15): read its manifest as stored.
+    assert client.get(f"/api/artifacts/{manifest['id']}/content").status_code == 403
+    with app.state.factory() as db:
+        content = json.loads(artifacts.read_file(config.artifact_root, db.get(Artifact, manifest["id"])))
     assert content["source_ref"] == pinned and content["commit_revision"] == pinned
 
 

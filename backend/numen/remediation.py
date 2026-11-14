@@ -35,19 +35,20 @@ def rejected(check):
     return DomainError("diff_rejected", check, 422)
 
 
-def git(root, *args, stdin=None):
-    """git's stdout, run in the checkout `root` with HOME set to its temporary parent."""
-    env = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(root.parent), "LC_ALL": "C",
-           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+def git(root, *args, stdin=None, env=None, timeout=GIT_TIMEOUT):
+    """git's stdout, run in the checkout or bare repository `root` with HOME set to its temporary
+    parent; `env` adds to its configuration-free environment."""
+    fixed = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(root.parent), "LC_ALL": "C",
+             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
     try:
         return subprocess.run(
-            ["git", "-c", "core.hooksPath=/dev/null", *args], cwd=root, env=env, input=stdin,
-            capture_output=True, timeout=GIT_TIMEOUT, check=True,
+            ["git", "-c", "core.hooksPath=/dev/null", *args], cwd=root, env={**fixed, **(env or {})},
+            input=stdin, capture_output=True, timeout=timeout, check=True,
         ).stdout
     except subprocess.CalledProcessError as exc:
         raise DomainError("git_failed", exc.stderr.decode(errors="replace")[-2000:].strip(), 422) from exc
     except subprocess.TimeoutExpired as exc:
-        raise DomainError("git_failed", f"git {args[0]} took longer than {GIT_TIMEOUT} s", 422) from exc
+        raise DomainError("git_failed", f"git {args[0]} took longer than {timeout} s", 422) from exc
 
 
 def git_part(path):
@@ -181,10 +182,11 @@ def load(files, name):
     return data
 
 
-def dependency_files(files, ecosystem, name, version, action, dist=None):
+def dependency_files(files, ecosystem, name, version, action, dist=None, spec=None):
     """The manifest files ({name: bytes}) edited to pin `name` to exactly `version`, or to bump it
     to `version` keeping its ^, ~ or >= prefix. `files` maps manifest names to their content;
-    `dist` is the npm registry's dist for that version (tarball and integrity)."""
+    `dist` is the npm registry's dist for that version (tarball and integrity). A `spec`, such as a
+    vendored file: tarball, is written in place of the version, and the lock entry keeps `version`."""
     manifest, sections, indent = MANIFESTS[ecosystem]
     data = load(files, manifest)
     found = [s for s in sections if isinstance(data.get(s), dict) and name in data[s]]
@@ -192,7 +194,7 @@ def dependency_files(files, ecosystem, name, version, action, dist=None):
         raise DomainError("dependency_not_found", f"{name} is not a direct dependency in {manifest}", 422)
     for section in found:
         prefix = re.match(r"\^|~|>=", str(data[section][name])) if action == "bump" else None
-        data[section][name] = (prefix.group() if prefix else "") + version
+        data[section][name] = spec or (prefix.group() if prefix else "") + version
     edited = {manifest: dump(data, indent)}
     if ecosystem == "npm" and files.get("package-lock.json"):
         # ponytail: only the package's own lock entry is rewritten; transitive entries,

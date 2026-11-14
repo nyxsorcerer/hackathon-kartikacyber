@@ -381,8 +381,9 @@ class ApprovalInput(Strict):
 
 
 class RemediationDraftInput(Strict):
-    """The Operator drafts a patch or a revert by hand (A08), the retry of a failed draft."""
-    action: Literal["patch", "revert"]
+    """The Operator drafts a Remediation PR by hand (A08), the retry of a failed draft: a patch or
+    a revert on an Own-repository commit, a pin or a bump for an Upstream one (A06)."""
+    action: Literal["patch", "revert", "pin", "bump"]
     profile: Profile | None = None
 
 

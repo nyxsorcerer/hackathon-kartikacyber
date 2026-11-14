@@ -17,6 +17,8 @@ services:
     environment: &test-env
       NUMEN_TEST_MODE: "1"
       NUMEN_GITHUB_API_URL: http://fixtures:8090
+      # Exposure's read-only mirror (A05): the fixture answers 404, so a clone fails fast as unknown.
+      NUMEN_GITHUB_GIT_URL: http://fixtures:8090/git
       NUMEN_NVD_API_URL: http://fixtures:8090/rest/json/cves/2.0
       NUMEN_NPM_REGISTRY_URL: http://fixtures:8090/npm
       NUMEN_PACKAGIST_URL: http://fixtures:8090/packagist

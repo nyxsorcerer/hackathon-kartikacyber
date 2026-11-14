@@ -28,7 +28,8 @@ from .workflows import Workflows, all_secrets
 from .domain import enqueue, event, remediation_job_ended
 
 log = logging.getLogger("numen.worker")
-# Agent, lab, Detection rule and interactive login work that can occupy a slot for minutes or hours.
+# Agent, lab, Detection rule, Exposure check (a mirror clone) and interactive login work that can
+# occupy a slot for minutes or hours.
 LONG_KINDS = (
     "account_login",
     "audit_context",
@@ -36,6 +37,7 @@ LONG_KINDS = (
     "commit_triage",
     "cve_analysis",
     "detection_rule",
+    "exposure_check",
     "finding_artifacts",
     "lab_run",
     "patch_drafting",

@@ -26,6 +26,8 @@ import {
   commitsSchema,
   applicationSchema,
   applicationsSchema,
+  exposureLabels,
+  exposureTones,
   findingVerdicts,
   repositoryLabel,
   reviewBatchSchema,
@@ -1589,6 +1591,25 @@ function CommitDetailBody({
                 <span className="muted">None recorded</span>
               ),
             ],
+            // A not-exposed Upstream Verdict is recorded here only (A05).
+            ...(commit.exposures.length
+              ? ([
+                  [
+                    "Exposure",
+                    <ul className="gap-list">
+                      {commit.exposures.map((exposure) => (
+                        <li key={exposure.application_id}>
+                          {exposure.application_name || "Application"}{" "}
+                          <Badge tone={exposureTones[exposure.state]}>
+                            {exposureLabels[exposure.state]}
+                          </Badge>{" "}
+                          {exposure.reason}
+                        </li>
+                      ))}
+                    </ul>,
+                  ],
+                ] as [string, ReactNode][])
+              : []),
           ]}
         />
         {commit.review_decision === "candidate" && opened && (

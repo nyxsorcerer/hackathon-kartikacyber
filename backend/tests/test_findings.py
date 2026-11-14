@@ -1,16 +1,27 @@
+import base64
+import hashlib
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import select
 
 from conftest import FixtureBroker, application, connection, source_snapshot
 from numen import artifacts, domain
 from numen.security import DomainError
-from numen.models import Application, ApplicationCVE, Artifact, Commit, Finding, Job, LabRun, Notification, now
+from numen.models import (
+    Application, ApplicationCVE, ApplicationRepository, Artifact, Commit, Finding, Job, LabRun, Notification,
+    Repository, now,
+)
+from numen.sources import Sources
 from numen.worker import run_once
-from test_analysis import analyze
-from test_artifacts import APPROVAL, bundle, finding, queue_cve_analysis, upload
+from test_analysis import CAPS, analyze, started
+from test_artifacts import APPROVAL, automatic_bundle, bundle, finding, queue_cve_analysis, upload, without_package
+from test_dependencies import npm_files
+from test_exposure import PACKAGE, REACT, SERVER, react
+from test_remediation_prs import HEAD, SHOP, tree
 from test_commit_review import assessment, pinned_bundle, prepared
 from test_workflows import cve_raw, seed_cve
 
@@ -169,6 +180,17 @@ def test_generated_bundle_summary_requires_no_artifact_reads(system, monkeypatch
     assert response.status_code == 200
     assert response.json()["items"][0]["artifact_state"]["status"] == "complete"
     assert reads == []
+
+
+def test_the_summary_carries_malicious_change(system):
+    """A Malicious change never runs, so its list row needs no Lab badge (ADR-0004)."""
+    _, client, _ = system
+    monitored, ident, _ = prepared(system)
+    rule = b'rule loader { strings: $a = "str(value)" condition: $a }'
+    job, _ = analyze(system, ident, assessment("Malicious change"), {"report.md": b"# A loader", "detection-rule.yar": rule})
+    other = finding(client, monitored["id"])
+    rows = client.get("/api/findings?view=summary").json()["items"]
+    assert {row["id"]: row["malicious_change"] for row in rows} == {job["result"]["finding_id"]: True, other["id"]: False}
 
 
 def test_publication_preserves_operator_changes_made_after_the_finding_was_loaded(
@@ -524,15 +546,20 @@ OWN_SOURCE = {
 
 def approved_commit_lab(system, role):
     """A Vulnerability introduced Finding from a commit of the Application's `role` repository,
-    with its Lab approved: (Finding id, lab_run job id)."""
+    with its Lab approved: (Finding id, lab_run job id). An Own-repository Proof's bundle leaves
+    package.json to the repository."""
     app, client, _ = system
     connection(app)
     shop = application(client, role=role, source_url="https://github.com/acme/shop")
     ident = parented(app, shop["id"], "a" * 40, "f" * 40, OWN_SOURCE)
-    job, broker = analyze(system, ident, assessment("Vulnerability introduced", "a" * 40), pinned_bundle("a" * 40))
+    drafted = pinned_bundle("a" * 40)
+    if role == "own":
+        drafted.pop("vulnerable-app/package.json")
+    job, broker = analyze(system, ident, assessment("Vulnerability introduced", "a" * 40), drafted)
     # The Analysis is told whether its Lab will supply the repository.
     facts = json.loads(broker.calls[0]["prompt"].rsplit("\n\nFacts:\n", 1)[1])
     assert facts["own_repository"] is (role == "own")
+    assert facts["vulnerable_app"] == ("own_commit" if role == "own" else "minimal")
     finding_id = job["result"]["finding_id"]
     queued = client.post(f"/api/findings/{finding_id}/lab-runs", json=APPROVAL)
     assert queued.status_code == 202, queued.text
@@ -565,14 +592,15 @@ def test_an_approved_lab_builds_the_own_repository_at_the_verdicts_commit(system
     assert {k: v for k, v in current["cause"].items() if k != "at"} == {"by": "proof", "lab_run_id": lab["id"]}
 
 
-def test_an_upstream_proof_keeps_the_bundle_only_lab(system):
+def test_an_upstream_proof_without_a_locked_package_keeps_the_bundle_only_lab(system):
     _, client, _ = system
     finding_id, _ = approved_commit_lab(system, "upstream")
     broker = run_lab(system, FixtureBroker({"verified": True, "status": "verified", "exit_code": 0}))
     (call,) = broker.calls
     assert set(call["files"]) == {*pinned_bundle(), "manifest.json"}
     (lab,) = client.get(f"/api/findings/{finding_id}").json()["lab_runs"]
-    assert "source_ref" not in lab
+    assert "source_ref" not in lab and "own_ref" not in lab
+    assert lab["bundle_only"] == "The Upstream link names no package or Locked version to install"
 
 
 def test_a_lab_that_does_not_reproduce_stays_visible_and_changes_no_state(system):
@@ -605,3 +633,213 @@ def test_a_lab_over_a_limit_fails_visibly_and_changes_no_state(system):
     (lab,) = current["lab_runs"]
     assert lab["status"] == "failed" and {k: lab["error"][k] for k in limit} == limit
     assert current["status"] == "open" and current["cause"]["by"] == "verdict"
+
+
+# An Upstream Proof's vulnerable app (A07): the Own repository at its default-branch head with the
+# Locked version installed, or, with no Own repository, a minimal app that pins it. The Locked
+# version is the fixture registry's tarball, vendored under vulnerable-app/.asset-monitor/.
+TARBALL = b"react-server-dom-webpack 19.0.0 stand-in bytes"
+VENDORED = f".asset-monitor/{PACKAGE}-19.0.0.tgz"
+OWN_HEAD = {
+    **{path: text.encode() for path, text in npm_files({PACKAGE: "19.0.0"}, {PACKAGE: "19.0.0"}).items()},
+    "server.js": b'require("http").createServer((q, r) => r.end("shop")).listen(8080);\n',
+    "Dockerfile": b"FROM node:latest\n",  # The repository's own: the bundle's wins.
+    ".dockerignore": b"node_modules\n",
+}
+# An Upstream Proof's bundle: the Dockerfile and its own files; the Lab supplies package.json.
+UPSTREAM_BUNDLE = without_package(pinned_bundle("f" * 40))
+
+
+def sri(data):
+    return "sha512-" + base64.b64encode(hashlib.sha512(data).digest()).decode()
+
+
+@pytest.fixture
+def npm(monkeypatch):
+    """The fixture npm registry at NUMEN_NPM_REGISTRY_URL=http://npm.fixture, serving the
+    react-server-dom-webpack 19.0.0 metadata (dist) and tarball that a test may change: the
+    paths it was asked for."""
+    monkeypatch.setenv("NUMEN_NPM_REGISTRY_URL", "http://npm.fixture")
+    registry = SimpleNamespace(paths=[], tarball=TARBALL, dist={
+        "tarball": f"http://npm.fixture/{PACKAGE}/-/{PACKAGE}-19.0.0.tgz", "integrity": sri(TARBALL)})
+
+    def answer(request):
+        registry.paths.append(request.url.path)
+        if request.url.path == f"/{PACKAGE}/19.0.0":
+            return httpx.Response(200, json={"name": PACKAGE, "version": "19.0.0", "dist": registry.dist})
+        if request.url.path == f"/{PACKAGE}/-/{PACKAGE}-19.0.0.tgz":
+            return httpx.Response(200, content=registry.tarball)
+        return httpx.Response(404, json={})
+
+    original = Sources.__init__
+
+    def setup(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.client = httpx.Client(transport=httpx.MockTransport(answer))
+
+    monkeypatch.setattr(Sources, "__init__", setup)
+    return registry
+
+
+def react_finding(system, base, own):
+    """The React2Shell fix commit on numen/react, exposed to an Application locking
+    react-server-dom-webpack@19.0.0: Shop, with its Own repository acme/shop at HEAD (OWN_HEAD),
+    when `own`, else Blog with no Own repository. (Application id, its Finding, the Analysis broker)"""
+    app, client, _ = system
+    connection(app)
+    _, release, fix = react(base)
+    if own:
+        ident = application(client, asset_name="Shop", role="own", source_url=SHOP)["id"]
+        linked = client.post(f"/api/applications/{ident}/repositories",
+                             json={"source_kind": "github", "source_url": REACT, "locked_version": "19.0.0"})
+        assert linked.status_code == 201, linked.text
+        with app.state.factory() as db:
+            shop_id = db.scalar(select(Repository.id).where(Repository.source_url == SHOP))
+        tree(app, shop_id, HEAD, OWN_HEAD, head=True)
+    else:
+        ident = application(client, asset_name="Blog", source_url=REACT, locked_version="19.0.0")["id"]
+    with app.state.factory.begin() as db:
+        link = db.scalar(select(ApplicationRepository).where(
+            ApplicationRepository.application_id == ident, ApplicationRepository.role == "upstream"))
+        link.packages, react_id = [f"npm:{PACKAGE}"], link.repository_id
+    commit = source_snapshot(app, ident, fix, repository_id=react_id, files={SERVER: b"export function decodeReply() {}\n"})
+    with app.state.factory.begin() as db:
+        row = db.get(Commit, commit)
+        row.data = {**row.data, "parent_revisions": [release]}
+    job, broker = analyze(system, commit, assessment("Vulnerability fix", release), without_package(pinned_bundle(release)))
+    assert job["status"] == "succeeded", job
+    (finding_id,) = job["result"]["finding_ids"]
+    found = client.get(f"/api/findings/{finding_id}").json()
+    assert (found["exposure"]["state"], found["exposure"]["reason"]) == ("exposed", "no release contains the fix yet")
+    return ident, found, broker
+
+
+def lab_files(system, finding_id):
+    """Approves the Finding's Lab and runs it: (the lab call's files, the job, the LabRun)."""
+    _, client, _ = system
+    queued = client.post(f"/api/findings/{finding_id}/lab-runs", json=APPROVAL)
+    assert queued.status_code == 202, queued.text
+    broker = run_lab(system, FixtureBroker({"verified": True, "status": "verified", "exit_code": 0}))
+    job = client.get(f"/api/jobs/{queued.json()['job_id']}").json()
+    labs = client.get(f"/api/findings/{finding_id}").json()["lab_runs"]
+    return ([call["files"] for call in broker.calls if call["kind"] == "lab"] or [None])[0], job, labs[0]
+
+
+def test_an_upstream_proof_builds_the_own_repository_head_with_the_locked_version_installed(
+        system, npm, local_sources):
+    _, client, _ = system
+    _, found, _ = react_finding(system, local_sources, own=True)
+    # The Analysis drafted for an app of its own, not Shop's head: Shop gets the report, and its own
+    # bundle is drafted automatically.
+    assert {a["path"] for a in found["artifacts"]} == {"report.md", "manifest.json"}
+    assert found["artifact_state"]["status"] == "draft"
+    automatic_bundle(system, found["id"], UPSTREAM_BUNDLE)
+    assert client.get(f"/api/findings/{found['id']}").json()["artifact_state"]["status"] == "complete"
+    files, job, lab = lab_files(system, found["id"])
+    assert job["status"] == "succeeded", job
+    for path in ("server.js", "package-lock.json"):
+        assert path in OWN_HEAD and "vulnerable-app/" + path in files, path
+    assert files["vulnerable-app/server.js"] == OWN_HEAD["server.js"]
+    for path in ("vulnerable-app/Dockerfile", "vulnerable-app/application.lock.json", "poc.py"):
+        assert files[path] == UPSTREAM_BUNDLE[path], path
+    assert "vulnerable-app/.dockerignore" not in files and "vulnerable-app/manifest.json" not in files
+    # Exactly the registry's bytes of the Locked version, installed from the file: spec.
+    assert files["vulnerable-app/" + VENDORED] == TARBALL
+    manifest = json.loads(files["vulnerable-app/package.json"])
+    locked = json.loads(files["vulnerable-app/package-lock.json"])
+    assert manifest["dependencies"] == locked["packages"][""]["dependencies"] == {PACKAGE: "file:" + VENDORED}
+    assert locked["packages"][f"node_modules/{PACKAGE}"] == {
+        "version": "19.0.0", "resolved": "file:" + VENDORED, "integrity": sri(TARBALL)}
+    assert npm.paths == [f"/{PACKAGE}/19.0.0", f"/{PACKAGE}/-/{PACKAGE}-19.0.0.tgz"]
+    assert (lab["status"], lab["packages"], lab["locked_version"], lab["own_ref"]) == (
+        "verified", [PACKAGE], "19.0.0", HEAD)
+
+
+def test_an_upstream_proof_without_an_own_repository_builds_a_minimal_app_pinning_the_locked_version(
+        system, npm, local_sources):
+    _, found, broker = react_finding(system, local_sources, own=False)
+    facts = json.loads(broker.calls[0]["prompt"].rsplit("\n\nFacts:\n", 1)[1])
+    assert (facts["vulnerable_app"], facts["own_repository"], facts["packages"], facts["locked_version"]) == (
+        "minimal", False, [PACKAGE], "19.0.0")
+    assert found["artifact_state"]["status"] == "complete", found["artifact_state"]
+    files, job, lab = lab_files(system, found["id"])
+    assert job["status"] == "succeeded", job
+    assert json.loads(files["vulnerable-app/package.json"]) == {
+        "name": "asset-monitor-lab", "version": "0.0.0", "private": True,
+        "dependencies": {PACKAGE: "file:" + VENDORED}}
+    assert files["vulnerable-app/" + VENDORED] == TARBALL and "vulnerable-app/package-lock.json" not in files
+    assert (lab["packages"], lab["locked_version"], lab["own_ref"]) == ([PACKAGE], "19.0.0", None)
+
+
+@pytest.mark.parametrize("tamper,message", [
+    ("bytes", "does not match its registry integrity"),
+    ("origin", "is not on the npm registry"),
+    ("integrity", "has no sha512 integrity"),
+])
+def test_a_locked_package_whose_integrity_or_origin_does_not_match_is_refused(
+        system, npm, local_sources, tamper, message):
+    _, found, _ = react_finding(system, local_sources, own=False)
+    if tamper == "bytes":
+        npm.tarball = b"something else"
+    elif tamper == "origin":
+        npm.dist = {**npm.dist, "tarball": f"http://elsewhere.fixture/{PACKAGE}-19.0.0.tgz"}
+    else:
+        npm.dist = {**npm.dist, "integrity": "sha1-" + base64.b64encode(hashlib.sha1(TARBALL).digest()).decode()}
+    files, job, lab = lab_files(system, found["id"])
+    assert files is None and (job["status"], job["error"]["code"]) == ("failed", "package_untrusted")
+    assert message in job["error"]["message"] and lab["status"] == "failed"
+    assert (f"/{PACKAGE}/-/{PACKAGE}-19.0.0.tgz" in npm.paths) is (tamper == "bytes")
+
+
+def test_the_automatic_bundle_draft_is_told_its_vulnerable_app_rule(system, local_sources):
+    app, client, _ = system
+    ident, found, _ = react_finding(system, local_sources, own=True)
+    job, broker = automatic_bundle(system, found["id"], UPSTREAM_BUNDLE)
+    assert job["status"] == "succeeded", job
+    (call,) = broker.calls
+    facts = json.loads(call["prompt"].rsplit("\n\nFacts:\n", 1)[1])
+    assert (facts["own_repository"], facts["vulnerable_app"], facts["packages"], facts["locked_version"]) == (
+        False, "own_head", [PACKAGE], "19.0.0")
+    assert (facts["source_pin"]["basis"], facts["source_ref"], facts["source_url"]) == ("own_head", HEAD, SHOP)
+    # The Own repository's head, not the Upstream source, is the evidence it reads.
+    assert call["files"]["source/server.js"] == OWN_HEAD["server.js"] and f"source/{SERVER}" not in call["files"]
+    current = client.get(f"/api/findings/{found['id']}").json()
+    assert current["artifact_state"]["status"] == "complete", current["artifact_state"]
+    pins = [e for e in job["events"] if e["kind"] == "source_pin"]
+    assert pins[0]["message"] == "Using the Own repository's head, where the Lab installs the Locked version"
+    # It counts against the Analysis caps like patch drafting: over a cap none is queued, and the
+    # Proof stays a Draft for Generate.
+    started(app, ident, CAPS["application"] - 1)
+    with app.state.factory.begin() as db:
+        application, row = db.get(Application, ident), db.get(Finding, found["id"])
+        assert domain.over_cap(db, application, domain.resolve_profile(db, application, "finding_artifacts"),
+                               False) == "application"
+        assert domain.draft_bundle(db, application, row) is None
+
+
+def test_a_repository_own_for_one_application_and_upstream_for_another_gets_a_bundle_per_role(system):
+    app, client, _ = system
+    connection(app)
+    shop = application(client, asset_name="Shop", role="own", source_url=SHOP)["id"]
+    partner = application(client, asset_name="Partner", source_url=SHOP)["id"]
+    ident = parented(app, shop, "a" * 40, "f" * 40, OWN_SOURCE)
+    drafted = {**without_package(pinned_bundle("a" * 40)), "disclosure-report.md": b"# For acme/shop\n"}
+    job, broker = analyze(system, ident, assessment("Vulnerability introduced", "a" * 40), drafted)
+    facts = json.loads(broker.calls[0]["prompt"].rsplit("\n\nFacts:\n", 1)[1])
+    assert (facts["vulnerable_app"], facts["own_repository"], facts["upstream"]) == ("own_commit", True, True)
+    rows = by_application(client)
+    own, upstream = (client.get(f"/api/findings/{rows[a]['id']}").json() for a in (shop, partner))
+    assert {a["path"] for a in own["artifacts"]} == {*drafted, "manifest.json"}
+    assert own["artifact_state"]["status"] == "complete", own["artifact_state"]
+    # Partner's Lab would build its own app: it gets the reports, and its own bundle draft is queued.
+    assert {a["path"] for a in upstream["artifacts"]} == {"report.md", "disclosure-report.md", "manifest.json"}
+    assert upstream["artifact_state"]["status"] == "draft" and upstream["disclosure_report"]
+    assert {s["step"]: s["status"] for s in upstream["playbook"]}["proof"] == "draft"
+    # That draft is for the minimal app Partner's Lab builds, and keeps the Disclosure report.
+    job, broker = automatic_bundle(system, upstream["id"], pinned_bundle("a" * 40))
+    assert job["status"] == "succeeded", job
+    facts = json.loads(broker.calls[0]["prompt"].rsplit("\n\nFacts:\n", 1)[1])
+    assert (facts["vulnerable_app"], facts["own_repository"]) == ("minimal", False)
+    upstream = client.get(f"/api/findings/{upstream['id']}").json()
+    assert upstream["artifact_state"]["status"] == "complete", upstream["artifact_state"]
+    assert upstream["disclosure_report"]["text"] == "# For acme/shop\n"

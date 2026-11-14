@@ -7,6 +7,8 @@ tokens are intentionally public test inputs, never production monitoring data.
 
 from __future__ import annotations
 
+import base64
+import gzip
 import hashlib
 from datetime import datetime, timezone
 import io
@@ -116,16 +118,89 @@ def git_sha(value: object) -> str:
     return hashlib.sha1(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def archive(sha: str) -> bytes:
+def tar_gz(files: dict[str, bytes]) -> bytes:
+    """The same gzipped tarball bytes on every call, so a registry integrity stays valid."""
     output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode='w:gz') as bundle:
-        for path, content in source_files(sha).items():
-            entry = tarfile.TarInfo(f'numen-fixture-{sha[:7]}/{path}')
+    with tarfile.open(fileobj=output, mode='w') as bundle:
+        for path, content in files.items():
+            entry = tarfile.TarInfo(path)
             entry.size = len(content)
             entry.mode = 0o644
             entry.mtime = 0
             bundle.addfile(entry, io.BytesIO(content))
-    return output.getvalue()
+    return gzip.compress(output.getvalue(), mtime=0)
+
+
+def archive(sha: str) -> bytes:
+    return tar_gz({f'numen-fixture-{sha[:7]}/{path}': content for path, content in source_files(sha).items()})
+
+
+# The React2Shell journey (A07). A harmless stand-in for react-server-dom-webpack, not React's code
+# and no exploit: 19.0.0's simulated flaw answers an action body carrying a "$$id" field with a fixed
+# marker string, and nothing it names is loaded or run; 19.0.1 refuses that field.
+NPM = 'http://fixtures:8090/npm'
+STAND_IN = {
+    '19.0.0': b'"use strict";\n// Asset Monitor test stand-in for react-server-dom-webpack 19.0.0, not React code.\n'
+              b'exports.decodeAction = (body) => ("$$id" in JSON.parse(body || "{}") ? "asset-monitor-simulated-flaw" : "ok");\n',
+    '19.0.1': b'"use strict";\n// Asset Monitor test stand-in for react-server-dom-webpack 19.0.1, not React code.\n'
+              b'exports.decodeAction = (body) => {\n'
+              b'  if ("$$id" in JSON.parse(body || "{}")) throw new Error("action references are refused");\n'
+              b'  return "ok";\n};\n',
+}
+NPM_TARBALLS = {
+    version: tar_gz({
+        'package/package.json': json.dumps({'name': 'react-server-dom-webpack', 'version': version, 'main': 'index.js', 'license': 'MIT'}).encode(),
+        'package/index.js': source,
+    })
+    for version, source in STAND_IN.items()
+}
+
+
+def npm_dist(version: str) -> dict:
+    return {
+        'tarball': f'{NPM}/react-server-dom-webpack/-/react-server-dom-webpack-{version}.tgz',
+        'integrity': 'sha512-' + base64.b64encode(hashlib.sha512(NPM_TARBALLS[version]).digest()).decode(),
+    }
+
+
+# The Own Node app numen/node-app-<run>: one head commit, locking the stand-in at 19.0.0.
+NODE_SHA = 'd' * 40
+NODE_APP = {
+    'package.json': json.dumps({'name': 'node-app', 'version': '1.0.0', 'private': True, 'dependencies': {'react-server-dom-webpack': '19.0.0'}}, indent=2).encode(),
+    'package-lock.json': json.dumps({'name': 'node-app', 'version': '1.0.0', 'lockfileVersion': 3, 'requires': True, 'packages': {
+        '': {'name': 'node-app', 'version': '1.0.0', 'dependencies': {'react-server-dom-webpack': '19.0.0'}},
+        'node_modules/react-server-dom-webpack': {'version': '19.0.0', 'resolved': npm_dist('19.0.0')['tarball'], 'integrity': npm_dist('19.0.0')['integrity'], 'license': 'MIT'},
+    }}, indent=2).encode(),
+    'server.js': b'const { decodeAction } = require("react-server-dom-webpack");\n'
+                 b'require("http").createServer((request, response) => {\n'
+                 b'  if (request.method !== "POST" || request.url !== "/action") return response.end("ok");\n'
+                 b'  let body = "";\n'
+                 b'  request.on("data", (chunk) => { body += chunk; });\n'
+                 b'  request.on("end", () => {\n'
+                 b'    try { response.end(String(decodeAction(body))); }\n'
+                 b'    catch (error) { response.statusCode = 400; response.end("refused"); }\n'
+                 b'  });\n'
+                 b'}).listen(8080);\n',
+}
+NODE_COMMIT = {
+    'sha': NODE_SHA,
+    'html_url': f'https://github.com/numen/node-app/commit/{NODE_SHA}',
+    'commit': {
+        'message': 'Route server actions through react-server-dom-webpack',
+        'author': {'name': 'Fixture Maintainer', 'email': 'fixture@example.invalid', 'date': '2026-10-02T00:00:00Z'},
+        'committer': {'name': 'Fixture Maintainer', 'date': '2026-10-02T00:00:00Z'},
+    },
+    'parents': [],
+    'files': [{'filename': path, 'status': 'added', 'additions': content.count(b'\n'), 'deletions': 0} for path, content in NODE_APP.items()],
+    'stats': {'additions': sum(content.count(b'\n') for content in NODE_APP.values()), 'deletions': 0},
+}
+
+
+def alias(path: str) -> str:
+    """Repositories outlive a journey run, so each run links its own numen/fixture-<run> and
+    numen/node-app-<run>; numen/react-fixture, the stand-in's Upstream, is the fake Upstream too."""
+    path = re.sub(r'^/repos/numen/(?:fixture-[0-9a-f]+|react-fixture)(?=/|$)', '/repos/numen/fixture', path)
+    return re.sub(r'^/repos/numen/node-app-[0-9a-f]+(?=/|$)', '/repos/numen/node-app', path)
 
 
 def cve_records() -> dict:
@@ -195,9 +270,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        path = parsed.path.rstrip('/') or '/'
-        # Repositories outlive a journey run, so each run links its own numen/fixture-<run>.
-        path = re.sub(r'^/repos/numen/fixture-[0-9a-f]+(?=/|$)', '/repos/numen/fixture', path)
+        path = alias(parsed.path.rstrip('/') or '/')
         query = parse_qs(parsed.query)
         with STATE.lock:
             STATE.requests.append(path)
@@ -271,6 +344,26 @@ class Handler(BaseHTTPRequestHandler):
             identical = len(comparison) == 2 and comparison[0] == comparison[1]
             revisions = [] if identical or int(query.get('page', ['1'])[0]) > 1 else [OLD_DATED_SHA, FIX_SHA]
             return self.json({'status': 'identical' if identical else 'ahead', 'ahead_by': 0 if identical else 2, 'total_commits': 0 if identical else 2, 'commits': [commit(sha) for sha in revisions], 'files': commit(FIX_SHA)['files']})
+        if path == '/repos/numen/node-app/commits':
+            body = json.dumps([NODE_COMMIT]).encode()
+            etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+            if self.headers.get('If-None-Match') == etag:
+                return self.send(304, b'', headers={'ETag': etag})
+            return self.send(200, body, headers={'ETag': etag})
+        if path == f'/repos/numen/node-app/commits/{NODE_SHA}':
+            return self.json(NODE_COMMIT)
+        if path.startswith('/repos/numen/node-app/contents/') and path.rsplit('/', 1)[1] in NODE_APP:
+            return self.send(200, NODE_APP[path.rsplit('/', 1)[1]], 'text/plain')
+        if path == f'/repos/numen/node-app/tarball/{NODE_SHA}':
+            return self.send(200, tar_gz({f'numen-node-app-{NODE_SHA[:7]}/{p}': c for p, c in NODE_APP.items()}), 'application/gzip')
+        if path.startswith('/npm/react-server-dom-webpack/'):
+            version = path.rsplit('/', 1)[1].removeprefix('react-server-dom-webpack-').removesuffix('.tgz')
+            if version in NPM_TARBALLS and path.endswith('.tgz'):
+                return self.send(200, NPM_TARBALLS[version], 'application/octet-stream')
+            if version in NPM_TARBALLS:
+                return self.json({'name': 'react-server-dom-webpack', 'version': version,
+                                  'repository': {'type': 'git', 'url': 'git+https://github.com/numen/react-fixture.git'},
+                                  'dist': npm_dist(version)})
         if '/tarball/' in path or '/archive/' in path:
             sha = BASE_SHA if BASE_SHA in path else FIX_SHA
             return self.send(200, archive(sha), 'application/gzip')
@@ -284,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         original = urlparse(self.path).path.rstrip('/')
-        path = re.sub(r'^/repos/numen/fixture-[0-9a-f]+(?=/|$)', '/repos/numen/fixture', original)
+        path = alias(original)
         length = int(self.headers.get('Content-Length', '0'))
         if length > 1_000_000:
             return self.json({'message': 'Fixture request too large'}, 413)

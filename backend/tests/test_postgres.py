@@ -720,11 +720,8 @@ def test_postgres_findings_open_and_link_within_each_application(postgres):
         app.state.factory.kw["bind"].dispose()
 
 
-def test_postgres_cleanup_report_orders_the_containing_commits_by_json_path(postgres, monkeypatch):
-    """The cleanup report's commits are filtered by branch and ordered by committed_at, both JSON
-    paths, on PostgreSQL."""
-    from test_detection_rules import test_the_cleanup_report_lists_the_commits_and_releases_that_contained_the_change as scenario
-
+def on_postgres(postgres, scenario, *args):
+    """Runs a backend scenario test, which takes (system, *args), against PostgreSQL."""
     original, _ = postgres
     config = replace(original, secret_key=Fernet.generate_key().decode(), test_mode=True)
     app = create_app(config=config, admin_password="test-password-long")
@@ -733,9 +730,23 @@ def test_postgres_cleanup_report_orders_the_containing_commits_by_json_path(post
             session = client.post("/api/auth/login", json={
                 "username": "admin", "password": "test-password-long"}).json()
             client.headers["X-CSRF-Token"] = session["csrf_token"]
-            scenario((app, client, config), monkeypatch)
+            scenario((app, client, config), *args)
     finally:
         app.state.factory.kw["bind"].dispose()
+
+
+@pytest.mark.parametrize("verdict", ["Vulnerability fix", "Malicious change"])
+def test_postgres_exposure_is_recorded_once_per_application_and_commit(postgres, tmp_path, verdict):
+    """Exposure rows (A05) upsert on their (Application, commit) key and join their Application."""
+    from test_exposure import test_a_not_exposed_verdict_is_recorded_on_the_upstream_repository_only as scenario
+
+    on_postgres(postgres, scenario, tmp_path, verdict)
+
+
+def test_postgres_cleanup_report_maps_git_containment_to_stored_commits(postgres, tmp_path):
+    from test_detection_rules import test_the_cleanup_report_lists_the_commits_and_releases_that_contained_the_change as scenario
+
+    on_postgres(postgres, scenario, tmp_path)
 
 
 def test_postgres_skip_locked_claims_and_fenced_recovery(postgres):

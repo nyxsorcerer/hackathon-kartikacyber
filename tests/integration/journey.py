@@ -10,14 +10,12 @@ from __future__ import annotations
 
 import argparse
 from http.cookiejar import CookieJar
-import io
 import json
 from pathlib import Path
 import time
 from urllib.error import HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 import uuid
-import zipfile
 
 
 class Client:
@@ -85,6 +83,12 @@ class Client:
 
 def items(value):
     return value['items']
+
+
+def wait_kind(client, application, kind):
+    """Waits for every `kind` job of the Application, such as those another job queued."""
+    jobs = items(client.request('GET', f'/api/jobs?application_id={application["id"]}'))
+    return [client.wait({'job_id': job['id']}) for job in jobs if job['kind'] == kind]
 
 
 def check_now(client, application):
@@ -243,13 +247,13 @@ def main():
     }
     finding = client.upload(f'/api/findings/{finding["id"]}/artifacts', files)
     assert finding['artifact_state']['status'] == 'complete'
-    archive_data = client.request('GET', f'/api/findings/{finding["id"]}/download', raw=True)
-    with zipfile.ZipFile(io.BytesIO(archive_data)) as bundle:
-        names = bundle.namelist()
-        for required in ['poc.py', 'report.md', 'vulnerable-app/Dockerfile', 'manifest.json']:
-            assert any(name.endswith(required) for name in names), required
+    assert {'poc.py', 'report.md', 'vulnerable-app/Dockerfile', 'manifest.json'} <= {a['path'] for a in finding['artifacts']}
+    # A15: an Upstream Proof is never exported, overriding Numen's AC-12 for an Upstream Finding.
+    assert finding['exportable'] is False
+    refused = client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(403,))
+    assert refused['code'] == 'upstream_proof_not_exported'
     assert client.request('GET', f'/api/findings/{finding["id"]}')['status'] == 'open'
-    print('PASS draft/completed finding bundle integrity and independent upstream status')
+    print('PASS draft/completed finding bundle, its Upstream download refused, and independent upstream status')
 
     # A15: every Approval carries the password; A07: the Lab builds and runs offline on the real Engine.
     refused = client.request('POST', f'/api/findings/{finding["id"]}/lab-runs', {'password': 'wrong-' + suffix}, expect=(403,))
@@ -307,7 +311,78 @@ def main():
         assert write_token not in json.dumps(seen), job['kind']
     print('PASS Remediation PR Approval refuses a wrong password, then opens exactly one draft pull request on the Own repository')
 
-    for application in [github, wordpress, own]:
+    # React2Shell (A05-A07, A15): an Own Node app locks a harmless stand-in of
+    # react-server-dom-webpack@19.0.0 from the fixture registry, whose metadata names numen/react-fixture.
+    node = client.request('POST', '/api/applications', {
+        **common, 'asset_name': f'React2Shell fixture {suffix}', 'product_kind': 'CMS',
+    }, expect=(200, 201))
+    client.request('POST', f'/api/applications/{node["id"]}/repositories', {
+        'role': 'own', 'source_kind': 'github', 'source_url': f'https://github.com/numen/node-app-{suffix}', 'source_ref': 'main',
+    }, expect=(201,))
+    check_now(client, node)
+    (derived,) = wait_kind(client, node, 'derive_upstreams')
+    assert derived['result']['added'] == ['https://github.com/numen/react-fixture'], derived['result']
+    upstream = next(r for r in client.request('GET', f'/api/applications/{node["id"]}')['repositories'] if r['role'] == 'upstream')
+    assert (upstream['packages'], upstream['locked_version'], upstream['locked_version_source']) == (['npm:react-server-dom-webpack'], '19.0.0', 'manifest'), upstream
+    check_now(client, node)
+    client.wait(client.request('POST', f'/api/applications/{node["id"]}/repositories/{upstream["repository_id"]}/backfills', {'count': 1}, expect=(202,)))
+    # Repositories outlive a run, so any stored commit of the Upstream repository will do.
+    upstream_commit = next(row for row in items(client.request('GET', f'/api/applications/{node["id"]}/commits')) if row['repository_id'] == upstream['repository_id'])
+    # Operator-opened, so it carries no Exposure row; Exposure itself is proven by test_exposure.py.
+    r2s = client.request('POST', '/api/findings', {
+        'application_id': node['id'], 'source': 'commit', 'title': f'React2Shell stand-in {suffix}',
+        'source_commit_id': upstream_commit['id'], 'affected_versions': ['19.0.0'], 'fixed_versions': ['19.0.1'],
+    }, expect=(200, 201))
+    disclosure = b'# Server action reference trusted before validation\n\nControlled integration fixture for the numen/react-fixture maintainers, not a real report.\n'
+    # The Lab supplies package.json, package-lock.json and server.js from the Own head, with the
+    # Locked version vendored; the PoC sees the stand-in's marker, never anything executed.
+    r2s_files = {
+        'poc.py': b'import json,os,sys,time,urllib.error,urllib.request\n'
+                  b'request=urllib.request.Request(os.environ["TARGET_URL"]+"/action",data=json.dumps({"$$id":"asset-monitor-probe"}).encode(),method="POST")\n'
+                  b'for _ in range(50):\n'
+                  b'    try:\n        body=urllib.request.urlopen(request,timeout=1).read();break\n'
+                  b'    except urllib.error.HTTPError as error:\n        body=error.read();break\n'
+                  b'    except OSError:time.sleep(0.2)\n'
+                  b'else:sys.exit("the application never answered")\n'
+                  b'sys.exit(0 if body==b"asset-monitor-simulated-flaw" else 1)\n',
+        'report.md': b'# React2Shell stand-in\n\nControlled integration fixture, not a real finding: an action body naming a server reference is answered with a marker.\n',
+        'disclosure-report.md': disclosure,
+        'vulnerable-app/Dockerfile': b'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY . /app/\nCMD ["node", "server.js"]\n',
+        'vulnerable-app/compose.yaml': b'services:\n  app:\n    build: .\n    ports: ["127.0.0.1:18080:8080"]\n',
+        'vulnerable-app/README.md': b'# Node app\nThe Own repository head with react-server-dom-webpack at its Locked version. Run docker compose up --build.\n',
+        'vulnerable-app/application.lock.json': json.dumps({'version': '19.0.0', 'fixture': True, 'local_inputs': {'Dockerfile': 'Controlled integration fixture'}, 'images': ['asset-monitor-lab:0.1.0']}).encode(),
+    }
+    r2s = client.upload(f'/api/findings/{r2s["id"]}/artifacts', r2s_files)
+    assert r2s['artifact_state']['status'] == 'complete', r2s['artifact_state']
+    assert r2s['disclosure_report'] == {'text': disclosure.decode(), 'form_url': 'https://github.com/numen/react-fixture/security/advisories/new'}, r2s['disclosure_report']
+    assert r2s['exportable'] is False
+    assert client.request('GET', f'/api/findings/{r2s["id"]}/download', expect=(403,))['code'] == 'upstream_proof_not_exported'
+    paths = {a['path']: a['id'] for a in r2s['artifacts']}
+    assert client.request('GET', f'/api/artifacts/{paths["poc.py"]}/content', expect=(403,))['code'] == 'upstream_proof_not_exported'
+    assert client.request('GET', f'/api/artifacts/{paths["report.md"]}/content', raw=True) == r2s_files['report.md']
+    print('PASS an Upstream Finding shows its Disclosure report for copying, and its Proof is never exported')
+
+    labs = f'/api/findings/{r2s["id"]}/lab-runs'
+    assert client.request('POST', labs, {'password': 'wrong-' + suffix}, expect=(403,))['code'] == 'approval_refused'
+    client.wait(client.request('POST', labs, {'password': password}, expect=(202,)), timeout=600)
+    r2s = client.request('GET', f'/api/findings/{r2s["id"]}')
+    run = r2s['lab_runs'][0]
+    assert run['status'] == 'verified', run
+    assert (run['packages'], run['locked_version'], run['own_ref']) == (['react-server-dom-webpack'], '19.0.0', 'd' * 40), run
+    assert r2s['status'] == 'confirmed' and r2s['cause']['by'] == 'proof'
+    print('PASS React2Shell stand-in 19.0.0 reproduces in a Lab after Approval')
+
+    link = f'/api/applications/{node["id"]}/repositories/{upstream["repository_id"]}'
+    assert client.request('PATCH', link, {'locked_version': '19.0.1'})['locked_version'] == '19.0.1'
+    wait_kind(client, node, 'exposure_check')  # none is queued while the repository has no Verdict
+    client.wait(client.request('POST', labs, {'password': password}, expect=(202,)), timeout=600)
+    after = client.request('GET', f'/api/findings/{r2s["id"]}')
+    run = after['lab_runs'][0]
+    assert (run['status'], run['locked_version']) == ('not_reproduced', '19.0.1'), run
+    assert (after['status'], after['cause']) == (r2s['status'], r2s['cause'])
+    print('PASS the fixed 19.0.1 stand-in shows Not reproduced and leaves the Finding as it was')
+
+    for application in [github, wordpress, own, node]:
         client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})
     client.request('POST', '/api/auth/logout', {})
     client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(401,), raw=True)

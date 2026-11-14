@@ -13,9 +13,9 @@ from datetime import timedelta
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from yaml import YAMLError
-from . import artifacts, cves, dependencies, detection, domain, prompts, remediation
+from . import artifacts, cves, dependencies, detection, domain, exposure, prompts, remediation
 from . import fingerprints as fingerprinting
 from .models import (
     Account,
@@ -25,6 +25,7 @@ from .models import (
     AuditContext,
     Commit,
     CVE,
+    Exposure,
     Finding,
     Job,
     JobAttempt,
@@ -301,7 +302,16 @@ def pin_message(pin):
         return "Using the requested source revision"
     if pin["basis"] == "commit_finding":
         return "Using the vulnerable revision from the linked commit analysis"
+    if pin["basis"] == "own_head":
+        return "Using the Own repository's head, where the Lab installs the Locked version"
     return "No vulnerable release pinned; retained the current checkout: " + pin["reason"]
+
+
+def lab_packages(locked):
+    """The packages and locked_version facts of an Upstream Proof (A07): of domain.locked_packages'
+    `locked`, the npm packages its Lab installs at their Locked version, else None."""
+    npm = locked if locked and locked[0] == "npm" else None
+    return {"packages": npm and npm[1], "locked_version": npm and npm[2]}
 
 
 def credential_strings(value, sensitive=False):
@@ -329,6 +339,23 @@ def credential_strings(value, sensitive=False):
     if isinstance(value, list):
         return [secret for entry in value for secret in credential_strings(entry, sensitive)]
     return [value] if sensitive and isinstance(value, str) and len(value) >= 8 else []
+
+
+def remediation_step(db, application, finding, commit, exposed):
+    """The Upstream column's Remediation PR step (A06) for the Finding of `commit`, from the
+    Application's Exposure row `exposed` to it: a pin to the newest release without a
+    Vulnerability introduced or Malicious change, or a bump to the first release that contains a
+    Vulnerability fix. Until Exposure knows that release it drafts nothing, and the step reads
+    no_safe_release or waiting_for_release; without an Own repository draft_remediation skips it."""
+    if domain.finding_cell(db, finding) != ("upstream", exposed.verdict):
+        return None
+    dependency = domain.upstream_dependency(db, application, db.get(Repository, commit.repository_id),
+                                            exposed.data.get("target"))
+    if dependency is None:
+        return None
+    action = "bump" if exposed.verdict == "Vulnerability fix" else "pin"
+    return domain.draft_remediation(db, application, finding, commit.id, action, commit.revision, automatic=True,
+                                    dependency=dependency)
 
 
 def all_secrets(db, vault):
@@ -767,6 +794,17 @@ class Workflows:
         if baseline:
             repository.baseline_revision = head
         self.queue_derivation(db, repository, head, imported)
+        # A release that contains a fix may have been tagged (A06): each Application still waiting
+        # for one, for an exposed Vulnerability fix with an open or confirmed Finding, is checked
+        # again, and its bump drafts once a tag contains the fix.
+        # ponytail: a tag added without a new commit is seen at the next non-304 check
+        for row in db.scalars(select(Exposure).join(Finding, and_(
+                Finding.application_id == Exposure.application_id, Finding.source == "commit",
+                Finding.data["source_commit_id"].as_string() == Exposure.commit_id)).where(
+                Exposure.repository_id == repository.id, Exposure.verdict == "Vulnerability fix",
+                Exposure.state != "not_exposed", Finding.status.in_(("open", "confirmed")))):
+            if not row.data.get("target"):
+                domain.queue_exposure(db, db.get(Application, row.application_id), repository)
         for linked, _ in domain.linked_applications(db, repository):
             source = domain.source_repository(db, linked)
             if source is None or source.id != repository.id:
@@ -893,7 +931,9 @@ class Workflows:
             raise DomainError("input_changed", "This repository is no longer the Own repository", 409)
         previous = domain.source_repository(db, application)
         current = {repository.source_url: link for link, repository in rows}
-        added, removed = [], []
+        # A link that is new, back, or locked at another version gets its Exposure recomputed (A05).
+        before = {url: (link.locked_version, link.removed_at) for url, link in current.items()}
+        added, removed, relocked = [], [], []
         for url, packages in found.items():
             link = current.get(url)
             if link is not None and link.role == "own":
@@ -915,6 +955,8 @@ class Workflows:
                 link.locked_version = version
                 link.locked_version_source = "manifest" if version else None
             link.packages, link.removed_at = [package for package, _ in packages], None
+            if before.get(url) != (link.locked_version, None):
+                relocked.append(link)
         for url, link in current.items():
             derived = link.role == "upstream" and link.packages
             if derived and url not in found and link.removed_at is None:
@@ -923,6 +965,8 @@ class Workflows:
         own_link.unresolved, own_link.derived_revision = unresolved, ref
         db.flush()
         domain.source_changed(db, application, previous.id if previous else None)
+        for link in relocked:
+            domain.queue_exposure(db, application, db.get(Repository, link.repository_id))
         if added and application.monitor_enabled and not application.archived:
             application.next_check_at = now()  # new repositories get their Baseline
         return {
@@ -1385,6 +1429,14 @@ class Workflows:
                 files.update({"before-source/" + path: data for path, data in before_files.items() if path != "manifest.json"})
             except DomainError as exc:
                 before_error = {"code": exc.code, "message": exc.message}
+        linked = [(a, link) for a, link in domain.linked_applications(db, repository) if domain.in_use(a, link)]
+        upstream = any(link.role == "upstream" for _, link in linked)
+        # The Proof bundle is drafted for one vulnerable app (A07): the Own repository at this commit
+        # when an Application uses it as its Own, else a minimal app that pins the Locked version.
+        # run_playbook gives it only to the Applications whose Lab builds that app.
+        rule = "own_commit" if any(link.role == "own" for _, link in linked) else "minimal"
+        locked = next((found for a, link in linked if rule == "minimal" and link.role == "upstream"
+                       and (found := domain.locked_packages(db, a, repository))), None)
         result, outputs, _ = self.agent(
             db,
             job,
@@ -1398,9 +1450,11 @@ class Workflows:
                 "source_kind": repository.source_kind,
                 "parent_revisions": commit.data.get("parent_revisions", []),
                 # An Own-repository Proof's Lab supplies the repository itself (A07).
-                "own_repository": any(
-                    link.role == "own" for _, link in domain.linked_applications(db, repository)
-                ),
+                "own_repository": rule == "own_commit",
+                "vulnerable_app": rule,
+                **lab_packages(locked),
+                # An Upstream Vulnerability introduced drafts a Disclosure report (A06).
+                "upstream": upstream,
                 "before_ref": before_ref,
                 "before_source_error": before_error,
                 "source_delta": "Source is pinned to the analyzed commit revision; its diff supplies before/after evidence.",
@@ -1408,6 +1462,7 @@ class Workflows:
             limits={"timeout_seconds": ANALYSIS_SECONDS},
         )
         check_verdict(result)
+        result = {**result, "vulnerable_app": rule}
         if "report.md" not in outputs:
             raise DomainError("missing_report", "Analysis completed without report.md", 422)
         if not commit.data.get("diff_complete") and result["verdict"] in ("Unrelated", "Security hardening"):
@@ -1415,32 +1470,25 @@ class Workflows:
             # can never be ruled Unrelated or mere hardening.
             result = {**result, "verdict": "Insufficient context"}
         verdict = result["verdict"]
-        vulnerable_ref, revision_error = None, None
-        if verdict in FINDING_VERDICTS:
-            try:
-                # Legacy parent resolution and SVN snapshotting may heartbeat or
-                # perform source I/O. Finish them before holding the publication fence.
-                vulnerable_ref = self.commit_finding_ref(db, repository, commit, result, outputs)
-            except DomainError as exc:
-                # The Verdict still opens its Findings; only the drafted bundle, pinned to a
-                # revision that fails validation, is not published. The error stays on the Analysis.
-                revision_error = exc
-                result = {**result, "bundle_error": exc.as_dict()}
-        if verdict == "Malicious change":
-            # Application code checks the drafted indicators and computes the cleanup report's
-            # commits and releases from repository data (A07), before holding the fence.
-            indicators = detection.check_indicators(commit, source_files, result["indicators"])
-            commits, truncated = detection.containing_commits(db, repository, commit)
-            releases = None  # Unknown: a WordPress plugin, or the tags could not be read.
-            if repository.source_kind == "github":
-                revisions = {row["revision"] for row in commits}
-                try:
-                    releases = [name for name, sha in self.source_client(db).github_tags(repository) if sha in revisions]
-                except DomainError:
-                    pass
-            static = {"report.md": outputs["report.md"], "indicators.json": json.dumps(indicators, indent=2).encode()}
-            if "detection-rule.yar" in outputs:
-                static["detection-rule.yar"] = outputs["detection-rule.yar"]
+        if verdict in domain.OPENING_VERDICTS and (upstream or verdict == "Malicious change"):
+            # Exposure (A05) and the cleanup report's containment (A07) come from release tags.
+            def read(run):
+                shas = self.backports(run, repository, commit)
+                return (self.exposures(db, repository, commit, verdict, run, shas),
+                        self.verdict_inputs(db, repository, commit, result, outputs, source_files, run, shas))
+
+            found, (result, prepared) = self.read_tags(db, repository, read)
+        else:
+            found, (result, prepared) = {}, self.verdict_inputs(db, repository, commit, result, outputs, source_files, None)
+        if verdict == "Vulnerability fix":
+            # The Deployed version check (A06) of each Application whose Own repository this is,
+            # at its latest observation.
+            prepared["deployed"] = {}
+            for owner, link in domain.linked_applications(db, repository):
+                if link.role == "own" and domain.in_use(owner, link):
+                    observed = domain.last_observation(db, owner)
+                    checks = self.deployed_checks(db, owner, observed and observed.data, [commit])
+                    prepared["deployed"][owner.id] = (checks[commit.id], observed and observed.id)
         self.context.fence(db)
         db.refresh(commit, with_for_update=True)
         analysis = Analysis(
@@ -1471,53 +1519,281 @@ class Workflows:
         commit.verdict = verdict
         commit.analysis_state = {"status": "completed", "analysis_id": analysis.id}
         response = {"analysis_id": analysis.id, "commit_id": commit.id, **result}
-        # Each Application the change reaches gets its own Finding (A11). A fix that addresses one
-        # of that Application's Findings is linked to them instead; a Vulnerability introduced or
-        # Malicious change fixes nothing, so its 'addresses' never keep it from opening its own.
-        change = {"commit_id": commit.id, "revision": commit.revision, "analysis_id": analysis.id, "verdict": verdict}
-        cause = {"by": "verdict", "verdict": verdict, "confidence": result["confidence"],
-                 "analysis_id": analysis.id, "commit_id": commit.id}
+        # A not-exposed Upstream Verdict is recorded on the Upstream repository only (A05).
+        exposures = {
+            ident: domain.record_exposure(db, db.get(Application, ident), commit, verdict,
+                                          {**data, "analysis_id": analysis.id})
+            for ident, data in found.items()
+        }
+        # A Locked version that changed while this ran is checked again (A05): a change made before
+        # this Verdict was stored had nothing to recompute. So is an Upstream link added or turned on
+        # while this ran, whose Exposure was never read: its exposure_check runs its Playbook.
+        unread = set()
+        for linked, link in domain.linked_applications(db, repository):
+            db.refresh(link)
+            if linked.id in found:
+                if link.locked_version != found[linked.id]["locked_version"]:
+                    domain.queue_exposure(db, linked, repository)
+            elif verdict in domain.OPENING_VERDICTS and domain.queue_exposure(db, linked, repository):
+                unread.add(linked.id)
         findings = {}
-        for target in domain.affected_applications(db, repository):
-            linked = domain.link_change(db, target, result.get("addresses", []), change)
-            if verdict not in domain.OPENING_VERDICTS or (linked and verdict == "Vulnerability fix"):
+        for target in domain.affected_applications(db, repository, exposures):
+            if target.id in unread:
                 continue
-            finding, _ = domain.open_finding(db, target, "commit", commit.id, result["title"], commit.revision[:7], cause)
-            findings[target.id] = {"finding_id": finding.id}
-            if finding.status not in ("open", "confirmed"):
-                continue  # A closed Finding keeps the evidence and bundle it was closed with.
-            # A later Verdict replaces an earlier Malicious change's static Proof and cleanup report,
-            # unless a Malicious change opened the Finding: it stays one and keeps its static Proof.
-            malicious = domain.malicious_change(db, finding)
-            kept = {k: v for k, v in finding.data.items() if malicious or k not in ("static_proof", "cleanup_report")}
-            finding.data = {**kept, "source_analysis_id": analysis.id, "evidence": result["evidence"]}
-            # Nothing was run, so an incomplete drafted bundle is still published, as a draft.
-            if verdict in FINDING_VERDICTS and not revision_error and not malicious:
-                findings[target.id] = self.publish_finding_bundle(
-                    db, job, target, finding, vulnerable_ref, outputs, {}, require_complete=False
-                )
-            elif verdict == "Malicious change":
-                # The static Proof stays a Draft until its Detection rule validates. Publishing
-                # flushes this data before set_finding_artifacts refreshes the Finding.
-                finding.data = {
-                    **finding.data,
-                    "static_proof": {"analysis_id": analysis.id, "indicators": indicators},
-                    "cleanup_report": {"analysis_id": analysis.id, "commits": commits, "commits_truncated": truncated,
-                                       "releases": releases, "secrets": [s for s in result["reachable_secrets"] if s.strip()]},
-                }
-                findings[target.id] = self.publish_finding_bundle(
-                    db, job, target, finding, commit.revision, static, {}, require_complete=False
-                )
-            # The Own column's Remediation PR (A06, A08): a patch for Vulnerability introduced, the
-            # Cure's revert for a Malicious change. An Upstream Verdict drafts its pin or bump with
-            # Exposure (Phase 7).
-            action = ("revert" if verdict == "Malicious change"
-                      else "patch" if verdict == "Vulnerability introduced" and not malicious else None)
-            if action and getattr(domain.own_repository(db, target), "id", None) == repository.id:
-                domain.draft_remediation(db, target, finding, commit.id, action, commit.revision, automatic=True)
+            entry = self.run_playbook(db, job, target, repository, commit, analysis, result, outputs, prepared,
+                                      exposures.get(target.id))
+            if entry:
+                findings[target.id] = entry
         own = findings.get(application.id, {"finding_id": None})
         analysis.result = {**result, "finding_id": own["finding_id"]}
         return {**response, **own, "finding_ids": [f["finding_id"] for f in findings.values()]}
+
+    def read_tags(self, db, repository, read):
+        """read(run_or_tags) over the repository's release tags (A05): a read-only mirror's run for
+        GitHub, tags/ for a WordPress plugin. Tags that cannot be read, or a read that fails part
+        way, are read again as the DomainError: every Exposure is then unknown, which counts as
+        exposed, and the releases unknown."""
+        source = self.source_client(db)
+        try:
+            if repository.source_kind == "github":
+                with source.github_mirror(repository) as run:
+                    return read(run)
+            return read(source.svn_tags(repository))
+        except DomainError as exc:
+            return read(exc)
+
+    def backports(self, run, repository, commit):
+        """The commit and its backports on the watched branches, when `run` is a mirror's. A backport
+        scan that fails or times out leaves the commit's own containment: a release that only a
+        backport fixes then reads as exposed, never every Exposure as unknown."""
+        if not callable(run):
+            return None
+        try:
+            return [commit.revision, *exposure.equivalents(run, commit.revision, exposure.watched(repository))]
+        except DomainError:
+            return [commit.revision]
+
+    def verdict_inputs(self, db, repository, commit, result, outputs, source_files, run, shas=None):
+        """The I/O a Verdict's Playbook needs, done before the publication fence: (result,
+        prepared). prepared holds the drafted bundle's vulnerable_ref and the vulnerable_app rule it
+        was drafted for, or the revision_error that keeps it from being published (also the result's
+        bundle_error), and for a Malicious change its checked indicators, static Proof files and the
+        cleanup report's containing commits and releases (A07), read from `run` as exposures'
+        run_or_tags (None: not read)."""
+        verdict = result["verdict"]
+        prepared = {"vulnerable_ref": None, "revision_error": None, "vulnerable_app": result.get("vulnerable_app")}
+        if verdict in FINDING_VERDICTS:
+            try:
+                # Legacy parent resolution and SVN snapshotting may heartbeat or
+                # perform source I/O. Finish them before holding the publication fence.
+                prepared["vulnerable_ref"] = self.commit_finding_ref(db, repository, commit, result, outputs)
+            except DomainError as exc:
+                # The Verdict still opens its Findings; only the drafted bundle, pinned to a
+                # revision that fails validation, is not published. The error stays on the Analysis.
+                prepared["revision_error"] = exc
+                result = {**result, "bundle_error": exc.as_dict()}
+        if verdict == "Malicious change":
+            revisions, truncated, releases = [commit.revision], False, None
+            if isinstance(run, dict):
+                releases = exposure.svn_releases(run, commit.revision)
+            elif callable(run):
+                shas = shas or self.backports(run, repository, commit)
+                revisions, truncated = exposure.containing(run, shas, exposure.watched(repository))
+                releases = exposure.releases(run, shas)
+            # Application code checks the drafted indicators and maps the containing commits to the
+            # stored ones (a Backfill commit reaches the Baseline, which is not stored).
+            indicators = detection.check_indicators(commit, source_files, result["indicators"])
+            stored = dict(db.execute(select(Commit.revision, Commit.id).where(
+                Commit.repository_id == repository.id, Commit.source_generation == commit.source_generation,
+                Commit.revision.in_(revisions))).all())
+            static = {"report.md": outputs["report.md"], "indicators.json": json.dumps(indicators, indent=2).encode()}
+            if "detection-rule.yar" in outputs:
+                static["detection-rule.yar"] = outputs["detection-rule.yar"]
+            prepared.update(
+                indicators=indicators, static=static, truncated=truncated, releases=releases,
+                commits=[{"revision": revision, "commit_id": stored.get(revision)} for revision in revisions],
+            )
+        return result, prepared
+
+    def run_playbook(self, db, job, target, repository, commit, analysis, result, outputs, prepared, exposed=None,
+                     fresh_only=False):
+        """One Application's Playbook for the Verdict `result` on `commit` (A06), after the fence:
+        its Finding (A11) with the drafted bundle (its Disclosure report among the files) or the
+        static Proof and cleanup report, and its Remediation PR: the Own column's patch or revert,
+        or, from the Upstream link's Exposure row `exposed`, the pin or bump of remediation_step; and
+        an Own Vulnerability fix's Deployed version check (prepared["deployed"]). A fix that
+        addresses one of the Application's Findings is linked to them instead; a Vulnerability
+        introduced or Malicious change fixes nothing, so its 'addresses' never keep it from opening
+        its own. With fresh_only, a Finding the Application already has is left as it is. Returns
+        {finding_id, ...}, or None when none opens."""
+        verdict = result["verdict"]
+        change = {"commit_id": commit.id, "revision": commit.revision, "analysis_id": analysis.id, "verdict": verdict}
+        cause = {"by": "verdict", "verdict": verdict, "confidence": result["confidence"],
+                 "analysis_id": analysis.id, "commit_id": commit.id}
+        linked = domain.link_change(db, target, result.get("addresses", []), change)
+        if verdict not in domain.OPENING_VERDICTS or (linked and verdict == "Vulnerability fix"):
+            return None
+        finding, fresh = domain.open_finding(db, target, "commit", commit.id, result["title"], commit.revision[:7], cause)
+        if fresh_only and not fresh:
+            return None
+        entry = {"finding_id": finding.id}
+        if finding.status not in ("open", "confirmed"):
+            return entry  # A closed Finding keeps the evidence and bundle it was closed with.
+        # A later Verdict replaces an earlier Malicious change's static Proof and cleanup report,
+        # unless a Malicious change opened the Finding: it stays one and keeps its static Proof.
+        malicious = domain.malicious_change(db, finding)
+        kept = {k: v for k, v in finding.data.items() if malicious or k not in ("static_proof", "cleanup_report")}
+        finding.data = {**kept, "source_analysis_id": analysis.id, "evidence": result["evidence"]}
+        # Nothing was run, so an incomplete drafted bundle is still published, as a draft.
+        if verdict in FINDING_VERDICTS and not prepared["revision_error"] and not malicious:
+            drafted, redraft = outputs, domain.vulnerable_app_rule(db, target, repository) != prepared["vulnerable_app"]
+            if redraft:
+                # Its Lab builds another app (A07), so a repository that is Own for one Application
+                # and Upstream for another never shares a bundle: it gets the reports, and
+                # draft_bundle drafts its own.
+                drafted = {path: outputs[path] for path in ("report.md", "disclosure-report.md") if path in outputs}
+            entry = self.publish_finding_bundle(
+                db, job, target, finding, prepared["vulnerable_ref"], drafted, {}, require_complete=False
+            )
+            if redraft:
+                domain.draft_bundle(db, target, finding)
+        elif verdict == "Malicious change":
+            # The static Proof stays a Draft until its Detection rule validates. Publishing
+            # flushes this data before set_finding_artifacts refreshes the Finding.
+            finding.data = {
+                **finding.data,
+                "static_proof": {"analysis_id": analysis.id, "indicators": prepared["indicators"]},
+                "cleanup_report": {"analysis_id": analysis.id, "commits": prepared["commits"],
+                                   "commits_truncated": prepared["truncated"], "releases": prepared["releases"],
+                                   "secrets": [s for s in result["reachable_secrets"] if s.strip()]},
+            }
+            entry = self.publish_finding_bundle(
+                db, job, target, finding, commit.revision, prepared["static"], {}, require_complete=False
+            )
+        # The Own column's Remediation PR (A06, A08): a patch for Vulnerability introduced, the
+        # Cure's revert for a Malicious change.
+        action = ("revert" if verdict == "Malicious change"
+                  else "patch" if verdict == "Vulnerability introduced" and not malicious else None)
+        if getattr(domain.own_repository(db, target), "id", None) == repository.id:
+            if action:
+                domain.draft_remediation(db, target, finding, commit.id, action, commit.revision, automatic=True)
+            if target.id in prepared.get("deployed", {}):  # An Own Vulnerability fix's Deployed version check
+                domain.apply_deployed_check(db, finding, *prepared["deployed"][target.id])
+        elif exposed is not None:
+            remediation_step(db, target, finding, commit, exposed)
+        return entry
+
+    def exposure_check(self, db, job, application):
+        """Recomputes the Application's Exposure (A05) to each Upstream Verdict on the repository
+        after its Locked version changed, or it was linked: the latest Analysis of each commit of
+        the current generation whose Verdict opens a Finding. The Playbook runs then for each one
+        that now reaches the Application and opened no Finding for it yet; a change to not exposed
+        leaves its Findings as they are. One mirror serves every commit."""
+        repository = domain.get(db, Repository, job.input["repository_id"])
+        links = [(a, link) for a, link in domain.linked_applications(db, repository)
+                 if a.id == application.id and link.role == "upstream" and domain.in_use(a, link)]
+        latest = {}
+        for analysis, commit in db.execute(
+            select(Analysis, Commit).join(Commit, Commit.id == Analysis.subject_id).where(
+                Analysis.kind == "commit_analysis", Commit.repository_id == repository.id,
+                Commit.source_generation == repository.source_generation,
+                Commit.verdict.in_(domain.OPENING_VERDICTS),
+            ).order_by(Analysis.created_at.desc())
+        ):
+            latest.setdefault(commit.id, (commit, analysis))
+        if not links or not latest:
+            return {"checked": 0, "finding_ids": []}
+        ((_, link),) = links
+        version = link.locked_version
+        mine = set(db.scalars(select(Finding.data["source_commit_id"].as_string()).where(
+            Finding.application_id == application.id, Finding.source == "commit")))
+
+        def read(run):
+            found, ready = {}, {}
+            for ident, (commit, analysis) in latest.items():
+                shas = self.backports(run, repository, commit)
+                found[ident] = self.exposures(db, repository, commit, commit.verdict, run, shas, links)[application.id]
+                if found[ident]["state"] != "not_exposed" and ident not in mine:
+                    outputs = artifacts.resource_files(db, self.config.artifact_root, "analysis", analysis.id)
+                    outputs.pop("manifest.json", None)
+                    # Only a Malicious change's indicators read the commit's tree.
+                    source_files = (self.snapshot(db, repository, commit.revision)[1]
+                                    if commit.verdict == "Malicious change" else {})
+                    ready[ident] = (outputs, *self.verdict_inputs(
+                        db, repository, commit, analysis.result, outputs, source_files, run, shas))
+            return found, ready
+
+        found, ready = self.read_tags(db, repository, read)
+        self.context.fence(db)
+        db.refresh(link)
+        if not domain.in_use(application, link) or link.locked_version != version:
+            # Changed again while this ran: that change queued its own check.
+            return {"checked": 0, "finding_ids": []}
+        findings = []
+        for ident, (commit, analysis) in latest.items():
+            verdict = commit.verdict
+            db.refresh(commit, with_for_update=True)
+            if commit.verdict != verdict:
+                continue  # A newer Analysis records its own Exposure.
+            known = db.scalar(select(Exposure).where(Exposure.application_id == application.id,
+                                                     Exposure.commit_id == commit.id))
+            known = bool(known and known.data.get("target"))
+            row = domain.record_exposure(db, application, commit, verdict, {**found[ident], "analysis_id": analysis.id})
+            if ident in ready:
+                outputs, result, prepared = ready[ident]
+                entry = self.run_playbook(db, job, application, repository, commit, analysis, result, outputs,
+                                          prepared, row, fresh_only=True)
+                if entry:
+                    findings.append(entry["finding_id"])
+            elif row.state != "not_exposed" and row.data["target"] and not known:
+                # The release a pin or bump moves to is known now, such as the first tag that
+                # contains a fix: the open Finding's Remediation PR step drafts it.
+                finding = db.scalar(select(Finding).where(
+                    Finding.application_id == application.id, Finding.source == "commit",
+                    Finding.data["source_commit_id"].as_string() == commit.id,
+                    Finding.status.in_(("open", "confirmed"))))
+                if finding:
+                    remediation_step(db, application, finding, commit, row)
+        return {"checked": len(latest), "finding_ids": findings}
+
+    def exposures(self, db, repository, commit, verdict, run_or_tags, shas=None, links=None):
+        """{application_id: found} for each in-use Upstream link of `repository` (A05), or each of
+        `links` ([(application, link)]): the Exposure of `verdict` on `commit` at the link's
+        Locked version, {state, reason, locked_version, tag, target}, where target is the release a
+        pin or bump moves to ({tag, version}, else None), found even without a Locked version.
+        `run_or_tags` is the GitHub mirror's run (`shas`: the commit and its backports, found when
+        omitted), the plugin's SVN tags, or the DomainError that kept them from being read, which
+        makes every Exposure unknown. Exposure does not apply to Own links."""
+        if links is None:
+            links = [(a, link) for a, link in domain.linked_applications(db, repository)
+                     if link.role == "upstream" and domain.in_use(a, link)]
+        if isinstance(run_or_tags, DomainError):
+            reason = f"The release tags could not be read: {run_or_tags.message}"
+            return {a.id: {"state": "unknown", "reason": reason, "locked_version": link.locked_version,
+                           "tag": None, "target": None} for a, link in links}
+        fix, svn = verdict == "Vulnerability fix", isinstance(run_or_tags, dict)
+        if svn:
+            released = bool(exposure.svn_releases(run_or_tags, commit.revision))
+        elif links:
+            run = run_or_tags
+            shas = shas or self.backports(run, repository, commit)
+            released = bool(exposure.releases(run, shas))
+        found = {}
+        for application, link in links:
+            package = link.packages[0].split(":", 1)[-1] if link.packages else repository.plugin_slug
+            version = link.locked_version
+            if svn:
+                tag = next((t for t in exposure.tag_forms(version, package) if t in run_or_tags), None) if version else None
+                contained = bool(tag) and run_or_tags[tag] >= int(commit.revision)
+                target = exposure.svn_target(run_or_tags, commit.revision, fix, package)
+            else:
+                tag = exposure.locked_tag(run, version, package) if version else None
+                contained = bool(tag) and exposure.contains(run, f"refs/tags/{tag}", shas)
+                target = (exposure.first_with if fix else exposure.latest_without)(run, shas, package)
+            state, reason = exposure.decide(verdict, version, tag, contained, released)
+            found[application.id] = {"state": state, "reason": reason, "locked_version": version, "tag": tag,
+                                     "target": target}
+        return found
 
     def commit_finding_ref(self, db, repository, commit, result, outputs):
         ref = result["vulnerable_ref"]
@@ -1749,6 +2025,8 @@ class Workflows:
                     suffix=":fingerprints",
                 )
                 result = merge_fingerprints(result, match, corpus)
+        findings = domain.deployed_findings(db, application)
+        checks = self.deployed_checks(db, application, result, [domain.source_commit(db, f) for f in findings])
         self.context.fence(db)
         row = Observation(
             id=uid(),
@@ -1758,7 +2036,42 @@ class Workflows:
             data={**result, "origin": "script", "profile": recipe.data.get("profile")},
         )
         db.add(row)
+        for finding in findings:
+            domain.apply_deployed_check(db, finding, checks[finding.data["source_commit_id"]], row.id)
         return {"observation_id": row.id, **result}
+
+    def deployed_checks(self, db, application, observed, commits):
+        """The Deployed version check (A06, A11) of each Own-repository Vulnerability fix commit in
+        `commits` at the version that the Application's version check `observed` (an observation's
+        data, or None) detected: {commit_id: {state, version, reason}}. serving_fix where the Own
+        repository's tag for that version contains the fix or a backport of it, before_fix where
+        it does not, and unknown, never a guess, where no fingerprint matches one version, the
+        recipe reads another repository, no tag matches or the tags cannot be read. I/O done before
+        the fence."""
+        own, version = domain.own_repository(db, application), (observed or {}).get("version")
+        source = domain.source_repository(db, application)
+        if not commits:
+            return {}
+        if observed is None:
+            reason = "No version check has run"
+        elif own is None or source.id != own.id:
+            reason = f"The version recipe reads {domain.repository_label(source)}, not the Own repository"
+        elif observed.get("status") != "detected":
+            reason = f"No fingerprint matches one version: the version check reported {observed.get('status')}"
+        else:
+            try:
+                with self.source_client(db).github_mirror(own) as run:
+                    tag = exposure.locked_tag(run, version, None)
+                    if tag:
+                        found = {commit.id: exposure.contains(run, f"refs/tags/{tag}",
+                                                              self.backports(run, own, commit)) for commit in commits}
+                        return {ident: {"state": "serving_fix" if served else "before_fix", "version": version,
+                                        "reason": f"{tag} {'contains' if served else 'does not contain'} the fix"}
+                                for ident, served in found.items()}
+                    reason = f"No release tag of the Own repository matches {version}"
+            except DomainError as exc:
+                reason = f"The Own repository's tags could not be read: {exc.message}"
+        return {commit.id: {"state": "unknown", "version": version, "reason": reason} for commit in commits}
 
     def target_policy(self, application):
         parsed = urlparse(application.asset_url)
@@ -2333,7 +2646,18 @@ class Workflows:
         analysis = domain.get(db, Analysis, analysis_id) if analysis_id else None
         if analysis and not domain.analysis_reaches(db, analysis, application.id):
             raise DomainError("invalid_reference", "Finding analysis belongs to another Application", 422)
-        if analysis and analysis.kind == "commit_analysis" and analysis.result.get("vulnerable_ref") and not job.input.get("source_ref"):
+        # The bundle is drafted for the vulnerable app its Lab builds (A07); a cve Finding's Lab
+        # supplies no Own tree.
+        subject = domain.finding_repository(db, finding)
+        rule = domain.vulnerable_app_rule(db, application, subject)
+        if rule == "own_commit" and domain.source_commit(db, finding) is None:
+            rule = "minimal"
+        if rule == "own_head":
+            # An Upstream Proof's Lab builds the Own repository's head with the Locked version installed.
+            repository = domain.own_repository(db, application)
+            source_ref = repository.cursor
+            pin = {"basis": "own_head", "source_ref": source_ref}
+        elif analysis and analysis.kind == "commit_analysis" and analysis.result.get("vulnerable_ref") and not job.input.get("source_ref"):
             origin = domain.get(db, Commit, analysis.subject_id)
             # The vulnerable revision belongs to the analysed commit's repository.
             repository = db.get(Repository, origin.repository_id)
@@ -2383,6 +2707,9 @@ class Workflows:
             "source_url": repository.source_url,
             "product_name": application.product_name,
             "audit_context": context,
+            "own_repository": rule == "own_commit",
+            "vulnerable_app": rule,
+            **lab_packages(domain.locked_packages(db, application, subject)),
         }
         result, outputs, _ = self.agent(
             db,
@@ -2391,6 +2718,12 @@ class Workflows:
             files,
             facts,
         )
+        # The Disclosure report the Analysis drafted (A06) outlives a regenerated bundle.
+        kept = db.scalar(select(Artifact).where(
+            Artifact.resource_type == "finding", Artifact.resource_id == finding.id,
+            Artifact.revision == (finding.artifact_revision or ""), Artifact.path == "disclosure-report.md"))
+        if kept and "disclosure-report.md" not in outputs:
+            outputs = {**outputs, "disclosure-report.md": artifacts.read_file(self.config.artifact_root, kept)}
         return self.publish_finding_bundle(db, job, application, finding, snapshot.source_ref, outputs, result)
 
     def publish_finding_bundle(
@@ -2436,15 +2769,54 @@ class Workflows:
         if not row:
             raise DomainError("missing_lab_run", "Lab metadata was not recorded", 422)
         finding = domain.get(db, Finding, row.finding_id)
-        if domain.malicious_change(db, finding):  # A later Verdict may have made it one.
-            raise DomainError(
-                "lab_not_allowed",
-                "A Malicious change never runs: its Proof is static, so it has no Lab",
-                409,
-            )
+        domain.require_lab(db, finding)  # A later Verdict or Exposure may have made it one without a Lab.
         files = artifacts.resource_files(
             db, self.config.artifact_root, "finding", finding.id, row.artifact_revision
         )
+        files.pop("disclosure-report.md", None)  # The Operator's to copy; it goes nowhere else (A15).
+        # The vulnerable app the bundle's own files are laid over (A07), the bundle's files winning.
+        commit, repository = domain.source_commit(db, finding), domain.finding_repository(db, finding)
+        locked = domain.locked_packages(db, application, repository)
+        own, ref, tree, source = None, None, {}, {}
+        if commit and domain.vulnerable_app_rule(db, application, repository) == "own_commit":
+            # An Own-repository Proof: the Own repository at the Verdict's commit, from its snapshot.
+            own, ref = repository, commit.revision
+            source = {"source_ref": ref}
+        elif locked:
+            # An Upstream Proof: the Own repository at its default-branch head, or with no Own
+            # repository a minimal app, with the Locked version installed.
+            ecosystem, names, version = locked
+            if ecosystem != "npm":
+                raise DomainError("lab_stack_unsupported", f"Labs run only Node applications; this Upstream "
+                                  f"repository's Locked version is a {ecosystem} package", 422)
+            own = domain.own_repository(db, application)
+            ref = own and own.cursor
+            tree = {"package.json": json.dumps({"name": "asset-monitor-lab", "version": "0.0.0", "private": True,
+                                                "dependencies": dict.fromkeys(names, version)}, indent=2).encode()}
+            source = {"packages": names, "locked_version": version, "own_ref": ref}
+        elif domain.finding_role(db, finding) == "upstream":
+            source = {"bundle_only": "The Upstream link names no package or Locked version to install"}
+        if own is not None:
+            _, tree = self.snapshot(db, own, ref)
+            self.require_clean_tree(db, own, ref)
+        files = {**{"vulnerable-app/" + p: d for p, d in tree.items() if p not in domain.LAB_DROPPED}, **files}
+        if locked:
+            # Exactly the registry's bytes of the Locked version, vendored and pinned as a file: spec,
+            # because a Lab's dependency fetch reaches only the public registry. Phase one installs it
+            # with install scripts disabled, and the app's other dependencies from the registry.
+            npm = self.source_client(db)
+            for name in names:
+                metadata = npm.npm_version(name, version)
+                dist = metadata.get("dist") if isinstance(metadata, dict) else None
+                if not isinstance(dist, dict):
+                    raise DomainError("package_not_found", f"The npm registry has no {name}@{version}", 422)
+                vendored = f".asset-monitor/{name.replace('/', '-')}-{version}.tgz"
+                files["vulnerable-app/" + vendored] = npm.npm_tarball(dist)
+                manifests = {path: files["vulnerable-app/" + path] for path in ("package.json", "package-lock.json")
+                             if "vulnerable-app/" + path in files}
+                files.update({"vulnerable-app/" + path: data for path, data in remediation.dependency_files(
+                    manifests, "npm", name, version, "pin",
+                    {"tarball": "file:" + vendored, "integrity": dist["integrity"]}, spec="file:" + vendored).items()})
         complete = artifacts.completeness(files)
         if complete["status"] != "complete":
             raise DomainError(
@@ -2452,31 +2824,6 @@ class Workflows:
                 "Complete and pin the vulnerable bundle before lab verification",
                 422,
             )
-        source = {}
-        commit = (
-            db.get(Commit, finding.data.get("source_commit_id") or "")
-            if finding.source == "commit"
-            else None
-        )
-        if commit and db.scalar(
-            select(ApplicationRepository.id).where(
-                ApplicationRepository.application_id == finding.application_id,
-                ApplicationRepository.repository_id == commit.repository_id,
-                ApplicationRepository.role == "own",
-            )
-        ):
-            # An Own-repository Proof builds the Own repository at the Verdict's commit, from its
-            # stored snapshot, and the bundle's own files win (A07). Upstream Proofs stay bundle-only.
-            # The repository's .dockerignore belongs to its own Dockerfile, which the bundle's
-            # replaces: it would keep the fetched node_modules out of `COPY . /app/`.
-            _, tree = self.snapshot(db, db.get(Repository, commit.repository_id), commit.revision)
-            own = {
-                "vulnerable-app/" + p: d
-                for p, d in tree.items()
-                if p not in ("manifest.json", ".dockerignore")
-            }
-            files = {**own, **files}
-            source = {"source_ref": commit.revision}
         result, outputs, _ = self.run(db, job, "lab", files=files)
         if result.get("verified") is not True and result.get("status") not in (
             "verified",
@@ -2511,6 +2858,25 @@ class Workflows:
                 all_secrets(db, self.vault),
             )
         return {"lab_run_id": row.id, **row.data}
+
+    def require_clean_tree(self, db, own, ref):
+        """Refuses a Lab whose tree, the Own repository at `ref`, reaches one of its Malicious change
+        commits (AC-A07), as its read-only mirror (A05) says: no job ever executes the payload. A
+        merged Cure revert in that tree clears it."""
+        malicious = list(db.scalars(select(Commit).where(
+            Commit.repository_id == own.id, Commit.source_generation == own.source_generation,
+            Commit.verdict == "Malicious change")))
+        if not malicious:
+            return
+        # ponytail: only a merged Cure revert clears it; a hand revert keeps Labs refused
+        cures = {row.subject: row.data.get("merge_commit_sha") for row in db.scalars(select(RemediationPR).where(
+            RemediationPR.repository_id == own.id, RemediationPR.action == "revert", RemediationPR.status == "merged"))}
+        with self.source_client(db).github_mirror(own) as run:
+            for commit in malicious:
+                cure = cures.get(commit.id)
+                if exposure.contains(run, ref, [commit.revision]) and not (cure and exposure.contains(run, ref, [cure])):
+                    raise DomainError("lab_not_allowed", f"The Lab would build {ref[:7]}, which contains the Malicious "
+                                      f"change {commit.revision[:7]}; merge its Cure revert first", 409)
 
     def detection_rule(self, db, job, application):
         """Validates a static Proof revision's Detection rule (A07) in the runner, where yara only
@@ -2626,22 +2992,26 @@ class Workflows:
                 f", in {repository.source_path} only: changes outside it are not reverted"
                 if repository.source_path else "")
             return self.draft_ready(db, job, row, repository, base, head, diff, True, summary)
-        # A pin or bump; Phase 7 and 8 decide when, and record row.data.dependency.
+        # A pin or bump of every package in row.data.dependency (an Upstream Verdict's, or Phase
+        # 8's advisory; a Phase 6 row names one package).
         dependency = row.data.get("dependency") or {}
-        ecosystem, name, version = dependency["ecosystem"], dependency["name"], dependency["version"]
+        ecosystem, version = dependency["ecosystem"], dependency["version"]
+        names = dependency.get("names") or [dependency["name"]]
         root = (repository.source_path or "").strip("/")
         at = root + "/" if root else ""
-        names = [remediation.MANIFESTS[ecosystem][0]] + (["package-lock.json"] if ecosystem == "npm" else [])
-        current = {f: head[at + f] for f in names if at + f in head}
-        dist = None
-        if ecosystem == "npm":
-            found = self.source_client(db).npm_version(name, version)
-            if found is None:
-                raise DomainError("dependency_version_unknown", f"The npm registry has no {name}@{version}", 422)
-            dist = found.get("dist")
-        edited = remediation.dependency_files(current, ecosystem, name, version, row.action, dist)
+        paths = [remediation.MANIFESTS[ecosystem][0]] + (["package-lock.json"] if ecosystem == "npm" else [])
+        current = {f: head[at + f] for f in paths if at + f in head}
+        edited = current
+        for name in names:
+            dist = None
+            if ecosystem == "npm":
+                found = self.source_client(db).npm_version(name, version)
+                if found is None:
+                    raise DomainError("dependency_version_unknown", f"The npm registry has no {name}@{version}", 422)
+                dist = found.get("dist")
+            edited = {**edited, **remediation.dependency_files(edited, ecosystem, name, version, row.action, dist)}
         diff = remediation.tree_diff({at + p: d for p, d in current.items()}, {at + p: d for p, d in edited.items()})
-        summary = f"{'Pins' if row.action == 'pin' else 'Bumps'} {name} to {version}"
+        summary = f"{'Pins' if row.action == 'pin' else 'Bumps'} {', '.join(names)} to {version}"
         return self.draft_ready(db, job, row, repository, base, head, diff, False, summary)
 
     def draft_ready(self, db, job, row, repository, base, tree, diff, workflows, summary):
@@ -3044,6 +3414,7 @@ def commit_inputs(db, commit):
     record = domain.commit_json(db, commit)
     prior = record.pop("analyses", [])
     record.pop("findings", None)
+    record.pop("exposures", None)
     files = {"commit.json": json.dumps(record, default=str).encode()}
     claims = [
         {

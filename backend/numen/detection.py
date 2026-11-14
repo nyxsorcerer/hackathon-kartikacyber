@@ -3,15 +3,11 @@ them; these helpers check the drafts against the commit. The payload is only eve
 
 import hashlib
 
-from sqlalchemy import select
-
-from .models import Commit
 from .security import DomainError
 
 # A static Proof revision holds these files (AC-12's required set for a Malicious change).
 STATIC_REQUIRED = ("report.md", "detection-rule.yar", "indicators.json")
 RULE_BYTES = 64 * 1024
-CONTAINING_COMMITS = 100
 UNVALIDATED = "The Detection rule has not been validated yet"
 REMOVED = ("removed", "D")  # GitHub's and SVN's status for a deleted file
 # The trees a Detection rule is scanned against, each sent to the runner as its own archive.
@@ -58,41 +54,6 @@ def check_indicators(commit, tree, indicators):
             else:
                 checked["rejected"].append({"kind": key[:-1], "value": value, "reason": "Not in the lines this commit added"})
     return checked
-
-
-def containing_commits(db, repository, commit):
-    """([{revision, commit_id}], truncated): the commit, then the stored commits of the same
-    repository, source generation and branch made after it, oldest first, and for a Backfill
-    commit the Baseline, which contains it too."""
-    # ponytail: approximate containment by branch and commit time; tags on unwatched branches,
-    # backports and reverts are missed. Phase 7's tag containment replaces this.
-    rows = [{"revision": commit.revision, "commit_id": commit.id}]
-    when, branch = commit.data.get("committed_at"), commit.data.get("branch")
-    if when:
-        on_branch = Commit.data["branch"].as_string()
-        rows += [
-            {"revision": row.revision, "commit_id": row.id}
-            for row in db.scalars(
-                select(Commit)
-                .where(
-                    Commit.repository_id == repository.id,
-                    Commit.source_generation == commit.source_generation,
-                    Commit.id != commit.id,
-                    on_branch == branch if branch else on_branch.is_(None),
-                    Commit.data["committed_at"].as_string() > when,
-                )
-                .order_by(Commit.data["committed_at"].as_string(), Commit.id)
-                .limit(CONTAINING_COMMITS)
-            )
-        ]
-    baseline = repository.baseline_revision
-    extra = (
-        [{"revision": baseline, "commit_id": None}]
-        if commit.data.get("backfill") and baseline and baseline not in {r["revision"] for r in rows}
-        else []
-    )
-    keep = CONTAINING_COMMITS - len(extra)
-    return rows[:keep] + extra, len(rows) > keep
 
 
 def rule_text(files):
