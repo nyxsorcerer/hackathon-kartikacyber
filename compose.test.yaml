@@ -20,6 +20,9 @@ services:
       # Exposure's read-only mirror (A05): the fixture answers 404, so a clone fails fast as unknown.
       NUMEN_GITHUB_GIT_URL: http://fixtures:8090/git
       NUMEN_NVD_API_URL: http://fixtures:8090/rest/json/cves/2.0
+      # The Advisory check's OSV feed (A09). The fixture's OSV, GHSA (/advisories) and NVD cpeName
+      # routes list CVE-2026-111497 for node 20.11.1 only and answer every other query empty.
+      NUMEN_OSV_URL: http://fixtures:8090/osv
       NUMEN_NPM_REGISTRY_URL: http://fixtures:8090/npm
       NUMEN_PACKAGIST_URL: http://fixtures:8090/packagist
       NUMEN_WORDPRESS_SVN_URL: svn://fixtures:3690

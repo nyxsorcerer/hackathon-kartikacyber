@@ -23,9 +23,13 @@ REPOSITORY_FIELDS = ("role", "source_kind", "source_url", "source_ref", "source_
 def local_sources(tmp_path, monkeypatch):
     """Git mirrors clone from tmp_path/git and SVN reads go to a missing local repository, so no
     test reaches github.com or plugins.svn.wordpress.org: a repository a test did not build fails
-    fast, which leaves its Exposure unknown. The base that git_repository builds under."""
+    fast, which leaves its Exposure unknown. OSV and NVD point at hosts that never resolve, so an
+    Advisory check a test did not stub records a feed error instead of reaching osv.dev or
+    nvd.nist.gov. The base that git_repository builds under."""
     monkeypatch.setenv("NUMEN_GITHUB_GIT_URL", (tmp_path / "git").as_uri())
     monkeypatch.setenv("NUMEN_WORDPRESS_SVN_URL", (tmp_path / "svn-missing").as_uri())
+    monkeypatch.setenv("NUMEN_OSV_URL", "http://osv.invalid")
+    monkeypatch.setenv("NUMEN_NVD_API_URL", "http://nvd.invalid")
     return tmp_path / "git"
 
 

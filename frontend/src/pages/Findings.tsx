@@ -33,6 +33,7 @@ import {
   applicationsSchema,
 } from "../types";
 import type {
+  AdvisoryRanges,
   Finding,
   Application,
   CleanupReport,
@@ -333,11 +334,13 @@ export function FindingsList({ application }: { application?: Application }) {
                       <td>
                         <Badge>{finding.artifact_state.status}</Badge>
                         <div className="table-subtitle">
-                          {/* A Malicious change never runs: no Lab (ADR-0004). */}
+                          {/* A Malicious change never runs: no Lab (ADR-0004). Nor does an Advisory check match (A06). */}
                           {finding.malicious_change ? (
                             <Badge>Static Proof</Badge>
                           ) : (
-                            <Badge tone={lab.tone}>{lab.label}</Badge>
+                            finding.source !== "advisory" && (
+                              <Badge tone={lab.tone}>{lab.label}</Badge>
+                            )
                           )}
                         </div>
                       </td>
@@ -737,7 +740,8 @@ function FindingBody({
           </>
         }
       />
-      {finding.artifact_state.missing.length > 0 && (
+      {/* Only a Lab or static Proof needs the bundle: an advisory Finding never offers a Lab. */}
+      {finding.artifact_state.missing.length > 0 && (labbed || malicious) && (
         <Callout
           tone="warm"
           title="Draft bundle"
@@ -760,6 +764,13 @@ function FindingBody({
       {finding.playbook.length > 0 && (
         <PlaybookPanel steps={finding.playbook} />
       )}
+      {finding.advisories.map((advisory) => (
+        <AdvisoryPanel
+          key={advisory.id}
+          advisory={advisory}
+          finding={finding}
+        />
+      ))}
       <div className="detail-columns even">
         <Panel
           title="Upstream remediation"
@@ -1068,6 +1079,8 @@ const stepStates: Record<string, string> = {
   no_own_repository: "No Own repository: skipped",
   no_safe_release: "No release without the change to pin",
   no_package: "The Upstream link names no package to change",
+  no_fixed_version: "No fixed version is known yet",
+  not_direct: "Not a direct dependency: update the package that pulls it in",
   not_drafted: "Not drafted",
   pending: "Not validated yet",
   ...deployedLabels,
@@ -1132,6 +1145,109 @@ function DisclosureReportPanel({
       padded
     >
       <pre className="json-view">{report.text}</pre>
+    </Panel>
+  );
+}
+/** Each feed's affected ranges, as the report writes them: "osv: >=20.0.0 <20.19.5 || …". */
+function rangeLines(ranges: AdvisoryRanges) {
+  return Object.entries(ranges).map(
+    ([feed, lists]) =>
+      `${feed}: ${lists.map((list) => list.map(([op, bound]) => op + bound).join(" ") || "all versions").join(" || ")}`,
+  );
+}
+/** An Advisory check match on the Finding (A09, A06): its report, rendered by Asset Monitor from
+ * the feeds' records, its aliases, each pin with its affected ranges, and the version its bump
+ * moves to. Feed text is shown only as text. */
+function AdvisoryPanel({
+  advisory,
+  finding,
+}: {
+  advisory: Finding["advisories"][number];
+  finding: Finding;
+}) {
+  const bump = finding.remediation_prs.find(
+    (pr) => pr.action === "bump" && pr.subject === advisory.vulnerability,
+  )?.dependency;
+  const step = finding.playbook.find((s) => s.step === "remediation_pr");
+  const fixed = bump
+    ? [
+        ...(bump.edits
+          ? [`${bump.name} ${bump.version}`]
+          : Object.entries(bump.versions || {}).map(([n, v]) => `${n} ${v}`)),
+        ...(bump.edits || []).map((e) => `${e.source}: ${e.from} → ${e.to}`),
+      ].join(" · ")
+    : finding.source === "advisory" && step
+      ? stepState(step.step, step.status)
+      : "None: an attached match drafts no bump of its own";
+  return (
+    <Panel
+      title={`Advisory ${advisory.vulnerability}`}
+      description="Rendered by Asset Monitor from the OSV, GHSA and NVD records, shown as text."
+      actions={
+        <CopyButton value={advisory.report} label="Copy the advisory report" />
+      }
+      padded
+    >
+      <DetailGrid
+        items={[
+          [
+            "Aliases",
+            <TextList
+              items={advisory.aliases.filter(
+                (name) => name !== advisory.vulnerability,
+              )}
+            />,
+          ],
+          [
+            "Exposure",
+            <Badge tone={exposureTones[advisory.state]}>
+              {exposureLabels[advisory.state]}
+            </Badge>,
+          ],
+          ["Feeds", advisory.feeds.join(", ").toUpperCase() || "None"],
+          ["Lowest fixed version", fixed],
+        ]}
+      />
+      <div className="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Pin</th>
+              <th scope="col">Pinned version</th>
+              <th scope="col">From</th>
+              <th scope="col">Affected ranges</th>
+              <th scope="col">Exposure</th>
+            </tr>
+          </thead>
+          <tbody>
+            {advisory.pins.map((pin, i) => (
+              <tr key={i}>
+                <td>
+                  <span className="mono">{pin.name}</span>
+                  <span className="table-subtitle">
+                    {pin.ecosystem || "runtime"}
+                  </span>
+                </td>
+                <td className="mono">{pin.version}</td>
+                <td className="mono">{pin.sources.join(", ")}</td>
+                <td>
+                  {rangeLines(pin.ranges).map((line) => (
+                    <div key={line} className="mono">
+                      {line}
+                    </div>
+                  ))}
+                </td>
+                <td>
+                  <Badge tone={exposureTones[pin.state]}>
+                    {exposureLabels[pin.state]}
+                  </Badge>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <pre className="json-view">{advisory.report}</pre>
     </Panel>
   );
 }
@@ -1619,7 +1735,9 @@ function RemediationPRs({
                     ? "This Verdict's Playbook has no Remediation PR."
                     : finding.remediation_actions.length
                       ? "Its Verdict drafts one automatically, or draft one here."
-                      : "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a patch or revert, and an exposed Upstream Verdict a pin or bump."
+                      : finding.source === "advisory"
+                        ? "An Advisory check match is bumped only to a known fixed version of a direct dependency or a runtime pin."
+                        : "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a patch or revert, and an exposed Upstream Verdict a pin or bump."
           }
         />
       )}

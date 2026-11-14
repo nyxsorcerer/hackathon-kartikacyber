@@ -5,10 +5,12 @@ from datetime import timedelta
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
-from . import artifacts, cves, detection
+from . import advisories, artifacts, cves, detection
 from .models import (
     Account,
     Action,
+    AdvisoryCache,
+    AdvisoryMatch,
     Analysis,
     Artifact,
     AuditContext,
@@ -946,7 +948,10 @@ def open_finding(db, application, source, subject, title, ref, cause):
 
 
 def source_commit(db, finding):
-    return db.get(Commit, finding.data.get("source_commit_id") or "") if finding.source == "commit" else None
+    """A commit Finding's source commit, or the exposed Upstream Vulnerability fix that gave an
+    advisory Finding its n-day Proof (run_playbook's fix_commit_id), or None."""
+    key = {"commit": "source_commit_id", "advisory": "fix_commit_id"}.get(finding.source)
+    return db.get(Commit, finding.data.get(key) or "") if key else None
 
 
 def finding_verdict(db, finding):
@@ -969,8 +974,9 @@ def malicious_change(db, finding):
 
 
 # The Own and Upstream columns of the A06 Playbook matrix: the steps each Verdict runs, by the
-# role of the repository it is about. Served content is Phase 9's, the Advisory check Phase 8's.
+# role of the repository it is about, and an Advisory check match's steps. Served content is Phase 9's.
 PLAYBOOKS = {
+    ("advisory", None): ("report", "remediation_pr"),
     ("own", "Vulnerability introduced"): ("proof", "report", "remediation_pr"),
     ("own", "Malicious change"): ("static_proof", "detection_rule", "remediation_pr", "cleanup_report"),
     ("own", "Vulnerability fix"): ("report", "deployed_version_check"),
@@ -981,8 +987,8 @@ PLAYBOOKS = {
 
 
 def finding_repository(db, finding):
-    """The repository the Finding is about: a commit Finding's source commit's, a cve Finding's
-    Application's source repository; None for any other source."""
+    """The repository the Finding is about: its source commit's (source_commit), a cve Finding's
+    Application's source repository; None for any other Finding."""
     if finding.source == "cve":
         return source_repository(db, db.get(Application, finding.application_id))
     commit = source_commit(db, finding)
@@ -997,10 +1003,12 @@ def finding_role(db, finding):
 
 
 def finding_cell(db, finding):
-    """The Finding's (role, Verdict) cell of PLAYBOOKS, or None, as for a Finding the Operator
-    opened on no Verdict, which keeps every step."""
+    """The Finding's cell of PLAYBOOKS: its (role, Verdict), which for an advisory Finding is that
+    of the exposed Upstream Vulnerability fix that gave it an n-day Proof (A16), else ("advisory",
+    None) for an advisory Finding, or None, as for a Finding the Operator opened on no Verdict,
+    which keeps every step."""
     cell = (finding_role(db, finding), finding_verdict(db, finding))
-    return cell if cell in PLAYBOOKS else None
+    return cell if cell in PLAYBOOKS else ("advisory", None) if finding.source == "advisory" else None
 
 
 def finding_exposure(db, finding):
@@ -1068,11 +1076,15 @@ def exportable(db, resource_type, resource_id):
 
 def require_lab(db, finding):
     """Refuses a Lab for a Finding whose Playbook has no Lab Proof (A06): a Malicious change never
-    runs (ADR-0004), and an Own-repository Vulnerability fix gets a report and a Deployed version
-    check instead."""
+    runs (ADR-0004), an Own-repository Vulnerability fix gets a report and a Deployed version
+    check instead, and an Advisory check match a report and a bump Remediation PR, unless an
+    exposed Upstream Vulnerability fix gave its Finding that fix's n-day Proof (finding_cell)."""
     if malicious_change(db, finding):
         raise DomainError("lab_not_allowed", "A Malicious change never runs: its Proof is static, so it has no Lab", 409)
     cell = finding_cell(db, finding)
+    if cell == ("advisory", None):
+        raise DomainError("lab_not_allowed", "An Advisory check match gets a report and a bump Remediation PR, "
+                          "never a Lab Proof", 409)
     if cell and "proof" not in PLAYBOOKS[cell]:
         raise DomainError("lab_not_allowed", "An Own-repository Vulnerability fix gets a report and a Deployed "
                           "version check, not a Lab", 409)
@@ -1185,6 +1197,8 @@ def playbook_steps(db, finding, root):
                       .order_by(RemediationPR.created_at.desc(), RemediationPR.id.desc()).limit(1))
     if own_repository(db, application) is None:
         remediation = "no_own_repository"
+    elif finding.source == "advisory":  # its own bump, with or without an n-day Proof
+        remediation = draft or advisory_dependency(db, finding)[1] or "not_drafted"
     elif draft or cell[0] == "own":
         remediation = draft or "not_drafted"
     else:
@@ -1200,7 +1214,8 @@ def playbook_steps(db, finding, root):
     static = (finding.data.get("static_proof") or {}).get("status", "pending")
     status = {
         "proof": proof,
-        "report": "ready" if "report.md" in paths else "missing",
+        # An advisory Finding's report is rendered from its matches (finding_json's advisories).
+        "report": "ready" if "report.md" in paths or finding.source == "advisory" else "missing",
         "disclosure_report": "ready" if "disclosure-report.md" in paths else "missing",
         "static_proof": static,
         "detection_rule": static,
@@ -1239,15 +1254,241 @@ def own_repository(db, application):
     return next((r for link, r in links(db, application) if link.role == "own" and link.removed_at is None), None)
 
 
+def advisory_repository(db, application):
+    """The repository whose head the Advisory check reads (A09): the Own repository, else the
+    source repository."""
+    return own_repository(db, application) or source_repository(db, application)
+
+
+def queue_advisory(db, application, repository, key):
+    return enqueue(db, "advisory_check", application, repository_input(repository), idempotency_key=key)
+
+
+def schedule_advisory_checks(db):
+    """Queues the Advisory check of each monitored Application once per UTC day (A09), once the
+    repository it reads has a head."""
+    day = now().date().isoformat()
+    for application in db.scalars(select(Application).where(
+            Application.monitor_enabled.is_(True), Application.archived.is_(False))):
+        key = f"advisory:{application.id}:{day}"
+        repository = advisory_repository(db, application)
+        if repository and repository.cursor and db.scalar(select(Job.id).where(Job.idempotency_key == key)) is None:
+            queue_advisory(db, application, repository, key)
+
+
+def store_advisory_cache(db, writes):
+    """Writes the feed answers an Advisory check fetched ({key: {etag, modified, body}}), in key
+    order so two checks that write the same keys at once cannot deadlock."""
+    for key in sorted(writes):
+        values = {**writes[key], "fetched_at": now()}
+        row = db.get(AdvisoryCache, key)
+        if row is None:
+            # As record_exposure: a concurrent check that creates the key first wins, and this one updates it.
+            try:
+                with db.begin_nested():
+                    db.add(AdvisoryCache(key=key, **values))
+                continue
+            except IntegrityError:
+                row = db.get(AdvisoryCache, key)
+        for name, value in values.items():
+            setattr(row, name, value)
+
+
+def record_advisory_matches(db, application, records):
+    """Stores the Advisory check's matches (A09) of `records` ([(feed, record)]) against the pins
+    just collected, one row per (Application, vulnerability), and reads every stored match again
+    against those pins. A vulnerability that shares an alias with stored rows folds into the oldest
+    of them that has a Finding, else the oldest: its key and Finding stay and the aliases merge.
+    Opens no Finding. Returns the Application's rows."""
+    rows = list(db.scalars(select(AdvisoryMatch).where(AdvisoryMatch.application_id == application.id)
+                           .order_by(AdvisoryMatch.created_at, AdvisoryMatch.id)))
+    collected, groups = application.advisory_pins, {}
+    for group in advisories.match(collected, records, [row.aliases for row in rows]):
+        names = set(group["aliases"])
+        overlapping = [row for row in rows if names & set(row.aliases)]
+        if overlapping:
+            row = next((other for other in overlapping if other.finding_id), overlapping[0])
+            # ponytail: a row with another Finding stays beside it, each Finding keeping its own
+            # match, as both were opened before the alias joined them; link the two if this happens
+            for other in overlapping:
+                if other is not row and other.finding_id in (None, row.finding_id):
+                    db.delete(other)
+                    rows.remove(other)
+        else:
+            query = select(AdvisoryMatch).where(AdvisoryMatch.application_id == application.id,
+                                                AdvisoryMatch.vulnerability == group["vulnerability"])
+            try:
+                with db.begin_nested():
+                    row = AdvisoryMatch(application_id=application.id, vulnerability=group["vulnerability"],
+                                        aliases=group["aliases"], state=group["state"], data={})
+                    db.add(row)
+            except IntegrityError:
+                row = db.scalar(query)
+            rows.append(row)
+        row.aliases = sorted(names | set(row.aliases))
+        groups[row.id] = group
+    for row in rows:
+        row.data, row.state = advisories.refresh(row.data or {}, groups.get(row.id), collected)
+        row.updated_at = now()
+    return rows
+
+
+def finding_aliases(db, finding):
+    """The vulnerability ids a commit or cve Finding goes by (A09): a cve Finding's CVE id, the
+    non-SHA `addresses` of a commit Finding's source Analysis, and the aliases of the Advisory check
+    matches attached to it."""
+    if finding.source == "cve":
+        names = {finding.cve_id}
+    else:
+        # ponytail: the addresses of fixes linked to the Finding are not read; read them too if a
+        # linked fix names an advisory that its source Analysis does not
+        analysis = db.get(Analysis, finding.data.get("source_analysis_id") or "")
+        names = {a for a in (analysis.result.get("addresses", []) if analysis else [])
+                 if not re.fullmatch(r"[0-9a-f]{7,64}", a)}
+    attached = db.scalars(select(AdvisoryMatch.aliases).where(AdvisoryMatch.finding_id == finding.id))
+    return names.union(*attached)
+
+
+def attach_advisory(db, application, match):
+    """Gives an exposed or unknown Advisory check match its Finding, once (A09, A11): the
+    Application's oldest Open or Confirmed commit or cve Finding that goes by one of its aliases,
+    which the match Confirms without an Alert and drafts nothing for; else a Finding with source
+    advisory, which open_finding alerts, an exposed match Confirms (an unknown one leaves it
+    Open), and whose bump Remediation PR is drafted when the Application has an Own repository.
+    A match that has a Finding keeps it, so a Dismissed or Remediated one is never reopened.
+    Returns "opened", "attached" or None."""
+    if match.state == "not_exposed" or match.finding_id:
+        return None
+    names, cause = set(match.aliases), {"by": "advisory", "advisory_id": match.vulnerability}
+    # ponytail: an Analysis committing at the same time as this check can open its commit Finding
+    # beside the advisory one, since run_playbook does not lock the Application row; lock it there
+    # if two Findings for one vulnerability show up
+    target = next((finding for finding in db.scalars(select(Finding).where(
+        Finding.application_id == application.id, Finding.source.in_(("commit", "cve")),
+        Finding.status.in_(("open", "confirmed"))).order_by(Finding.created_at, Finding.id))
+        if finding_aliases(db, finding) & names), None)
+    if target is not None:
+        match.finding_id = target.id
+        db.add(Action(resource_type="finding", resource_id=target.id, data={
+            "action": "advisory_attached", "vulnerability": match.vulnerability, "aliases": match.aliases}))
+        transition_finding(db, target, "confirmed", cause)
+        return "attached"
+    pin = next(entry for entry in match.data["pins"] if entry["state"] != "not_exposed")
+    title = f"{pin['name']} {pin['version']}: {match.data.get('summary') or match.vulnerability}"
+    cause = {**cause, "aliases": match.aliases}
+    finding, opened = open_finding(db, application, "advisory", match.vulnerability, title, match.vulnerability, cause)
+    if opened:
+        if match.state == "exposed":
+            transition_finding(db, finding, "confirmed", cause)
+        finding.data = {**finding.data, "target_applicability": "affected" if match.state == "exposed" else "unknown"}
+        # A06: the bump to the lowest fixed version, drafted by application code, opens after Approval.
+        own = own_repository(db, application)
+        dependency, _ = advisories.target(match.data, application.advisory_pins)
+        if own is not None and dependency:
+            draft_remediation(db, application, finding, match.vulnerability, "bump", own.cursor, automatic=True,
+                              dependency=dependency)
+    match.finding_id = finding.id
+    return "opened" if opened else None
+
+
+def advisory_dependency(db, finding):
+    """(dependency, reason) of the bump an advisory Finding gets from the match that opened it
+    (advisories.target), or (None, None) for any other Finding."""
+    match = finding.source == "advisory" and db.scalar(select(AdvisoryMatch).where(
+        AdvisoryMatch.finding_id == finding.id, AdvisoryMatch.vulnerability == finding.data.get("subject_id")))
+    if not match:
+        return None, None
+    return advisories.target(match.data, db.get(Application, finding.application_id).advisory_pins or {})
+
+
+def bumped(match, pins):
+    """{name: versions} of the newly collected `pins` of each runtime or package the match lists,
+    when every one of them is readable and outside the match's ranges; else None, as when one is
+    no longer collected."""
+    versions = {}
+    for entry in match.data.get("pins", []):
+        key = (entry["kind"], entry["ecosystem"], entry["name"])
+        found = [pin["version"] for pin in pins["runtimes" if key[0] == "runtime" else "packages"]
+                 if pin["name"] == key[2] and pin.get("ecosystem") == key[1]]
+        if not found or any(advisories.pin_state(version, entry["ranges"], advisories.scheme_of(key))
+                            != "not_exposed" for version in found):
+            return None
+        versions.setdefault(key[2], set()).update(found)
+    return versions or None
+
+
+def remediate_advisories(db, application, pins, revision):
+    """A version bump seen on the Own repository's default branch (A09, A11): each Open or
+    Confirmed Finding of Advisory check matches (the advisory Finding a match opened, or the
+    commit or cve Finding it attached to) is Remediated when every one of its matches, as
+    record_advisory_matches just read them again with the feeds' latest ranges, is bumped by the
+    newly collected `pins`. The only caller that remediates by version_bump."""
+    grouped = {}
+    for match, finding in db.execute(select(AdvisoryMatch, Finding).join(
+            Finding, Finding.id == AdvisoryMatch.finding_id).where(
+            AdvisoryMatch.application_id == application.id, Finding.status.in_(("open", "confirmed")))
+            .order_by(AdvisoryMatch.vulnerability)):
+        grouped.setdefault(finding.id, (finding, []))[1].append(match)
+    for finding, matches in grouped.values():
+        found = [bumped(match, pins) for match in matches]
+        if all(found):
+            versions = {}
+            for held in found:
+                for name, values in held.items():
+                    versions.setdefault(name, set()).update(values)
+            transition_finding(db, finding, "remediated", {
+                "by": "version_bump", "advisory_id": matches[0].vulnerability, "revision": revision,
+                "versions": {name: sorted(values) for name, values in versions.items()}})
+
+
+def advisory_json(row):
+    return {"id": row.id, "vulnerability": row.vulnerability, "aliases": row.aliases, "state": row.state,
+            "finding_id": row.finding_id, **row.data, "updated_at": row.updated_at}
+
+
+def advisories_json(db, application):
+    """The pins the last Advisory check collected and its matches. Each pin has its Exposure:
+    unknown when its version cannot be read; else the worst state of the matches that list it, or
+    not_exposed when none does and a feed answered; null before any feed answered."""
+    pins = {"repository_id": None, "revision": None, "collected_at": None, "feeds": {}, "runtimes": [],
+            "packages": [], **(application.advisory_pins or {})}
+    rows = db.scalars(select(AdvisoryMatch).where(AdvisoryMatch.application_id == application.id)
+                      .order_by(AdvisoryMatch.vulnerability)).all()
+    states = {}
+    for row in rows:
+        for entry in row.data.get("pins", []):
+            states.setdefault((entry["kind"], entry["ecosystem"], entry["name"], entry["version"]), set()).add(
+                entry["state"])
+    answered = any("error" not in feed for feed in pins["feeds"].values())
+    readable = advisories.index(pins)
+    for kind, label in (("runtimes", "runtime"), ("packages", "package")):
+        listed = []
+        for pin in pins[kind]:
+            key = (label, pin.get("ecosystem"), pin["name"])
+            if pin not in readable.get(key, []):
+                exposure = "unknown"
+            elif (*key, pin["version"]) in states:
+                exposure = advisories.worst(states[(*key, pin["version"])])
+            else:
+                exposure = "not_exposed" if answered else None
+            listed.append({**pin, "exposure": exposure})
+        pins[kind] = listed
+    pins["matches"] = [advisory_json(row) for row in rows]
+    return pins
+
+
 def remediation_actions(db, finding):
     """The Remediation PRs the Operator may draft for the Finding (A06), with an Own repository.
     On a commit of the Own repository: a revert (the Cure) for a Malicious change; a patch or a
     revert for a Vulnerability introduced, or for a commit with no Verdict yet (a Finding the
     Operator opened); none for any other Verdict, so a Vulnerability fix is never reverted. On an
     Upstream commit, once its Exposure knows the release to move to: a pin for a Vulnerability
-    introduced or Malicious change, a bump for a Vulnerability fix."""
+    introduced or Malicious change, a bump for a Vulnerability fix. For an advisory Finding, a bump
+    once its match has a fixed version to move to."""
     application = db.get(Application, finding.application_id)
     own = own_repository(db, application)
+    if finding.source == "advisory":
+        return ["bump"] if own is not None and advisory_dependency(db, finding)[0] else []
     commit = source_commit(db, finding)
     if own is None or commit is None:
         return []
@@ -1379,7 +1620,8 @@ def remediation_json(row):
 def link_change(db, application, addresses, change):
     """Links a change ({commit_id, revision, analysis_id, verdict}) to the Application's Findings,
     in any state, that its Analysis says it addresses: a commit SHA, full or abbreviated, matches
-    the Finding's source commit, and any other id its CVE or advisory id. A fix addressing a
+    the Finding's source commit, and any other id its CVE or advisory id, or an alias of an
+    Advisory check match attached to it. A fix addressing a
     Dismissed or Remediated Finding is linked to it too, so it opens nothing new. It never looks
     at another Application's Findings, and it leaves status and cause as they are. Returns the
     linked Findings, which for a change linked before are the ones it was linked to then."""
@@ -1395,6 +1637,9 @@ def link_change(db, application, addresses, change):
         return earlier
     shas = [a for a in addresses if re.fullmatch(r"[0-9a-f]{7,64}", a)]
     ids = [a for a in addresses if a not in shas]
+    advised = [row.finding_id for row in db.scalars(select(AdvisoryMatch).where(
+        AdvisoryMatch.application_id == application.id, AdvisoryMatch.finding_id.is_not(None)))
+        if set(row.aliases) & set(ids)]
     # ponytail: prefix match within one Application; a 7-character prefix shared by two of its
     # source commits links both.
     found = [
@@ -1404,6 +1649,7 @@ def link_change(db, application, addresses, change):
                 *(Commit.revision.startswith(sha) for sha in shas),
                 Finding.cve_id.in_(ids),
                 and_(Finding.source == "advisory", Finding.data["subject_id"].as_string().in_(ids)),
+                Finding.id.in_(advised),
             ))
         )
         if finding.data.get("source_commit_id") != change["commit_id"]
@@ -1568,6 +1814,10 @@ def finding_json(db, row, root):
         "deployed_version_check": row.data.get("deployed_version_check"),
         "exposure": exposure_json(exposure) if (exposure := finding_exposure(db, row)) else None,
         "disclosure_report": disclosure_report(db, row, root),
+        # The Advisory check matches attached to it, each with its report, rendered as text.
+        "advisories": [{**advisory, "report": advisories.report(advisory)} for advisory in map(
+            advisory_json, db.scalars(select(AdvisoryMatch).where(AdvisoryMatch.finding_id == row.id)
+                                      .order_by(AdvisoryMatch.vulnerability)))],
         # A06: without an Own repository the Remediation PR steps show "no Own repository".
         "own_repository": own_repository(db, db.get(Application, row.application_id)) is not None,
         "remediation_actions": remediation_actions(db, row),
@@ -1591,6 +1841,7 @@ APPLICATION_SUBJECTS = {
     "backfill": ("source", "repositories"),
     "derive_upstreams": ("source", "repositories"),
     "exposure_check": ("source", "repositories"),
+    "advisory_check": ("advisory", "advisories"),
     "version_recipe": ("version", "version"),
     "version_check": ("version", "version"),
     "audit_context": ("audit", "audit"),

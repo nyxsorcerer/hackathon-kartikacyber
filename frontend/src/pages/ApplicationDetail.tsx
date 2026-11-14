@@ -69,6 +69,7 @@ import { CVEList, cveRows } from "./CVEs";
 import { FindingsList } from "./Findings";
 import { failureGroups } from "./Jobs";
 import { ApplicationRepositories } from "./ApplicationRepositories";
+import { ApplicationAdvisories } from "./ApplicationAdvisories";
 import { jobName, jobOutcome } from "../jobSummary";
 type VersionRecord = NonNullable<Application["version"]>;
 export function ApplicationDetail() {
@@ -262,6 +263,7 @@ function ApplicationBody({
             label: "Repositories",
             count: application.repositories.filter((r) => !r.removed_at).length,
           },
+          { id: "advisories", label: "Advisories" },
           { id: "version", label: "Version" },
           { id: "commits", label: "Commits", count: count(data.commits) },
           { id: "audit", label: "Audit context", count: count(data.audits) },
@@ -324,6 +326,9 @@ function ApplicationBody({
       )}
       {tab === "repositories" && (
         <ApplicationRepositories application={application} refresh={refresh} />
+      )}
+      {tab === "advisories" && (
+        <ApplicationAdvisories application={application} />
       )}
       {tab === "version" && (
         <VersionTab

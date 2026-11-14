@@ -16,7 +16,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from . import artifacts, cves, domain, prompts
@@ -26,6 +26,7 @@ from .db import make_database
 from .models import (
     Account,
     Action,
+    AdvisoryMatch,
     Analysis,
     Artifact,
     AuditContext,
@@ -802,6 +803,24 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             )
         )
 
+    @router.get("/applications/{ident}/advisories")
+    def application_advisories(ident: str, db=database_dependency):
+        """The runtime and package pins the last Advisory check collected (A09)."""
+        return domain.advisories_json(db, domain.get(db, Application, ident))
+
+    @router.post("/applications/{ident}/advisory-checks")
+    def run_advisory_check(
+        ident: str, key: str | None = Header(None, alias="Idempotency-Key"), db=database_dependency
+    ):
+        """The Advisory check, now: it reads the head of the Own repository, else the source repository."""
+        row = domain.get(db, Application, ident)
+        repository = domain.advisory_repository(db, row)
+        if repository is None:
+            raise DomainError("repository_required", "Link a repository to this Application first", 422)
+        if repository.cursor is None:
+            raise DomainError("source_not_checked", "Check this repository once to set its Baseline first", 422)
+        return accepted(domain.queue_advisory(db, row, repository, key))
+
     @router.get("/applications/{ident}/version-observations")
     def observations(
         ident: str, cursor: str | None = None, limit: int = 50, db=database_dependency
@@ -1076,8 +1095,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         )
 
     def remove_finding(db, row):
-        """Deletes the finding, its lab runs and their artifact records and its Remediation PRs,
-        keeping an audit record of what was deleted. Returns the artifact revisions whose folders
+        """Deletes the finding, its lab runs and their artifact records and its Remediation PRs, and
+        frees its Advisory check matches, keeping an audit record of what was deleted. Returns the
+        artifact revisions whose folders
         the caller removes once the rows are gone."""
         labs = list(db.scalars(select(LabRun.id).where(LabRun.finding_id == row.id)))
         owned = or_(
@@ -1088,6 +1108,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         db.execute(delete(Artifact).where(owned))
         db.execute(delete(LabRun).where(LabRun.finding_id == row.id))
         db.execute(delete(RemediationPR).where(RemediationPR.finding_id == row.id))
+        # ponytail: a freed Advisory check match opens a new Finding on its next check while it is
+        # exposed; Dismiss is the way to keep it closed
+        db.execute(update(AdvisoryMatch).where(AdvisoryMatch.finding_id == row.id).values(finding_id=None))
         action(db, "finding", row.id, {
             "action": "deleted",
             "title": row.title,
@@ -1237,26 +1260,33 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     @router.post("/findings/{ident}/remediation-prs")
     def draft_remediation_pr(ident: str, body: RemediationDraftInput, db=database_dependency):
         """The Operator drafts a Remediation PR by hand (A08), such as again after a failed draft:
-        a patch or revert on an Own-repository commit, a pin or bump for an Upstream one. Like a
-        manual Analysis it is neither capped nor counted."""
+        a patch or revert on an Own-repository commit, a pin or bump for an Upstream one, a bump
+        for an Advisory check match. Like a manual Analysis it is neither capped nor counted."""
         finding = domain.get(db, Finding, ident)
         application = domain.get(db, Application, finding.application_id)
         actions = domain.remediation_actions(db, finding)
+        own = domain.own_repository(db, application)
         if body.action not in actions:
             raise DomainError("remediation_unavailable", (
                 "No Own repository: Remediation PR steps are skipped"
-                if domain.own_repository(db, application) is None
+                if own is None
                 else f"This Finding's Playbook drafts a {' or a '.join(actions)}, not a {body.action}"
                 if actions
+                else "An Advisory check match is bumped only to a known fixed version of a direct dependency or "
+                "a runtime pin" if finding.source == "advisory"
                 else "Only a Vulnerability introduced or Malicious change commit of the Own repository gets a "
                 "patch or revert, and an exposed Upstream Verdict a pin or bump once its release is known"
             ), 422)
-        commit = db.get(Commit, finding.data["source_commit_id"])
-        dependency = None
-        if body.action in ("pin", "bump"):
-            dependency = domain.upstream_dependency(db, application, db.get(Repository, commit.repository_id),
-                                                    domain.finding_exposure(db, finding).data["target"])
-        row = domain.draft_remediation(db, application, finding, commit.id, body.action, commit.revision,
+        if finding.source == "advisory":
+            subject, revision = finding.data["subject_id"], own.cursor
+            dependency = domain.advisory_dependency(db, finding)[0]
+        else:
+            commit = db.get(Commit, finding.data["source_commit_id"])
+            subject, revision, dependency = commit.id, commit.revision, None
+            if body.action in ("pin", "bump"):
+                dependency = domain.upstream_dependency(db, application, db.get(Repository, commit.repository_id),
+                                                        domain.finding_exposure(db, finding).data["target"])
+        row = domain.draft_remediation(db, application, finding, subject, body.action, revision,
                                        dependency=dependency,
                                        submitted=body.profile.model_dump() if body.profile else None)
         return accepted(db.get(Job, row.data["job_id"]))

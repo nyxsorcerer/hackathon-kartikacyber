@@ -197,10 +197,69 @@ NODE_COMMIT = {
 
 
 def alias(path: str) -> str:
-    """Repositories outlive a journey run, so each run links its own numen/fixture-<run> and
-    numen/node-app-<run>; numen/react-fixture, the stand-in's Upstream, is the fake Upstream too."""
+    """Repositories outlive a journey run, so each run links its own numen/fixture-<run>,
+    numen/node-app-<run> and numen/advisory-app-<run>; numen/react-fixture, the stand-in's
+    Upstream, is the fake Upstream too."""
     path = re.sub(r'^/repos/numen/(?:fixture-[0-9a-f]+|react-fixture)(?=/|$)', '/repos/numen/fixture', path)
+    path = re.sub(r'^/repos/numen/advisory-app-[0-9a-f]+(?=/|$)', '/repos/numen/advisory-app', path)
     return re.sub(r'^/repos/numen/node-app-[0-9a-f]+(?=/|$)', '/repos/numen/node-app', path)
+
+
+# The Advisory check journey (A09): the Own repository numen/advisory-app-<run> pins Node 20.11.1
+# in its Dockerfile and .nvmrc, which the fixture CVE-2026-111497 affects. OSV, GHSA and NVD each
+# list it, cross-aliased, for node 20.11.1 only and answer every other query empty, so no other
+# journey Application opens an advisory Finding.
+ADVISORY_SHA = 'e' * 40
+ADVISORY_APP = {
+    'Dockerfile': b'FROM node:20.11.1-alpine\nWORKDIR /app\nCOPY server.js .\nCMD ["node", "server.js"]\n',
+    '.nvmrc': b'20.11.1\n',
+    'server.js': b'require("http").createServer((q, r) => r.end("ok")).listen(8080);\n',
+}
+ADVISORY_COMMIT = {
+    'sha': ADVISORY_SHA,
+    'html_url': f'https://github.com/numen/advisory-app/commit/{ADVISORY_SHA}',
+    'commit': {
+        'message': 'Serve the app from the Node 20.11.1 image',
+        'author': {'name': 'Fixture Maintainer', 'email': 'fixture@example.invalid', 'date': '2026-10-03T00:00:00Z'},
+        'committer': {'name': 'Fixture Maintainer', 'date': '2026-10-03T00:00:00Z'},
+    },
+    'parents': [],
+    'files': [{'filename': path, 'status': 'added', 'additions': content.count(b'\n'), 'deletions': 0} for path, content in ADVISORY_APP.items()],
+    'stats': {'additions': sum(content.count(b'\n') for content in ADVISORY_APP.values()), 'deletions': 0},
+}
+NODE_CVE, NODE_GHSA, NODE_OSV = 'CVE-2026-111497', 'GHSA-9c4w-m7v2-x5qh', 'BIT-node-2026-111497'
+NODE_CPE = 'cpe:2.3:a:nodejs:node.js:20.11.1:*:*:*:*:*:*:*'
+OSV_NODE = {
+    'id': NODE_OSV, 'modified': '2026-11-01T00:00:00Z', 'aliases': [NODE_CVE, NODE_GHSA],
+    'summary': 'Node.js HTTP request smuggling (fixture)',
+    'affected': [{'package': {'ecosystem': 'Bitnami', 'name': 'node'}, 'ranges': [{'type': 'SEMVER', 'events': [
+        {'introduced': '20.0.0'}, {'fixed': '20.19.5'}, {'introduced': '22.0.0'}, {'fixed': '22.12.0'}]}]}],
+    'references': [{'type': 'ADVISORY', 'url': 'https://nodejs.org/en/blog/vulnerability/fixture'}],
+}
+GHSA_NODE = {
+    'ghsa_id': NODE_GHSA, 'cve_id': NODE_CVE, 'summary': 'Node.js request smuggling in the HTTP parser (fixture)',
+    'severity': 'high', 'identifiers': [{'type': 'GHSA', 'value': NODE_GHSA}, {'type': 'CVE', 'value': NODE_CVE}],
+    'references': [f'https://github.com/advisories/{NODE_GHSA}'], 'updated_at': '2026-11-01T00:00:00Z',
+    'vulnerabilities': [],
+}
+NVD_NODE = {
+    'id': NODE_CVE, 'lastModified': '2026-11-01T00:00:00.000',
+    'descriptions': [{'lang': 'en', 'value': 'Node.js 20 before 20.19.5 allows request smuggling (fixture).'}],
+    'metrics': {'cvssMetricV31': [{'source': 'fixture@example.invalid', 'cvssData': {'version': '3.1', 'baseScore': 7.5}}]},
+    'configurations': [{'nodes': [{'operator': 'OR', 'negate': False, 'cpeMatch': [{
+        'vulnerable': True, 'criteria': 'cpe:2.3:a:nodejs:node.js:*:*:*:*:*:*:*:*',
+        'versionStartIncluding': '20.0.0', 'versionEndExcluding': '20.19.5'}]}]}],
+    'references': [{'url': f'https://nvd.nist.gov/vuln/detail/{NODE_CVE}'}],
+}
+
+
+def osv_results(queries: list) -> dict:
+    """OSV's querybatch answer: the node record for node 20.11.1 only."""
+    node = {'package': {'ecosystem': 'Bitnami', 'name': 'node'}, 'version': '20.11.1'}
+    return {'results': [
+        {'vulns': [{'id': NODE_OSV, 'modified': OSV_NODE['modified']}]} if isinstance(query, dict)
+        and {key: query.get(key) for key in node} == node else {}
+        for query in queries]}
 
 
 def cve_records() -> dict:
@@ -356,6 +415,24 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(200, NODE_APP[path.rsplit('/', 1)[1]], 'text/plain')
         if path == f'/repos/numen/node-app/tarball/{NODE_SHA}':
             return self.send(200, tar_gz({f'numen-node-app-{NODE_SHA[:7]}/{p}': c for p, c in NODE_APP.items()}), 'application/gzip')
+        if path == '/repos/numen/advisory-app/commits':
+            body = json.dumps([ADVISORY_COMMIT]).encode()
+            etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+            if self.headers.get('If-None-Match') == etag:
+                return self.send(304, b'', headers={'ETag': etag})
+            return self.send(200, body, headers={'ETag': etag})
+        if path == f'/repos/numen/advisory-app/commits/{ADVISORY_SHA}':
+            return self.json(ADVISORY_COMMIT)
+        if path == f'/repos/numen/advisory-app/tarball/{ADVISORY_SHA}':
+            return self.send(200, tar_gz({f'numen-advisory-app-{ADVISORY_SHA[:7]}/{p}': c for p, c in ADVISORY_APP.items()}), 'application/gzip')
+        if path == f'/osv/v1/vulns/{NODE_OSV}':
+            return self.json(OSV_NODE)
+        if path == '/advisories':
+            return self.json([GHSA_NODE] if query.get('cve_id') == [NODE_CVE] else [])
+        if path == '/rest/json/cves/2.0' and 'cpeName' in query:
+            found = [{'cve': NVD_NODE}] if query['cpeName'] == [NODE_CPE] else []
+            first = int(query.get('startIndex', ['0'])[0]) == 0
+            return self.json({'totalResults': len(found), 'vulnerabilities': found if first else []})
         if path.startswith('/npm/react-server-dom-webpack/'):
             version = path.rsplit('/', 1)[1].removeprefix('react-server-dom-webpack-').removesuffix('.tgz')
             if version in NPM_TARBALLS and path.endswith('.tgz'):
@@ -386,6 +463,11 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw) if raw else {}
         except ValueError:
             return self.json({'message': 'Invalid JSON'}, 400)
+        if not path.startswith('/admin/'):
+            with STATE.lock:
+                STATE.requests.append(path)
+        if path == '/osv/v1/querybatch':
+            return self.json(osv_results((data.get('queries') if isinstance(data, dict) else None) or []))
         if path == '/admin/advance':
             with STATE.lock:
                 STATE.generation += 1

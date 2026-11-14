@@ -382,7 +382,61 @@ def main():
     assert (after['status'], after['cause']) == (r2s['status'], r2s['cause'])
     print('PASS the fixed 19.0.1 stand-in shows Not reproduced and leaves the Finding as it was')
 
-    for application in [github, wordpress, own, node]:
+    # The Advisory check (A09, A06): an Own repository pinning Node 20.11.1 in its Dockerfile and
+    # .nvmrc, matched against the fixture's OSV, GHSA and NVD routes, which each list CVE-2026-111497.
+    cve, ghsa_id, osv_id = 'CVE-2026-111497', 'GHSA-9c4w-m7v2-x5qh', 'BIT-node-2026-111497'
+    advisory = client.request('POST', '/api/applications', {
+        **common, 'asset_name': f'Advisory fixture {suffix}', 'product_kind': 'CMS',
+    }, expect=(200, 201))
+    client.request('POST', f'/api/applications/{advisory["id"]}/repositories', {
+        'role': 'own', 'source_kind': 'github', 'source_url': f'https://github.com/numen/advisory-app-{suffix}', 'source_ref': 'main',
+    }, expect=(201,))
+    check_now(client, advisory)
+    checks = f'/api/applications/{advisory["id"]}/advisory-checks'
+    first = client.wait(client.request('POST', checks, {}, expect=(202,)))
+    wait_kind(client, advisory, 'advisory_check')  # and any the scheduler queued
+    wait_kind(client, advisory, 'remediation_draft')
+    assert (first['result']['runtimes'], first['result']['opened']) == (2, 1), first['result']
+
+    def advisory_findings():
+        return [(f['id'], f['source'], f['source_ref']) for f in items(client.request('GET', f'/api/findings?application_id={advisory["id"]}'))]
+
+    def advisory_alerts():
+        return [n for n in fixture.request('GET', '/admin/state')['notifications']
+                if f'Application: Advisory fixture {suffix}' in n['content']]
+
+    ((finding_id, source, ref),) = advisory_findings()
+    assert (source, ref) == ('advisory', cve)
+    found = client.request('GET', f'/api/findings/{finding_id}')
+    (match,) = found['advisories']
+    assert (match['vulnerability'], match['state'], match['feeds']) == (cve, 'exposed', ['ghsa', 'nvd', 'osv']), match
+    assert {ghsa_id, osv_id} <= set(match['aliases'])
+    (pin,) = match['pins']
+    assert (pin['name'], pin['version'], pin['sources']) == ('node', '20.11.1', ['Dockerfile', '.nvmrc']), pin
+    assert pin['ranges'] == {'osv': [[['>=', '20.0.0'], ['<', '20.19.5']], [['>=', '22.0.0'], ['<', '22.12.0']]],
+                             'nvd': [[['>=', '20.0.0'], ['<', '20.19.5']]]}, pin
+    assert match['report'].startswith(f'{cve} (also ') and 'osv: >=20.0.0 <20.19.5 || >=22.0.0 <22.12.0' in match['report']
+    # The bump to the lowest fixed version, drafted by application code, waits for Approval; no Lab.
+    (bump,) = found['remediation_prs']
+    assert (bump['action'], bump['status'], bump['subject']) == ('bump', 'ready', cve), bump
+    assert '-FROM node:20.11.1-alpine\n' in bump['diff'] and '+FROM node:20.19.5-alpine\n' in bump['diff'], bump['diff']
+    refused = client.request('POST', f'/api/findings/{finding_id}/lab-runs', {'password': password}, expect=(409,))
+    assert refused['code'] == 'lab_not_allowed'
+    deadline = time.monotonic() + 30
+    while not advisory_alerts() and time.monotonic() < deadline:
+        time.sleep(0.5)
+    (alert,) = advisory_alerts()
+    assert alert['content'].startswith('Asset Monitor: Advisory\n') and f'Source: {cve}' in alert['content'], alert
+    # The next check opens no duplicate and sends no second Alert.
+    again = client.wait(client.request('POST', checks, {}, expect=(202,)))
+    assert (again['result']['matches'], again['result']['opened']) == (1, 0), again['result']
+    assert advisory_findings() == [(finding_id, 'advisory', cve)] and len(advisory_alerts()) == 1
+    # Every feed request went to a fixture route.
+    feeds = {p for p in fixture.request('GET', '/admin/state')['requests'] if p.startswith(('/osv/', '/advisories', '/rest/json/cves/2.0'))}
+    assert {'/osv/v1/querybatch', '/advisories'} <= feeds <= {'/osv/v1/querybatch', f'/osv/v1/vulns/{osv_id}', '/advisories', '/rest/json/cves/2.0'}, feeds
+    print('PASS the Advisory check opens exactly one advisory Finding for a Dockerfile node pin across OSV, GHSA and NVD, and a second check opens none')
+
+    for application in [github, wordpress, own, node, advisory]:
         client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})
     client.request('POST', '/api/auth/logout', {})
     client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(401,), raw=True)

@@ -20,6 +20,7 @@ const subjectLinks: Record<string, string> = {
   account: "Open connections",
   notification: "Open notified item",
   source: "Open repositories",
+  advisory: "Open Advisories",
   version: "Open version evidence",
   audit: "Open audit context",
   cves: "Open CVE records",
@@ -125,6 +126,33 @@ function successSummary(job: Job): {
       return {
         summary: `Found ${plural(count(r, "repositories") || 0, "Upstream repository", "Upstream repositories")}`,
         facts,
+      };
+    }
+    case "advisory_check": {
+      const unknown = count(r, "unknown") || 0;
+      const matches = count(r, "matches") || 0;
+      const opened = count(r, "opened") || 0;
+      const attached = count(r, "attached") || 0;
+      if (unknown)
+        facts.push(
+          `${plural(unknown, "unreadable version")}, counted as exposed`,
+        );
+      if (matches)
+        facts.push(
+          plural(
+            matches,
+            "exposed or unknown match",
+            "exposed or unknown matches",
+          ),
+        );
+      if (attached) facts.push(`Attached to ${plural(attached, "Finding")}`);
+      const pins = `Collected ${count(r, "runtimes") || 0} runtime and ${plural(count(r, "packages") || 0, "package pin")}`;
+      return {
+        summary: opened
+          ? `${pins} · ${plural(opened, "Finding")} opened`
+          : pins,
+        facts,
+        tone: opened ? "warm" : undefined,
       };
     }
     case "cve_sync": {

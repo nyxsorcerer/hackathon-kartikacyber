@@ -454,6 +454,46 @@ it("summarizes an Upstream derivation", async () => {
   ).toBeInTheDocument();
 });
 
+it("summarizes an Advisory check", async () => {
+  serveJobs([
+    {
+      ...triage,
+      id: "job-advisory",
+      kind: "advisory_check",
+      subject: {
+        type: "advisory",
+        label: "example/portal",
+        ref: null,
+        link: "/applications/application-1?tab=advisories",
+      },
+      result: {
+        source_ref: "f".repeat(40),
+        runtimes: 3,
+        packages: 120,
+        unknown: 1,
+        matches: 2,
+        opened: 1,
+        attached: 1,
+        finding_ids: ["finding-1", "finding-2"],
+      },
+    },
+  ]);
+  renderJob("job-advisory");
+  const outcome = await screen.findByRole("region", { name: "Job outcome" });
+  expect(outcome).toHaveTextContent(
+    "Advisory check succeeded: Collected 3 runtime and 120 package pins · 1 Finding opened",
+  );
+  expect(
+    within(outcome).getByText("1 unreadable version, counted as exposed"),
+  ).toBeInTheDocument();
+  expect(
+    within(outcome).getByText("Attached to 1 Finding"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getAllByRole("link", { name: /Open Advisories/ })[0],
+  ).toHaveAttribute("href", "/applications/application-1?tab=advisories");
+});
+
 it("summarizes an Analysis by its Verdict and confidence", async () => {
   serveJobs([
     {

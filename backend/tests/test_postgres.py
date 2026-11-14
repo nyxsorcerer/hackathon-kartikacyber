@@ -628,6 +628,49 @@ def test_postgres_migration_adds_remediation_prs(schema_url):
     engine.dispose()
 
 
+def test_postgres_migration_adds_advisory_check_tables(schema_url):
+    migrate(schema_url, "c2b3d4e5f6a7")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(text(
+            "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name,"
+            " source_generation, monitor_interval_seconds, monitor_enabled, archived, config, cve_cursor)"
+            " VALUES ('a1', 'Site', 'https://example.com', 'plugin', 'Demo', 1, 300, true, false, '{}', '{}')"
+        ))
+        db.execute(text(
+            "INSERT INTO findings (id, application_id, source, title, status, data, created_at, updated_at)"
+            " VALUES ('f1', 'a1', 'commit', 'Fixture', 'open', '{}', now(), now())"
+        ))
+    insert = text(
+        "INSERT INTO advisory_matches (id, application_id, vulnerability, aliases, finding_id, state, data,"
+        " created_at, updated_at) VALUES (:id, 'a1', 'CVE-2026-111497', '[\"GHSA-fixt-ure0-0001\"]', 'f1',"
+        " 'exposed', '{}', now(), now())"
+    )
+    pins = text(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema()"
+        " AND table_name = 'applications' AND column_name = 'advisory_pins'"
+    )
+    for _ in range(2):  # upgrade, then again after a downgrade
+        migrate(schema_url, "head")
+        drift = alembic(schema_url, "check", check=False)
+        assert drift.returncode == 0, drift.stdout + drift.stderr
+        with engine.begin() as db:
+            assert db.execute(text("SELECT advisory_pins FROM applications")).one() == (None,)
+            db.execute(insert, {"id": "m1"})
+            db.execute(text("INSERT INTO advisory_cache (key, body, fetched_at) VALUES ('osv:node', '{}', now())"))
+        # (Application, vulnerability) is the match's key: a second row is refused.
+        with pytest.raises(IntegrityError), engine.begin() as db:
+            db.execute(insert, {"id": "m2"})
+        alembic(schema_url, "downgrade", "c2b3d4e5f6a7")
+        with engine.begin() as db:
+            assert db.execute(text("SELECT to_regclass('advisory_matches'), to_regclass('advisory_cache')")).one() == (
+                None, None)
+            assert db.execute(pins).scalar() == 0
+            assert db.execute(text("SELECT applications.id, findings.id FROM applications JOIN findings"
+                                   " ON findings.application_id = applications.id")).one() == ("a1", "f1")
+    engine.dispose()
+
+
 def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(postgres, monkeypatch):
     import httpx
     from numen.models import Commit

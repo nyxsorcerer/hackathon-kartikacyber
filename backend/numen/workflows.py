@@ -14,12 +14,12 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 from sqlalchemy import and_, select
-from yaml import YAMLError
-from . import artifacts, cves, dependencies, detection, domain, exposure, prompts, remediation
+from . import advisories, artifacts, cves, dependencies, detection, domain, exposure, prompts, remediation
 from . import fingerprints as fingerprinting
 from .models import (
     Account,
     Action,
+    AdvisoryCache,
     Analysis,
     Artifact,
     AuditContext,
@@ -43,6 +43,7 @@ from .models import (
     VersionRecipe,
     now,
     uid,
+    utc,
 )
 from .schemas import (
     AUDIT_MAX_FUNCTIONS, CHANGE_KINDS, CONFIDENCES, SERVED_CONTENT_VERDICTS, VERDICTS, ModelCapability,
@@ -346,8 +347,9 @@ def remediation_step(db, application, finding, commit, exposed):
     Application's Exposure row `exposed` to it: a pin to the newest release without a
     Vulnerability introduced or Malicious change, or a bump to the first release that contains a
     Vulnerability fix. Until Exposure knows that release it drafts nothing, and the step reads
-    no_safe_release or waiting_for_release; without an Own repository draft_remediation skips it."""
-    if domain.finding_cell(db, finding) != ("upstream", exposed.verdict):
+    no_safe_release or waiting_for_release; without an Own repository draft_remediation skips it.
+    An advisory Finding keeps its own bump (advisory_dependency)."""
+    if finding.source != "commit" or domain.finding_cell(db, finding) != ("upstream", exposed.verdict):
         return None
     dependency = domain.upstream_dependency(db, application, db.get(Repository, commit.repository_id),
                                             exposed.data.get("target"))
@@ -847,19 +849,22 @@ class Workflows:
 
     def queue_derivation(self, db, repository, head, imported):
         """Derives the Upstream repositories of each Application whose Own repository this is:
-        first after its Baseline, then whenever a new commit changes a manifest or lockfile."""
-        changed = any(
-            flag["rule"] == "dependency_manifest"
-            for ident in imported
-            for flag in db.get(Commit, ident).data["prefilter"]
-        )
+        first after its Baseline, then whenever a new commit changes a manifest or lockfile. A new
+        commit that changes a pin file also queues the Advisory check (A09) of each Application
+        that reads this repository (advisory_repository: its Own repository, else its source
+        repository); the daily check is the first one."""
+        commits = [db.get(Commit, ident).data for ident in imported]
+        changed = any(flag["rule"] == "dependency_manifest" for data in commits for flag in data["prefilter"])
+        pins = any(advisories.pin_file(path) for data in commits for file in data.get("files", [])
+                   for path in (file.get("path"), file.get("previous_path")) if path)
         for linked, link in domain.linked_applications(db, repository):
-            if (
-                link.role == "own"
-                and link.removed_at is None
-                and not linked.archived
-                and (changed or link.derived_revision is None)
-            ):
+            if link.removed_at is not None or linked.archived:
+                continue
+            if pins and getattr(domain.advisory_repository(db, linked), "id", None) == repository.id:
+                domain.queue_advisory(db, linked, repository, f"advisory:{linked.id}:{head}")
+            if link.role != "own":
+                continue
+            if changed or link.derived_revision is None:
                 domain.enqueue(
                     db,
                     "derive_upstreams",
@@ -881,9 +886,7 @@ class Workflows:
             wanted = dependencies.direct_dependencies(files)
             locked = dependencies.locked_versions(files)
             recorded = dependencies.composer_sources(files)
-        # Valid JSON or YAML of the wrong shape (an array, a string entry, a package without a
-        # name) fails as AttributeError, KeyError or TypeError.
-        except (ValueError, YAMLError, AttributeError, KeyError, TypeError) as exc:
+        except dependencies.UNREADABLE as exc:
             raise DomainError(
                 "invalid_manifest", f"A manifest or lockfile could not be read: {exc}", 422
             ) from exc
@@ -976,6 +979,97 @@ class Workflows:
             "removed": removed,
             "unresolved": len(unresolved),
         }
+
+    def advisory_check(self, db, job, application):
+        """The Advisory check (A09): collects the Application's runtime and package pins from the
+        head of the repository it reads, with the Operator's or Deployed Locked versions in place
+        of the lockfile's, matches the pins against OSV, GHSA and NVD, remediates the Findings of
+        matches that a bump on the Own repository's default branch moved past the feeds' latest
+        ranges, and gives each exposed or unknown match its Finding (attach_advisory)."""
+        repository = domain.get(db, Repository, job.input["repository_id"])
+        current = domain.advisory_repository(db, application)
+        if current is None or current.id != repository.id:
+            raise DomainError(
+                "input_changed", "The repository this Advisory check reads changed after it was queued", 409
+            )
+        overrides = {
+            tuple(package.split(":", 1)): (link.locked_version, link.locked_version_source)
+            for link, _ in domain.links(db, application)
+            if link.role == "upstream" and domain.in_use(application, link) and link.locked_version
+            and link.locked_version_source in ("operator", "deployed")
+            for package in link.packages
+        }
+        snapshot, files = self.snapshot(db, repository, job.input["source_ref"])
+        pins = advisories.collect(files, repository.source_path, overrides)
+        records, feeds, writes = self.advisory_feeds(db, pins)
+        self.context.fence(db)
+        # ponytail: concurrent checks keep the pins of the one that finishes last, an older head's
+        # if it ran longer; the next change or daily check reads the head again.
+        db.refresh(application, with_for_update=True)
+        application.advisory_pins = {"repository_id": repository.id, "revision": snapshot.source_ref,
+                                     "collected_at": now().isoformat(), "feeds": feeds, **pins}
+        domain.store_advisory_cache(db, writes)
+        rows = domain.record_advisory_matches(db, application, records)
+        if getattr(domain.own_repository(db, application), "id", None) == repository.id:
+            domain.remediate_advisories(db, application, pins, snapshot.source_ref)
+        found = [(row, domain.attach_advisory(db, application, row)) for row in rows]
+        return {"source_ref": snapshot.source_ref, "runtimes": len(pins["runtimes"]),
+                "packages": len(pins["packages"]),
+                "unknown": sum(pin["version"] is None for pin in pins["runtimes"] + pins["packages"]),
+                "matches": sum(row.state != "not_exposed" for row in rows),
+                "opened": sum(how == "opened" for _, how in found),
+                "attached": sum(how == "attached" for _, how in found),
+                "finding_ids": [row.finding_id for row, how in found if how]}
+
+    def advisory_feeds(self, db, pins):
+        """([(feed, record)], {feed: {records} or {error}}, cache writes) for the pins whose version
+        can be read, fetched by this worker (never an agent) through the cache: an OSV record again
+        only when querybatch gives it a new `modified`, a GitHub answer revalidated by its ETag and an
+        NVD answer reused for 12 hours. One feed's error leaves the others matching."""
+        asks, source = advisories.queries(pins), self.source_client(db)
+        records, feeds, writes = [], {}, {}
+
+        def body(key, row):
+            return writes[key]["body"] if key in writes else row.body
+
+        def osv():
+            listed = {}
+            for vulns in source.osv_query(asks["osv"]) if asks["osv"] else []:
+                listed.update((v["id"], v["modified"]) for v in vulns if advisories.ALIAS.fullmatch(v["id"]))
+            for ident, modified in sorted(listed.items()):
+                key = f"osv:{ident}"
+                row = db.get(AdvisoryCache, key)
+                if row is None or not modified or row.modified != modified:
+                    writes[key] = {"etag": None, "modified": modified, "body": source.osv_vuln(ident)}
+                records.append(("osv", body(key, row)))
+
+        def nvd():
+            for name in asks["nvd"]:
+                key = f"nvd:{name}"
+                row = db.get(AdvisoryCache, key)
+                if row is None or now() - utc(row.fetched_at) >= timedelta(hours=12):
+                    writes[key] = {"etag": None, "modified": None, "body": {"vulnerabilities": source.nvd_cpe(name)}}
+                records.extend(("nvd", raw) for raw in body(key, row)["vulnerabilities"])
+
+        def ghsa():
+            for params in asks["ghsa"] + [{"cve_id": cve} for cve in advisories.runtime_cves(records)]:
+                key = "ghsa:" + hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()
+                row = db.get(AdvisoryCache, key)
+                answer = source.ghsa_advisories(params, row and row.etag)
+                if answer is not None:
+                    writes[key] = {"etag": answer[0], "modified": None, "body": {"items": answer[1]}}
+                elif row is None:
+                    continue  # a 304 to no ETag: nothing to reuse
+                records.extend(("ghsa", raw) for raw in body(key, row)["items"])
+
+        for feed, fetch in (("osv", osv), ("nvd", nvd), ("ghsa", ghsa)):
+            before = len(records)
+            try:
+                fetch()
+                feeds[feed] = {"records": len(records) - before}
+            except DomainError as exc:
+                feeds[feed] = {"error": {"code": exc.code, "message": exc.message}}
+        return records, feeds, writes
 
     def import_commits(self, db, repository, records):
         """Stores the records not seen before, each with its Pre-filter result, and queues their
@@ -1622,7 +1716,8 @@ class Workflows:
         static Proof and cleanup report, and its Remediation PR: the Own column's patch or revert,
         or, from the Upstream link's Exposure row `exposed`, the pin or bump of remediation_step; and
         an Own Vulnerability fix's Deployed version check (prepared["deployed"]). A fix that
-        addresses one of the Application's Findings is linked to them instead; a Vulnerability
+        addresses one of the Application's Findings is linked to them instead, and an exposed
+        Upstream one runs this Playbook on the advisory Finding it links to; a Vulnerability
         introduced or Malicious change fixes nothing, so its 'addresses' never keep it from opening
         its own. With fresh_only, a Finding the Application already has is left as it is. Returns
         {finding_id, ...}, or None when none opens."""
@@ -1631,9 +1726,19 @@ class Workflows:
         cause = {"by": "verdict", "verdict": verdict, "confidence": result["confidence"],
                  "analysis_id": analysis.id, "commit_id": commit.id}
         linked = domain.link_change(db, target, result.get("addresses", []), change)
-        if verdict not in domain.OPENING_VERDICTS or (linked and verdict == "Vulnerability fix"):
+        # An exposed Upstream fix of an Open or Confirmed advisory Finding's vulnerability gives that
+        # Finding its n-day Proof (A06, A16): it takes this fix's cell and keeps its advisory bump.
+        advisory = next((f for f in linked if f.source == "advisory" and f.status in ("open", "confirmed")
+                         and f.data.get("fix_commit_id") in (None, commit.id)), None) if (
+            exposed is not None and verdict == "Vulnerability fix") else None
+        if verdict not in domain.OPENING_VERDICTS or (linked and verdict == "Vulnerability fix" and not advisory):
             return None
-        finding, fresh = domain.open_finding(db, target, "commit", commit.id, result["title"], commit.revision[:7], cause)
+        if advisory:
+            finding, fresh = advisory, "fix_commit_id" not in advisory.data
+            finding.data = {**finding.data, "fix_commit_id": commit.id}
+        else:
+            finding, fresh = domain.open_finding(db, target, "commit", commit.id, result["title"],
+                                                 commit.revision[:7], cause)
         if fresh_only and not fresh:
             return None
         entry = {"finding_id": finding.id}
@@ -2992,11 +3097,20 @@ class Workflows:
                 f", in {repository.source_path} only: changes outside it are not reverted"
                 if repository.source_path else "")
             return self.draft_ready(db, job, row, repository, base, head, diff, True, summary)
-        # A pin or bump of every package in row.data.dependency (an Upstream Verdict's, or Phase
-        # 8's advisory; a Phase 6 row names one package).
         dependency = row.data.get("dependency") or {}
         ecosystem, version = dependency["ecosystem"], dependency["version"]
+        if ecosystem == "runtime":
+            # An Advisory check's runtime bump (A06): the Dockerfile FROM tags, .nvmrc, engines and
+            # platform pins its edits name, each still holding the version the check read.
+            edits = dependency["edits"]
+            current = {e["source"]: head[e["source"]] for e in edits if e["source"] in head}
+            diff = remediation.tree_diff(current, {**current, **remediation.runtime_files(current, edits)})
+            summary = f"Bumps {dependency['name']} to {version} ({', '.join(dict.fromkeys(e['source'] for e in edits))})"
+            return self.draft_ready(db, job, row, repository, base, head, diff, False, summary)
+        # A pin or bump of every package in row.data.dependency (an Upstream Verdict's, or an
+        # advisory's with each package's own fixed version in `versions`; a Phase 6 row names one package).
         names = dependency.get("names") or [dependency["name"]]
+        versions = {name: dependency.get("versions", {}).get(name, version) for name in names}
         root = (repository.source_path or "").strip("/")
         at = root + "/" if root else ""
         paths = [remediation.MANIFESTS[ecosystem][0]] + (["package-lock.json"] if ecosystem == "npm" else [])
@@ -3005,13 +3119,16 @@ class Workflows:
         for name in names:
             dist = None
             if ecosystem == "npm":
-                found = self.source_client(db).npm_version(name, version)
+                found = self.source_client(db).npm_version(name, versions[name])
                 if found is None:
-                    raise DomainError("dependency_version_unknown", f"The npm registry has no {name}@{version}", 422)
+                    raise DomainError("dependency_version_unknown",
+                                      f"The npm registry has no {name}@{versions[name]}", 422)
                 dist = found.get("dist")
-            edited = {**edited, **remediation.dependency_files(edited, ecosystem, name, version, row.action, dist)}
+            edited = {**edited, **remediation.dependency_files(edited, ecosystem, name, versions[name], row.action,
+                                                               dist)}
         diff = remediation.tree_diff({at + p: d for p, d in current.items()}, {at + p: d for p, d in edited.items()})
-        summary = f"{'Pins' if row.action == 'pin' else 'Bumps'} {', '.join(names)} to {version}"
+        summary = f"{'Pins' if row.action == 'pin' else 'Bumps'} " + "; ".join(
+            f"{', '.join(n for n in names if versions[n] == v)} to {v}" for v in dict.fromkeys(versions.values()))
         return self.draft_ready(db, job, row, repository, base, head, diff, False, summary)
 
     def draft_ready(self, db, job, row, repository, base, tree, diff, workflows, summary):
@@ -3052,14 +3169,16 @@ class Workflows:
         _, tree = self.snapshot(db, repository, row.base_ref)
         applied = remediation.apply_diff(row.diff, tree, workflows="workflows" in (row.data.get("flags") or []),
                                          prefix=repository.source_path)
-        revision = row.data["revision"]
-        title = f"Asset Monitor {row.action} of {revision[:7]}"
+        # A commit's Remediation PR names its short SHA; an Advisory check's its vulnerability.
+        commit = db.get(Commit, row.subject)
+        ref = row.data["revision"] if commit else row.subject
+        title = f"Asset Monitor {row.action} of {ref[:7]}" if commit else f"Asset Monitor {row.action} for {ref}"
         link = domain.settings(db).data.get("dashboard_url", "").rstrip("/") + f"/findings/{row.finding_id}"
         body = (f"{title}, opened after the Operator's Approval of this exact diff. Review it before "
                 "merging: Asset Monitor never merges." + (f"\n\nFinding: {link}" if link.startswith("http") else ""))
         message = f"{title}\n\nApproved diff SHA-256: {row.diff_sha256}"
         opened = remediation.open_pull_request(self.write_client(db), repository,
-                                               remediation.branch_name(revision, row.action), row.base_ref,
+                                               remediation.branch_name(ref, row.action), row.base_ref,
                                                tree, applied, title, body, message)
         self.context.fence(db)
         row.status, row.data, row.updated_at = "open", {**row.data, **opened, "error": None}, now()

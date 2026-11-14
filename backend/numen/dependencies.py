@@ -14,6 +14,9 @@ GITHUB = re.compile(
     r"(?:github:|(?:git\+)?(?:https?|ssh|git)://(?:git@)?(?:www\.)?github\.com/|git@github\.com:)?"
     r"([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?:[/#].*)?"
 )
+# How the readers below fail on a manifest or lockfile that cannot be read: invalid JSON or YAML,
+# or valid JSON or YAML of the wrong shape (an array, a string entry, a package without a name).
+UNREADABLE = (ValueError, yaml.YAMLError, AttributeError, KeyError, TypeError)
 
 
 def load(files, name):

@@ -269,7 +269,10 @@ def applicability(application, repository, cve, observation):
 
 
 def safe_reference(value):
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+    except ValueError:  # such as an unclosed IPv6 bracket in a feed's URL
+        return False
     return parsed.scheme in ("http", "https") and bool(parsed.hostname)
 
 

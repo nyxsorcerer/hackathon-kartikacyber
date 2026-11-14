@@ -681,10 +681,10 @@ def npm(monkeypatch):
     return registry
 
 
-def react_finding(system, base, own):
-    """The React2Shell fix commit on numen/react, exposed to an Application locking
+def react_fix(system, base, own):
+    """The React2Shell fix commit on numen/react, not analysed yet, of an Application locking
     react-server-dom-webpack@19.0.0: Shop, with its Own repository acme/shop at HEAD (OWN_HEAD),
-    when `own`, else Blog with no Own repository. (Application id, its Finding, the Analysis broker)"""
+    when `own`, else Blog with no Own repository. (Application id, the commit id, the release)"""
     app, client, _ = system
     connection(app)
     _, release, fix = react(base)
@@ -706,6 +706,13 @@ def react_finding(system, base, own):
     with app.state.factory.begin() as db:
         row = db.get(Commit, commit)
         row.data = {**row.data, "parent_revisions": [release]}
+    return ident, commit, release
+
+
+def react_finding(system, base, own):
+    """react_fix analysed to a Vulnerability fix: (Application id, its Finding, the Analysis broker)"""
+    _, client, _ = system
+    ident, commit, release = react_fix(system, base, own)
     job, broker = analyze(system, commit, assessment("Vulnerability fix", release), without_package(pinned_bundle(release)))
     assert job["status"] == "succeeded", job
     (finding_id,) = job["result"]["finding_ids"]

@@ -456,10 +456,92 @@ export const remediationPRSchema = z.object({
   pull_number: z.number().nullable().optional(),
   pull_url: z.string().nullable().optional(),
   merge_commit_sha: z.string().nullable().optional(),
+  /** A commit id, or an Advisory check's vulnerability id. */
+  subject: z.string().optional(),
+  /** What a pin or bump moves to: packages to `version` (each to its own in `versions`), or a
+   * runtime's pins through its `edits`. */
+  dependency: z
+    .object({
+      ecosystem: z.string().optional(),
+      name: z.string().optional(),
+      version: z.string().nullish(),
+      versions: z.record(z.string(), z.string()).optional(),
+      edits: z
+        .array(
+          z.object({ source: z.string(), from: z.string(), to: z.string() }),
+        )
+        .optional(),
+    })
+    .nullable()
+    .optional(),
   created_at: z.string(),
   updated_at: z.string(),
 });
 export type RemediationPR = z.infer<typeof remediationPRSchema>;
+const pinExposureSchema = z.enum(["exposed", "not_exposed", "unknown"]);
+/** A runtime or package pin the Advisory check collected (A09). A null version cannot be read:
+ * its `reason` says why and its Exposure is unknown, which counts as exposed. */
+export const advisoryPinSchema = z.object({
+  name: z.string(),
+  version: z.string().nullable(),
+  source: z.string(),
+  reason: z.string().nullable().optional(),
+  /** A runtime's: dockerfile, nvmrc, engines or platform, and a Dockerfile's image and tag. */
+  field: z.string().optional(),
+  image: z.string().nullable().optional(),
+  tag: z.string().nullable().optional(),
+  /** A package's. */
+  ecosystem: z.string().nullable().optional(),
+  direct: z.boolean().optional(),
+  /** null until a feed answers. */
+  exposure: pinExposureSchema.nullable(),
+});
+export type AdvisoryPin = z.infer<typeof advisoryPinSchema>;
+/** Each feed's affected ranges: lists of [operator, version] comparators, any one of which holds. */
+const advisoryRangesSchema = z.record(
+  z.string(),
+  z.array(z.array(z.tuple([z.string(), z.string()]))),
+);
+export type AdvisoryRanges = z.infer<typeof advisoryRangesSchema>;
+/** One (Application, vulnerability) match of the Advisory check, its OSV, GHSA and CVE aliases as one. */
+export const advisoryMatchSchema = z.object({
+  id: z.string(),
+  vulnerability: z.string(),
+  aliases: z.array(z.string()),
+  state: pinExposureSchema,
+  finding_id: z.string().nullable(),
+  summary: z.string().nullable().optional(),
+  severity: z.string().nullable().optional(),
+  feeds: z.array(z.string()).default([]),
+  pins: z
+    .array(
+      z.object({
+        kind: z.string(),
+        ecosystem: z.string().nullable(),
+        name: z.string(),
+        version: z.string(),
+        sources: z.array(z.string()),
+        ranges: advisoryRangesSchema,
+        state: pinExposureSchema,
+      }),
+    )
+    .default([]),
+  updated_at: z.string().nullable().optional(),
+});
+export type AdvisoryMatch = z.infer<typeof advisoryMatchSchema>;
+/** GET /applications/{id}/advisories: the pins the last Advisory check collected, and its matches. */
+export const advisoriesSchema = z.object({
+  repository_id: z.string().nullable(),
+  revision: z.string().nullable(),
+  collected_at: z.string().nullable(),
+  feeds: z.record(
+    z.string(),
+    z.object({ records: z.number().optional(), error: z.unknown().optional() }),
+  ),
+  runtimes: z.array(advisoryPinSchema),
+  packages: z.array(advisoryPinSchema),
+  matches: z.array(advisoryMatchSchema).default([]),
+});
 export const findingSchema = z.object({
   id: z.string(),
   application_id: z.string(),
@@ -518,6 +600,10 @@ export const findingSchema = z.object({
     .object({ text: z.string(), form_url: z.string().nullable() })
     .nullable()
     .optional(),
+  /** The Advisory check matches attached to it, each with its report as plain text. */
+  advisories: z
+    .array(advisoryMatchSchema.extend({ report: z.string() }))
+    .default([]),
   /** Without one, the Remediation PR steps are skipped (A06). */
   own_repository: z.boolean().default(false),
   /** The drafts the Operator may start by hand: patch and/or revert, or a pin or bump. */

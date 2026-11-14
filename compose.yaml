@@ -160,6 +160,10 @@ services:
     image: asset-monitor-backend-test:0.1.0
     build: {context: ., dockerfile: Dockerfile, target: test}
     restart: no
+    environment:
+      <<: *app-env
+      # A passing test's tmp_path is removed at teardown, so a full run does not fill the disk.
+      PYTEST_ADDOPTS: -o tmp_path_retention_policy=failed
     command: [pytest, -q, -p, no:cacheprovider]
   runner-tests:
     image: asset-monitor-runner-test:0.1.0

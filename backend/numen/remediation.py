@@ -27,8 +27,11 @@ MANIFESTS = {
 }
 
 
-def branch_name(revision, action):
-    return f"asset-monitor/{revision[:7]}-{action}"
+def branch_name(ref, action):
+    """asset-monitor/<short-sha>-<action> for a commit; any other subject, such as an Advisory
+    check's vulnerability, as a slug: asset-monitor/cve-2026-111497-bump."""
+    name = ref[:7] if re.fullmatch(r"[0-9a-f]{7,64}", ref) else re.sub(r"[^a-z0-9]+", "-", ref.lower()).strip("-")
+    return f"asset-monitor/{name}-{action}"
 
 
 def rejected(check):
@@ -215,6 +218,46 @@ def dependency_files(files, ecosystem, name, version, action, dist=None, spec=No
                     else:  # a stale integrity would fail npm ci; npm resolves the version again
                         entry.pop(key, None)
         edited["package-lock.json"] = dump(lock, 2)
+    return edited
+
+
+# A runtime pin a JSON manifest holds: its keys and the manifest's indent.
+RUNTIME_FIELDS = {"engines": (("engines", "node"), 2), "platform": (("config", "platform", "php"), 4)}
+
+
+def runtime_files(files, edits):
+    """The files ({path: bytes}) that a runtime bump's `edits` ([{source, field, from, to}], from
+    advisories.target) change in `files`: the image token of a Dockerfile's FROM lines (a digest
+    after it is dropped, as it names the old image), the version on .nvmrc's first line, or
+    package.json engines.node or composer.json config.platform.php. A source that no longer holds
+    `from` raises pin_changed, so a pin edited since the check is never overwritten."""
+    edited = {}
+    for edit in edits:
+        source, field, old, new = edit["source"], edit["field"], edit["from"], edit["to"]
+        text = edited.get(source, files.get(source) or b"").decode()
+        exact, after = re.compile(r"=?v?" + re.escape(old)), text
+        if field == "dockerfile":
+            token = re.compile(r"(?<=\s)" + re.escape(old) + r"(?:@\S+)?(?=\s|$)")
+            after = "".join(token.sub(new, line) if re.match(r"\s*FROM\s", line, re.I) else line
+                            for line in text.splitlines(keepends=True))
+        elif field == "nvmrc":
+            lines = text.splitlines(keepends=True)
+            first = next((i for i, line in enumerate(lines) if line.strip() and not line.strip().startswith("#")), None)
+            if first is not None and exact.fullmatch(lines[first].strip()):
+                lines[first] = lines[first].replace(old, new, 1)
+                after = "".join(lines)
+        else:
+            keys, indent = RUNTIME_FIELDS[field]
+            data = holder = load({source: text}, source)
+            for key in keys[:-1]:
+                holder = holder.get(key) if isinstance(holder, dict) else None
+            value = holder.get(keys[-1]) if isinstance(holder, dict) else None
+            if isinstance(value, str) and exact.fullmatch(value.strip()):
+                holder[keys[-1]] = value.replace(old, new, 1)
+                after = dump(data, indent).decode()
+        if after == text:
+            raise DomainError("pin_changed", f"{source} no longer pins {old}; run the Advisory check again", 409)
+        edited[source] = after.encode()
     return edited
 
 

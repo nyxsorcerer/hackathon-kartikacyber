@@ -32,6 +32,7 @@ log = logging.getLogger("numen.worker")
 # occupy a slot for minutes or hours.
 LONG_KINDS = (
     "account_login",
+    "advisory_check",
     "audit_context",
     "commit_analysis",
     "commit_triage",

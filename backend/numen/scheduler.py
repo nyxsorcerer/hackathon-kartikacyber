@@ -2,7 +2,7 @@ import time
 from .broker import Broker
 from .config import Config
 from .db import make_database
-from .domain import schedule
+from .domain import schedule, schedule_advisory_checks
 from .queue import recover
 
 
@@ -14,6 +14,8 @@ def main():
         recover(factory, broker)
         with factory.begin() as db:
             schedule(db)
+        with factory.begin() as db:
+            schedule_advisory_checks(db)
         time.sleep(15)
 
 

@@ -65,6 +65,18 @@ def release_branch_candidates(version):
     return [f"{major}.x", *([f"{major}.{minor}"] if minor else []), f"release-{major}", f"v{major}"]
 
 
+def feed_json(response, kind=dict):
+    """The JSON body of an advisory feed's answer, which must be a `kind`: feed data is untrusted."""
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, kind):
+        raise DomainError("invalid_source_response",
+                          f"{response.request.url.host} did not answer with a JSON {kind.__name__}", 502)
+    return body
+
+
 def github_parents(data):
     parents = data.get("parents") if isinstance(data, dict) else None
     if not isinstance(parents, list) or any(not isinstance(p, dict) or not isinstance(p.get("sha"), str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", p["sha"]) for p in parents):
@@ -103,15 +115,18 @@ class Sources:
             if config.test_mode
             else "https://repo.packagist.org"
         )
+        self.osv = os.getenv("NUMEN_OSV_URL", "https://api.osv.dev") if config.test_mode else "https://api.osv.dev"
 
     def close(self):
         self.client.close()
 
-    def get(self, url, params=None, headers=None, limit=MAX_SET):
+    def get(self, url, params=None, headers=None, limit=MAX_SET, json=None):
+        """GET `url`, or POST the `json` body. A 304 is an answer like any other below 400."""
         self.heartbeat()
+        method = "GET" if json is None else "POST"
         for attempt in range(4):
             try:
-                with self.client.stream("GET", url, params=params, headers=headers) as stream:
+                with self.client.stream(method, url, params=params, headers=headers, json=json) as stream:
                     content = bytearray()
                     for chunk in stream.iter_bytes(chunk_size=256 * 1024):
                         self.heartbeat()
@@ -765,6 +780,75 @@ class Sources:
                             422,
                         )
         return list(results.values()), finished.isoformat()
+
+    def osv_query(self, queries):
+        """[[{id, modified}]] of OSV's querybatch, one list per query in order: at most 1000 queries a
+        request, each followed through its next_page_token for at most 10 pages."""
+        results = []
+        for start in range(0, len(queries), 1000):
+            batch = queries[start:start + 1000]
+            found, pending = [[] for _ in batch], dict.fromkeys(range(len(batch)))
+            for _ in range(10):
+                body = {"queries": [{**batch[i], **({"page_token": token} if token else {})}
+                                    for i, token in pending.items()]}
+                items = feed_json(self.get(f"{self.osv}/v1/querybatch", json=body)).get("results")
+                if not isinstance(items, list) or len(items) != len(pending):
+                    raise DomainError("invalid_source_response", "OSV did not answer every query", 502)
+                asked, pending = pending, {}
+                for i, item in zip(asked, items):
+                    item = item if isinstance(item, dict) else {}
+                    found[i] += [{"id": v["id"], "modified": str(v.get("modified") or "")[:64]}
+                                 for v in item.get("vulns") or [] if isinstance(v, dict) and isinstance(v.get("id"), str)]
+                    if isinstance(item.get("next_page_token"), str) and item["next_page_token"]:
+                        pending[i] = item["next_page_token"]
+                if not pending:
+                    break
+            else:
+                raise DomainError("source_history_limit", "OSV answered more than 10 pages for a query", 422)
+            results += found
+        return results
+
+    def osv_vuln(self, ident):
+        """OSV's record of `ident`."""
+        return feed_json(self.get(f"{self.osv}/v1/vulns/{quote(ident, safe='')}"))
+
+    def ghsa_advisories(self, params, etag=None):
+        """(ETag, advisories) of GitHub's advisory database for `params`, with the read token,
+        following the Link header's next page for at most 10 pages; None when `etag` still holds."""
+        headers = self.github_headers()
+        # ponytail: only the first page's ETag is kept, so a change past page one waits until page
+        # one changes too; keep each page's ETag if a 100-package request ever answers more than 100
+        response = self.get(f"{self.github}/advisories", {**params, "per_page": 100},
+                            {**headers, "If-None-Match": etag} if etag else headers)
+        if response.status_code == 304:
+            return None
+        etag, items = response.headers.get("etag"), []
+        for _ in range(10):
+            items += [item for item in feed_json(response, list) if isinstance(item, dict)]
+            url = response.links.get("next", {}).get("url")
+            if not url:
+                return etag, items
+            if not url.startswith(self.github + "/"):  # the read token goes to GitHub only
+                raise DomainError("unsafe_source_redirect", "GitHub's next page is on another host", 502)
+            response = self.get(url, headers=headers)
+        raise DomainError("source_history_limit", "GitHub answered more than 10 pages of advisories", 422)
+
+    def nvd_cpe(self, cpe_name):
+        """The raw CVE records NVD lists for `cpe_name`, every page, with the NVD key when there is one."""
+        headers = {"apiKey": self.nvd_key} if self.nvd_key else {}
+        records, index = [], 0
+        for _ in range(10):
+            if not self.config.test_mode:
+                time.sleep(0.7 if self.nvd_key else 6.1)  # NVD's rolling 30-second window
+            payload = feed_json(self.get(self.nvd, {"cpeName": cpe_name, "startIndex": index}, headers))
+            entries, total = payload.get("vulnerabilities"), payload.get("totalResults")
+            if not isinstance(entries, list) or not isinstance(total, int) or (not entries and index < total):
+                raise DomainError("incomplete_cve_page", "CVE source returned an incomplete page", 502, retryable=True)
+            records += [entry["cve"] for entry in entries if isinstance(entry, dict) and isinstance(entry.get("cve"), dict)]
+            index += len(entries)
+            if index >= total:
+                return records
+        raise DomainError("cve_sync_limit", "NVD answered more than 10 pages for a CPE", 422)
 
     def release_corpus(self, repository):
         """Pin a bounded release corpus, retaining exactly which distributed bytes were available."""

@@ -1414,3 +1414,175 @@ it("shows a diff's bidi and zero-width characters as visible escapes", async () 
   // The hash, and so the Approval, is still of the diff's own bytes.
   expect(within(panel).getByText(hash)).toBeInTheDocument();
 });
+
+// A09 and A06: an advisory Finding gets a report and a bump Remediation PR, never a Lab Proof.
+const CVE = "CVE-2026-111497";
+const advisoryReport = `${CVE} (also BIT-node-2026-111497, GHSA-9c4w-m7v2-x5qh)\nSeverity: high\n\n<script>alert('report')</script>\n`;
+const bumpDiff = [
+  "diff --git a/Dockerfile b/Dockerfile",
+  "--- a/Dockerfile",
+  "+++ b/Dockerfile",
+  "@@ -1 +1 @@",
+  "-FROM node:20.11.1-alpine",
+  "+FROM node:20.19.5-alpine",
+  "",
+].join("\n");
+const advisoryFinding = {
+  ...detail,
+  source: "advisory",
+  source_ref: CVE,
+  title: "node 20.11.1: Node.js request smuggling (fixture)",
+  cause: { by: "advisory", advisory_id: CVE, at },
+  target_applicability: "affected",
+  lab_runs: [],
+  artifact_state: {
+    status: "draft",
+    missing: ["report.md", "poc.py"],
+    limitations: [],
+    vulnerable_version: null,
+  },
+  playbook: [
+    { step: "report", status: "ready" },
+    { step: "remediation_pr", status: "ready" },
+  ],
+  own_repository: true,
+  remediation_actions: ["bump"],
+  remediation_prs: [
+    {
+      ...draft,
+      id: "rpr-bump",
+      action: "bump",
+      subject: CVE,
+      diff: bumpDiff,
+      paths: ["Dockerfile"],
+      summary: "Bumps node to 20.19.5 (Dockerfile)",
+      dependency: {
+        ecosystem: "runtime",
+        name: "node",
+        version: "20.19.5",
+        edits: [
+          {
+            source: "Dockerfile",
+            field: "dockerfile",
+            from: "node:20.11.1-alpine",
+            to: "node:20.19.5-alpine",
+          },
+        ],
+      },
+    },
+  ],
+  advisories: [
+    {
+      id: "match-1",
+      vulnerability: CVE,
+      aliases: ["BIT-node-2026-111497", CVE, "GHSA-9c4w-m7v2-x5qh"],
+      state: "exposed",
+      finding_id: "finding",
+      summary: "<script>alert('report')</script>",
+      severity: "high",
+      feeds: ["ghsa", "nvd", "osv"],
+      references: [],
+      pins: [
+        {
+          kind: "runtime",
+          ecosystem: null,
+          name: "node",
+          version: "20.11.1",
+          sources: ["Dockerfile"],
+          ranges: {
+            osv: [
+              [
+                [">=", "20.0.0"],
+                ["<", "20.19.5"],
+              ],
+              [
+                [">=", "22.0.0"],
+                ["<", "22.12.0"],
+              ],
+            ],
+            nvd: [
+              [
+                [">=", "20.0.0"],
+                ["<", "20.19.5"],
+              ],
+            ],
+          },
+          state: "exposed",
+        },
+      ],
+      report: advisoryReport,
+      updated_at: at,
+    },
+  ],
+};
+
+it("shows an advisory Finding's report, aliases, ranges, pinned version and bump draft", async () => {
+  const { container, unmount } = showFinding(advisoryFinding);
+  const panel = await screen.findByRole("region", { name: `Advisory ${CVE}` });
+  // The report is text: the markup in it is never rendered.
+  expect(panel.querySelector("pre")?.textContent).toBe(advisoryReport);
+  expect(container.querySelector("script")).toBeNull();
+  expect(
+    within(panel).getByRole("button", { name: "Copy the advisory report" }),
+  ).toBeInTheDocument();
+  const row = (label: string) =>
+    within(panel).getByText(label, { selector: "dt" }).nextElementSibling;
+  expect(row("Aliases")).toHaveTextContent("BIT-node-2026-111497");
+  expect(row("Aliases")).toHaveTextContent("GHSA-9c4w-m7v2-x5qh");
+  expect(row("Exposure")).toHaveTextContent("Exposed");
+  const [pin] = within(panel).getAllByRole("row").slice(1);
+  expect(pin).toHaveTextContent("node");
+  expect(pin).toHaveTextContent("20.11.1");
+  expect(pin).toHaveTextContent("Dockerfile");
+  expect(pin).toHaveTextContent("osv: >=20.0.0 <20.19.5 || >=22.0.0 <22.12.0");
+  expect(pin).toHaveTextContent("nvd: >=20.0.0 <20.19.5");
+  expect(row("Lowest fixed version")).toHaveTextContent(
+    "node 20.19.5 · Dockerfile: node:20.11.1-alpine → node:20.19.5-alpine",
+  );
+  const playbook = screen.getByRole("region", { name: "Playbook" });
+  const state = (step: string) =>
+    within(playbook).getByText(step, { selector: "dt" }).nextElementSibling;
+  expect(state("Report")).toHaveTextContent("Ready");
+  expect(state("Remediation PR")).toHaveTextContent(
+    "Waiting for your Approval",
+  );
+  // No Lab Proof: no Lab, no Lab badge and no Draft bundle callout.
+  expect(screen.queryByRole("region", { name: "Lab" })).not.toBeInTheDocument();
+  expect(screen.queryByText(/^Lab /)).not.toBeInTheDocument();
+  expect(screen.queryByText("Draft bundle")).not.toBeInTheDocument();
+  // The bump draft's diff, waiting for Approval.
+  const prs = screen.getByRole("region", { name: "Remediation PRs" });
+  expect(prs.querySelector("pre")?.textContent).toBe(bumpDiff);
+  expect(
+    within(prs).getByText("Bumps node to 20.19.5 (Dockerfile)"),
+  ).toBeInTheDocument();
+  expect(within(prs).getByRole("button", { name: "Approve" })).toBeEnabled();
+  unmount();
+
+  // A match with no fixed version, or of a package only a lockfile names, drafts nothing.
+  for (const [status, label] of [
+    ["no_fixed_version", "No fixed version is known yet"],
+    [
+      "not_direct",
+      "Not a direct dependency: update the package that pulls it in",
+    ],
+  ]) {
+    const { unmount } = showFinding({
+      ...advisoryFinding,
+      playbook: [
+        { step: "report", status: "ready" },
+        { step: "remediation_pr", status },
+      ],
+      remediation_actions: [],
+      remediation_prs: [],
+    });
+    const steps = await screen.findByRole("region", { name: "Playbook" });
+    expect(within(steps).getByText(label)).toBeInTheDocument();
+    const advisory = screen.getByRole("region", { name: `Advisory ${CVE}` });
+    expect(
+      within(advisory).getByText("Lowest fixed version", { selector: "dt" })
+        .nextElementSibling,
+    ).toHaveTextContent(label);
+    unmount();
+  }
+});

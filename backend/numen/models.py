@@ -88,6 +88,9 @@ class Application(Base):
     cve_cursor: Mapped[dict] = mapped_column(JSON, default=dict)
     last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The pins the last Advisory check collected (A09): {repository_id, revision, collected_at,
+    # feeds, runtimes, packages}. Deferred, so lists and the scheduler never load a large lockfile's.
+    advisory_pins: Mapped[dict | None] = mapped_column(JSON, nullable=True, deferred=True)
 
 
 class Repository(Base):
@@ -335,6 +338,35 @@ class Exposure(Base):
     # analysis_id
     data: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AdvisoryMatch(Base):
+    """An Advisory check match (A09), one per (Application, vulnerability): `vulnerability` is the
+    canonical id of the alias set, and `aliases` holds every OSV, GHSA and CVE id in it."""
+
+    __tablename__ = "advisory_matches"
+    __table_args__ = (UniqueConstraint("application_id", "vulnerability"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    vulnerability: Mapped[str] = mapped_column(String)
+    aliases: Mapped[list] = mapped_column(JSON, default=list)
+    finding_id: Mapped[str | None] = mapped_column(ForeignKey("findings.id"), nullable=True)
+    # exposed, unknown (which counts as exposed) or not_exposed
+    state: Mapped[str] = mapped_column(String)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AdvisoryCache(Base):
+    """A feed response the Advisory check fetched, by request key, with what revalidates it."""
+
+    __tablename__ = "advisory_cache"
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    etag: Mapped[str | None] = mapped_column(Text, nullable=True)
+    modified: Mapped[str | None] = mapped_column(String, nullable=True)
+    body: Mapped[dict] = mapped_column(JSON)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class Job(Base):
