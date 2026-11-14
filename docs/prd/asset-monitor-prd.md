@@ -318,7 +318,7 @@ Asset Monitor never sends it.
 - The Operator must accept the first fingerprint before it becomes the Baseline. Accepting a Baseline is not an Approval and needs no password.
 - Each distinct fingerprint, per page and user agent, is triaged at most once.
 - A changed fingerprint goes through Triage and Analysis.
-- After an Unrelated or Security hardening Verdict, the Operator can accept the new fingerprint as the Baseline.
+- After an Unrelated or Security hardening Verdict, the Operator can accept the new fingerprint as the Baseline. So can a change that Triage declined to analyse, or that the Operator dismissed from the Review queue (defaulted decision 14).
 
 **Remediation.** A served-content Finding becomes Remediated when a later check matches the Baseline again, or when the Operator marks it.
 
@@ -472,6 +472,7 @@ The Operator delegated these on 2026-11-12. Each one can be changed by editing t
 11. **Default profiles:** Triage on Pi with DeepSeek; Analysis on Claude Code at high effort.
 12. **Exposure "unknown":** treated as exposed everywhere.
 13. **Plugin pin:** `pi-commandcode-provider` 0.7.8 with Pi 1.3.0, as agreed. That is an upgrade from the fork base's 0.7.3 with Pi 1.0.0.
+14. **Baseline after Triage declines:** a served-content change that Triage declined to analyse, or that the Operator dismissed from the Review queue, may also be accepted as the new Baseline. Otherwise a legitimate redesign that Triage waves through could never become the Baseline without a hand-started Analysis.
 
 ## Risks
 
