@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from urllib.parse import quote, urlparse
@@ -9,6 +10,8 @@ from . import advisories, artifacts, cves, detection, served
 from .models import (
     Account,
     Action,
+    Agent,
+    AgentMessage,
     AdvisoryCache,
     AdvisoryMatch,
     Analysis,
@@ -17,6 +20,7 @@ from .models import (
     CVE,
     Commit,
     Exposure,
+    FileManifest,
     Finding,
     Job,
     JobEvent,
@@ -32,6 +36,7 @@ from .models import (
     Repository,
     ServedChange,
     ServedFetch,
+    ServerChange,
     Setting,
     Snapshot,
     Transcript,
@@ -426,7 +431,7 @@ def triage_application(db, repository):
 # Automatic Analyses per UTC day (A04), automatic patch drafting (A08) and Proof bundle drafting
 # (draft_bundle) included. Manual runs are neither capped nor counted.
 ANALYSIS_CAPS = {"application": 10, "account": 30}
-CAPPED_KINDS = ("commit_analysis", "served_analysis", "patch_drafting", "finding_artifacts")
+CAPPED_KINDS = ("commit_analysis", "served_analysis", "server_analysis", "patch_drafting", "finding_artifacts")
 
 
 def over_cap(db, application, profile, shared):
@@ -498,8 +503,18 @@ def start_served_analysis(db, change):
                            {"served_change_id": change.id}, key)
 
 
+def start_server_analysis(db, change):
+    """Starts the automatic Analysis of a Server change Triage flagged (B06), once per change,
+    within the same caps as a commit's."""
+    key = f"server-analysis:{change.id}"
+    if db.scalar(select(Job.id).where(Job.idempotency_key == key)):
+        return None
+    return start_automatic(db, change, "server_analysis", db.get(Application, change.application_id),
+                           {"server_change_id": change.id}, key)
+
+
 def start_automatic(db, subject, kind, application, inputs, key, shared=False):
-    """Queues the automatic Analysis `kind` of `subject`, a Commit or a ServedChange, on the
+    """Queues the automatic Analysis `kind` of `subject`, a Commit, ServedChange or ServerChange, on the
     Application's commit_analysis profile, or records why it waits for a cap or is blocked."""
     try:
         profile = automated_profile(db, application, "commit_analysis")
@@ -914,20 +929,25 @@ FINDING_DEFAULTS = {"affected_versions": [], "fixed_versions": [], "evidence": [
 # Finding there. Draft is an artifact-completeness state (AC-12), never a lifecycle state.
 FINDING_TRANSITIONS = {"confirmed": ("open",), "dismissed": ("open",), "remediated": ("open", "confirmed")}
 FINDING_CAUSES = {
-    "confirmed": {"operator", "proof", "detection_rule", "advisory"},
+    "confirmed": {"operator", "proof", "detection_rule", "advisory", "regression"},
     "dismissed": {"operator"},
-    "remediated": {"operator", "remediation_pr", "version_bump", "baseline_match", "deployed_version"},
+    "remediated": {"operator", "remediation_pr", "version_bump", "baseline_match", "deployed_version", "manifest"},
 }
 
 
 def transition_finding(db, finding, state, cause):
     """Moves a Finding to `state`, recording `cause` ({by, ...refs}) and when. Returns False,
     changing nothing, when the Finding's state cannot move there. Callers decide whether the
-    cause applies: a deployed_version cause is for Own-repository Vulnerability fix Findings only."""
+    cause applies: a deployed_version cause is for Own-repository Vulnerability fix Findings only.
+    A regression (B07: a named SHA-256 seen again) moves only a Remediated server_files Finding
+    back to Confirmed."""
     if cause.get("by") not in FINDING_CAUSES[state]:
         raise ValueError(f"{cause.get('by')!r} cannot make a Finding {state}")
     db.refresh(finding, with_for_update=True)
-    if finding.status not in FINDING_TRANSITIONS[state]:
+    regression = cause["by"] == "regression"
+    if regression and finding.source != "server_files":
+        raise ValueError("Only a server_files Finding regresses")
+    if finding.status not in (("remediated",) if regression else FINDING_TRANSITIONS[state]):
         return False
     cause = {**cause, "at": now().isoformat()}
     db.add(Action(resource_type="finding", resource_id=finding.id, data={
@@ -941,7 +961,8 @@ def transition_finding(db, finding, state, cause):
 OPENING_VERDICTS = ("Vulnerability fix", "Vulnerability introduced", "Malicious change")
 # Where each source keeps its subject: the commit, the CVE record (the cve_id column), the
 # served-content change or the advisory.
-FINDING_SUBJECTS = {"commit": "source_commit_id", "cve": None, "served_content": "subject_id", "advisory": "subject_id"}
+FINDING_SUBJECTS = {"commit": "source_commit_id", "cve": None, "served_content": "subject_id", "advisory": "subject_id",
+                    "server_files": "subject_id"}
 
 
 def open_finding(db, application, source, subject, title, ref, cause):
@@ -1013,6 +1034,8 @@ PLAYBOOKS = {
                                        "served_content_sweep"),
     ("upstream", "Vulnerability fix"): ("proof", "remediation_pr"),
     ("served_content", "Malicious change"): ("static_proof", "detection_rule", "cleanup_report"),
+    # B07: Quarantine after Approval. Its static Proof, Detection rule and cleanup report are deferred.
+    ("server_files", "Malicious change"): ("quarantine",),
 }
 
 
@@ -1037,7 +1060,7 @@ def finding_cell(db, finding):
     served_content Finding, which for an advisory Finding is that of the exposed Upstream
     Vulnerability fix that gave it an n-day Proof (A16), else ("advisory", None) for an advisory
     Finding, or None, as for a Finding the Operator opened on no Verdict, which keeps every step."""
-    role = "served_content" if finding.source == "served_content" else finding_role(db, finding)
+    role = finding.source if finding.source in ("served_content", "server_files") else finding_role(db, finding)
     cell = (role, finding_verdict(db, finding))
     return cell if cell in PLAYBOOKS else ("advisory", None) if finding.source == "advisory" else None
 
@@ -1098,7 +1121,7 @@ def exportable(db, resource_type, resource_id):
         finding = db.get(Finding, resource_id or "")
         return finding is None or finding_role(db, finding) != "upstream"
     analysis = db.get(Analysis, resource_id or "") if resource_type == "analysis" else None
-    if analysis is None or analysis.kind == "served_analysis":  # served content has no Upstream Proof
+    if analysis is None or analysis.kind in ("served_analysis", "server_analysis"):  # neither has an Upstream Proof
         return True
     if analysis.kind == "commit_analysis":
         commit = db.get(Commit, analysis.subject_id)
@@ -1114,6 +1137,8 @@ def require_lab(db, finding):
     runs (ADR-0004), an Own-repository Vulnerability fix gets a report and a Deployed version
     check instead, and an Advisory check match a report and a bump Remediation PR, unless an
     exposed Upstream Vulnerability fix gave its Finding that fix's n-day Proof (finding_cell)."""
+    if finding.source == "server_files":
+        raise DomainError("lab_not_allowed", "Server files are never run: a server-files Finding has no Lab", 409)
     if malicious_change(db, finding):
         raise DomainError("lab_not_allowed", "A Malicious change never runs: its Proof is static, so it has no Lab", 409)
     cell = finding_cell(db, finding)
@@ -1258,6 +1283,7 @@ def playbook_steps(db, finding, root):
         "remediation_pr": remediation,
         "deployed_version_check": deployed_version(finding),
         "served_content_sweep": (finding.data.get("served_content_sweep") or {}).get("status", "pending"),
+        "quarantine": quarantine_status(db, finding) if cell[0] == "server_files" else None,
     }
     return [{"step": step, "status": status[step]} for step in PLAYBOOKS[cell]]
 
@@ -1419,6 +1445,133 @@ def queue_served_triage(db, application, change):
     except DomainError as exc:
         change.triage_status = "blocked"
         change.triage_result = {"decision": "insufficient_context", "reason": exc.message, "error": exc.code}
+
+
+def queue_server_triage(db, application, change):
+    """Queues the Triage of a Server change (B06) as queue_served_triage does a served-content one."""
+    mode = application.config.get("triage_mode", "disabled")
+    change.triage_status = "disabled" if mode == "disabled" else "pending"
+    if mode == "disabled":
+        return
+    try:
+        if mode == "jev":
+            raise DomainError("jev_triage_unsupported",
+                              "Jev Triage reads commits only; analyse this Server change by hand", 422)
+        profile = automated_profile(db, application, "commit_triage")
+        if profile["agent"] != mode:
+            raise DomainError("triage_profile_mismatch", "Triage mode and agent profile differ", 422)
+        enqueue(db, "server_triage", application, {"server_change_id": change.id}, profile)
+    except DomainError as exc:
+        change.triage_status = "blocked"
+        change.triage_result = {"decision": "insufficient_context", "reason": exc.message, "error": exc.code}
+
+
+SERVER_CHANGE_FIELDS = ("id", "agent_id", "fingerprint", "manifest_id", "baseline_manifest_id", "diff", "incomplete",
+                        "triage_status", "triage_result", "review_decision", "verdict", "analysis_state")
+
+
+def server_change_files(change):
+    """The file entries a Server change added or changed: the bytes Triage and Analysis read."""
+    return [entry for entry in [*change.diff.get("added", ()), *(m["after"] for m in change.diff.get("modified", ()))]
+            if entry.get("type") == "file"]
+
+
+def server_change_json(db, row):
+    """A Server change, with the SHA-256 values of its added and changed files whose bytes are held."""
+    digests = sorted({entry["sha256"] for entry in server_change_files(row) if entry.get("sha256")})
+    held = set(db.scalars(select(Artifact.resource_id).where(
+        Artifact.resource_type == "server_files", Artifact.resource_id.in_(digests)))) if digests else set()
+    return {**{name: getattr(row, name) for name in SERVER_CHANGE_FIELDS}, "held": sorted(held),
+            "created_at": utc(row.created_at)}
+
+
+def server_change_label(db, change):
+    """A Server change's readable name: its agent's. A server path never names it (B07)."""
+    return f"{db.get(Agent, change.agent_id).name} · Server change"
+
+
+def canonical_sha256(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def named_sha256(finding):
+    """The SHA-256 values a server_files Finding names (B07)."""
+    return {entry["sha256"] for entry in finding.data.get("server_files") or () if entry.get("sha256")}
+
+
+def quarantine_list(db, finding):
+    """B07: the files of the agent's latest complete File manifest whose SHA-256 the Finding names,
+    as a Quarantine command lists them, [{root, path, sha256}] sorted, and that list's SHA-256."""
+    named = named_sha256(finding)
+    manifest = db.scalar(select(FileManifest).where(
+        FileManifest.agent_id == (finding.data.get("agent_id") or ""), FileManifest.status == "complete")
+        .order_by(FileManifest.sequence.desc()).limit(1))
+    files = sorted(({"root": e["root"], "path": e["path"], "sha256": e["sha256"]} for e in (manifest.entries if manifest else ())
+                    if e["type"] == "file" and e.get("sha256") in named), key=lambda f: (f["root"], f["path"]))
+    return files, canonical_sha256(files)
+
+
+def finding_commands(db, finding):
+    """The Quarantine and Restore commands signed for the Finding, in sequence order."""
+    return list(db.scalars(select(AgentMessage).where(
+        AgentMessage.type == "command", AgentMessage.data["finding_id"].as_string() == finding.id)
+        .order_by(AgentMessage.sequence)))
+
+
+def command_state(message):
+    """A command's status, expired once past its expiry even before the scheduler marks it."""
+    late = message.status == "pending" and message.expires_at is not None and utc(message.expires_at) <= now()
+    return "expired" if late else message.status
+
+
+def result_files(message):
+    files = ((message.data or {}).get("result") or {}).get("files")
+    return [item for item in files if isinstance(item, dict)] if isinstance(files, list) else []
+
+
+def quarantined_files(commands):
+    """The files done Quarantine commands moved aside that no done Restore has put back."""
+    restored = {item.get("quarantine_id") for message in commands if message.name == "restore"
+                and message.status == "done" for item in result_files(message) if item.get("status") == "restored"}
+    return [{"quarantine_id": item["quarantine_id"], "root": item.get("root"), "path": item.get("path"),
+             "sha256": item.get("sha256"), "command_id": message.id}
+            for message in commands if message.name == "quarantine" and message.status == "done"
+            for item in result_files(message) if item.get("status") == "quarantined"
+            and re.fullmatch(r"[0-9a-f]{32}", str(item.get("quarantine_id"))) and item["quarantine_id"] not in restored]
+
+
+def restore_entries(commands, quarantine):
+    """The quarantine ids a Restore of the done Quarantine command `quarantine` names, and their SHA-256."""
+    entries = [item["quarantine_id"] for item in quarantined_files(commands) if item["command_id"] == quarantine.id]
+    return entries, canonical_sha256(entries)
+
+
+def quarantine_status(db, finding):
+    """The quarantine Playbook step: its latest Quarantine command's status, or waiting_for_approval."""
+    latest = [message for message in finding_commands(db, finding) if message.name == "quarantine"]
+    return command_state(latest[-1]) if latest else "waiting_for_approval"
+
+
+def quarantine_json(db, finding):
+    """B07: a server_files Finding's Quarantine list and its hash, each Quarantine and Restore
+    command with the agent's verified result per file, and the files held in Quarantine. All of it
+    is shown as text."""
+    agent = db.get(Agent, finding.data.get("agent_id") or "")
+    files, digest = quarantine_list(db, finding)
+    commands = finding_commands(db, finding)
+    rows = []
+    for message in commands:
+        result = (message.data or {}).get("result") or {}
+        row = {"id": message.id, "name": message.name, "sequence": message.sequence, "status": command_state(message),
+               "reason": result.get("reason"), "expires_at": utc(message.expires_at), "created_at": utc(message.created_at),
+               **{key: message.data[key] for key in ("list_sha256", "entries_sha256", "quarantine_command_id")
+                  if key in (message.data or {})}, "files": result_files(message)}
+        if message.name == "quarantine" and message.status == "done":
+            entries, entries_digest = restore_entries(commands, message)
+            row["restore"] = {"entries": entries, "entries_sha256": entries_digest} if entries else None
+        rows.append(row)
+    return {"agent_id": agent and agent.id, "agent_name": agent and agent.name, "agent_status": agent and agent.status,
+            "list": files, "list_sha256": digest, "commands": rows, "quarantined": quarantined_files(commands)}
 
 
 def served_fetch_json(row):
@@ -2016,7 +2169,7 @@ def finding_subjects(db, findings):
     change, a cve Finding's CVE for its Application, and every commit linked to them."""
     subjects = {value for row in findings for value in (
         row.data.get("source_commit_id"), row.data.get("fix_commit_id"),
-        row.data.get("subject_id") if row.source == "served_content" else None,
+        row.data.get("subject_id") if row.source in ("served_content", "server_files") else None,
         f"{row.application_id}:{row.cve_id}" if row.source == "cve" else None) if value}
     subjects.update(db.scalars(select(Action.data["commit_id"].as_string()).where(
         Action.resource_type == "finding", Action.resource_id.in_([row.id for row in findings]),
@@ -2098,6 +2251,7 @@ def finding_json(db, row, root):
         "deployed_version_check": row.data.get("deployed_version_check"),
         "exposure": exposure_json(exposure) if (exposure := finding_exposure(db, row)) else None,
         "disclosure_report": disclosure_report(db, row, root),
+        "quarantine": quarantine_json(db, row) if row.source == "server_files" else None,
         # The Advisory check matches attached to it, each with its report, rendered as text.
         "advisories": [{**advisory, "report": advisories.report(advisory)} for advisory in map(
             advisory_json, db.scalars(select(AdvisoryMatch).where(AdvisoryMatch.finding_id == row.id)
@@ -2163,6 +2317,12 @@ def job_subject(db, row, application):
             return {"type": "served", "label": "Removed served-content change", "ref": None, "link": None}
         return {"type": "served", "label": served_change_label(db, change), "ref": change.fingerprint[:12],
                 "link": f"/applications/{change.application_id}?tab=served"}
+    if data.get("server_change_id"):
+        change = db.get(ServerChange, data["server_change_id"])
+        if not change:
+            return {"type": "server", "label": "Removed Server change", "ref": None, "link": None}
+        return {"type": "server", "label": server_change_label(db, change), "ref": change.fingerprint[:12],
+                "link": f"/applications/{change.application_id}?tab=server"}
     if data.get("cve_id"):
         cve = db.get(CVE, data["cve_id"])
         query = f"cve={quote(data['cve_id'])}"
@@ -2389,7 +2549,7 @@ def start_waiting(db):
     flag runs this before its own change, so a new change never takes a freed slot first."""
     waiting = [
         row
-        for model in (Commit, ServedChange)
+        for model in (Commit, ServedChange, ServerChange)
         for row in db.scalars(
             select(model)
             .where(model.analysis_state["status"].as_string() == "waiting_for_cap")
@@ -2397,7 +2557,8 @@ def start_waiting(db):
         )
     ]
     for subject in sorted(waiting, key=lambda s: s.analysis_state["since"]):
-        (start_served_analysis if isinstance(subject, ServedChange) else start_analysis)(db, subject)
+        start = {ServedChange: start_served_analysis, ServerChange: start_server_analysis}.get(type(subject), start_analysis)
+        start(db, subject)
     # Then the automatic patch drafts waiting for a cap (A08), oldest first.
     drafts = db.scalars(
         select(RemediationPR).where(RemediationPR.status == "waiting_for_cap").with_for_update(skip_locked=True)

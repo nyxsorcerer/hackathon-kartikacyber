@@ -26,7 +26,7 @@ VERDICTS = (
 SERVED_CONTENT_VERDICTS = VERDICTS[2:]
 CONFIDENCES = ("low", "medium", "high")
 # What opened a Finding (A11); cve only for CVE records carried over from Numen.
-FINDING_SOURCES = ("commit", "served_content", "advisory", "cve")
+FINDING_SOURCES = ("commit", "served_content", "advisory", "cve", "server_files")
 CHANGE_KINDS = ("vulnerability_fix", "security_hardening", "vulnerability_introduction", "unrelated", "insufficient_context")
 # Codex has no flag that removes its shell, so it cannot run Triage with no tools (ADR-0004).
 TRIAGE_CODEX = "Triage on Codex is refused until a no-tools restriction has been verified for it"
@@ -221,9 +221,43 @@ class WatchedPageInput(Strict):
         return http_url(value)
 
 
+class AgentInput(Strict):
+    """B04: an On-server agent and the agent listener's URL as its server sees it, https://host[:port]."""
+    name: str = Field(min_length=1, max_length=100)
+    url: str
+
+    @field_validator("name")
+    @classmethod
+    def named(cls, value):
+        if not value.strip() or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            raise ValueError("Give the agent a name")
+        return value.strip()
+
+    @field_validator("url")
+    @classmethod
+    def listener(cls, value):
+        value = http_url(value)
+        parsed = urlparse(value)
+        if parsed.scheme != "https" or parsed.path or parsed.query or parsed.params or len(value) > 300:
+            raise ValueError("Expected https://host[:port] with nothing else")
+        return value
+
+
+class FingerprintInput(Strict):
+    """Confirm fingerprint: the one the Operator compared with what enroll printed."""
+    fingerprint: str = Field(max_length=80)
+
+
 class BaselineInput(Strict):
     """Accepting a Content fingerprint as a Watched page's Baseline (A10): not an Approval, so no password."""
     fetch_id: str
+
+
+class ServerBaselineInput(Strict):
+    """Accepting a File manifest as an agent's Baseline (B05): the manifest and the SHA-256 the
+    Operator saw, so a stale one is refused. Not an Approval, so no password."""
+    manifest_id: str
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class FindingInput(Strict):
@@ -236,10 +270,14 @@ class FindingInput(Strict):
     target_applicability: Literal["affected", "not affected", "unknown"] = "unknown"
     source_commit_id: str | None = None
     source_analysis_id: str | None = None
+    # B07: the Server change a hand-opened server_files Finding is about; required for that source only.
+    source_server_change_id: str | None = None
     evidence: list = Field(default_factory=list)
 
     @model_validator(mode="after")
     def cve(self):
+        if (self.source == "server_files") != bool(self.source_server_change_id):
+            raise ValueError("A server_files Finding, and only one, names its source_server_change_id")
         if self.source == "cve" and not self.cve_id:
             raise ValueError("A CVE finding requires a CVE ID")
         if self.cve_id and not re.fullmatch(r"CVE-\d{4}-\d{4,}", self.cve_id):
@@ -392,6 +430,18 @@ class LoginInput(Strict):
 class ApprovalInput(Strict):
     # Empty by default: a missing password is refused exactly like a wrong one (A15).
     password: str = Field(default="", max_length=1024, repr=False)
+
+
+class QuarantineApprovalInput(ApprovalInput):
+    """An Approval of Quarantine (B07): the password, and the SHA-256 of the file list the Operator
+    reviewed, so a list that changed since is never sent."""
+    list_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class RestoreApprovalInput(ApprovalInput):
+    """An Approval of Restore (B07): the done Quarantine command, and the SHA-256 of its entries."""
+    command_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,128}$")
+    entries_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class RemediationDraftInput(Strict):

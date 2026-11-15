@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -24,13 +25,15 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session, load_only, sessionmaker
 
-from numen import ingress
+from numen import ingress, servers
 from numen.api import create_app
 from numen.cli import INGRESS_ROLES, ingress_roles
 from numen.config import Config
 from numen.db import make_database
 from numen.domain import enqueue, schedule
-from numen.models import Account, Job, Application, PushDelivery, PushWebhook, now
+from numen.models import (
+    Account, Agent, AgentMessage, AgentRequest, Job, Application, EnrollmentCode, PushDelivery, PushWebhook, now,
+)
 from numen.queue import ExecutionContext, claim, recover
 from numen.security import DomainError, Vault
 from conftest import FixtureBroker, github_account
@@ -822,6 +825,16 @@ def test_postgres_migration_adds_push_webhook_tables(schema_url):
 
 
 PUSH = "asset_monitor_push"
+AGENT = "asset_monitor_agent"
+# B04: everything asset_monitor_agent may touch. received_at is Postgres's alone.
+AGENT_GRANTS = {
+    ("agents", "SELECT"): ("id", "public_key", "status", "wanted"),
+    ("enrollment_codes", "SELECT"): ("id", "agent_id", "expires_at", "used_at"),
+    ("agent_messages", "SELECT"): ("agent_id", "type", "sequence", "key_id", "payload", "signature", "status",
+                                   "expires_at"),
+    ("agent_requests", "INSERT"): ("id", "agent_id", "route", "method", "target", "timestamp", "nonce",
+                                   "content_sha256", "signature", "body"),
+}
 
 
 def test_postgres_ingress_roles_hold_no_grant_on_release_1_tables(postgres):
@@ -851,13 +864,16 @@ def test_postgres_ingress_roles_hold_no_grant_on_release_1_tables(postgres):
     with factory.begin() as db:
         assert set(db.scalars(ROLES, {"roles": roles})) == set(roles)
         assert {"accounts", "settings", "operators", "sessions", "findings", "jobs", "notification_outbox",
-                "push_webhooks", "push_deliveries"} <= set(db.scalars(tables))
+                "push_webhooks", "push_deliveries", "dashboard_keys", "file_manifests",
+                "server_changes"} <= set(db.scalars(tables))
         assert set(db.execute(on_tables, {"roles": roles}).all()) == {
             (PUSH, "push_webhooks", "SELECT"), (PUSH, "push_deliveries", "INSERT")}
         assert set(db.execute(on_columns, {"roles": roles}).all()) == {
             *((PUSH, "push_webhooks", column, "SELECT") for column in webhook),
             (PUSH, "push_webhooks", "last_accepted", "UPDATE"), (PUSH, "push_webhooks", "last_refusal", "UPDATE"),
             *((PUSH, "push_deliveries", column, "INSERT") for column in delivery),
+            *((AGENT, table, column, privilege) for (table, privilege), columns in AGENT_GRANTS.items()
+              for column in columns),
         }
 
 
@@ -941,6 +957,163 @@ def test_postgres_push_listener_works_on_the_push_role_grants(postgres, schema_u
         assert vault.decrypt(row.secret) == secret
         assert db.execute(select(PushDelivery.delivery_id, PushDelivery.body_sha256)).all() == [
             ("g1", hashlib.sha256(b'{"after": "1"}').hexdigest())]
+
+
+APPLICATION = text(
+    "INSERT INTO applications (id, asset_name, asset_url, product_kind, product_name, source_generation,"
+    " monitor_interval_seconds, monitor_enabled, archived, config, cve_cursor)"
+    " VALUES ('a1', 'Site', 'https://example.com', 'CMS', 'Shop', 1, 86400, true, false, '{}', '{}')")
+AGENT_ROW = text(
+    "INSERT INTO agents (id, application_id, name, url, status, allowed_paths, watched_roots, data, sequence,"
+    " config_sequence, report_sequence, created_at) VALUES (:id, 'a1', 'web', 'https://10.0.0.5:8792',"
+    " 'awaiting_enrollment', '[]', '[]', '{}', 0, 0, 0, now())")
+AGENT_REQUEST = text(
+    "INSERT INTO agent_requests (id, agent_id, route, method, target, timestamp, nonce, content_sha256,"
+    " signature, body) VALUES (:id, 'g1', 'poll', 'GET', '/agent/v1/poll', 1, :nonce, :sha, 's', '')")
+AGENT_MESSAGE = text(
+    "INSERT INTO agent_messages (id, agent_id, type, sequence, key_id, payload, signature, status, data,"
+    " created_at, updated_at) VALUES (:id, 'g1', 'command', :sequence, 'dk-1', 'p', 's', 'pending', '{}', now(), now())")
+
+
+def test_postgres_migration_adds_on_server_agent_tables(schema_url):
+    """B04: the agent tables, with an agent request unique per (agent, nonce) and its received_at set
+    by Postgres, and a signed message unique per (agent, sequence). Existing Applications survive the
+    upgrade and the downgrade, which drops the tables and the agent role's schema USAGE but no role."""
+    migrate(schema_url, "c9d0e1f2a3b4")
+    engine = create_engine(schema_url)
+    usage = text(f"SELECT has_schema_privilege('{AGENT}', current_schema(), 'USAGE')")
+    with engine.begin() as db:
+        db.execute(APPLICATION)
+    for _ in range(2):  # upgrade, then again after a downgrade
+        migrate(schema_url, "head")
+        drift = alembic(schema_url, "check", check=False)
+        assert drift.returncode == 0, drift.stdout + drift.stderr
+        with engine.begin() as db:
+            assert db.scalar(usage) is True
+            db.execute(AGENT_ROW, {"id": "g1"})
+            db.execute(AGENT_REQUEST, {"id": "r1", "nonce": "n1", "sha": "1" * 64})
+            db.execute(AGENT_MESSAGE, {"id": "m1", "sequence": 1})
+            assert db.scalar(text("SELECT received_at IS NOT NULL FROM agent_requests")) is True
+        for statement, values in (
+            (AGENT_REQUEST, {"id": "r2", "nonce": "n1", "sha": "2" * 64}),  # same nonce from that agent
+            (AGENT_MESSAGE, {"id": "m2", "sequence": 1}),  # same sequence for that agent
+        ):
+            with pytest.raises(IntegrityError), engine.begin() as db:
+                db.execute(statement, values)
+        alembic(schema_url, "downgrade", "c9d0e1f2a3b4")
+        with engine.begin() as db:
+            assert db.execute(text(
+                "SELECT to_regclass('agents'), to_regclass('enrollment_codes'), to_regclass('agent_requests'),"
+                " to_regclass('agent_messages'), to_regclass('dashboard_keys')")).one() == (None,) * 5
+            assert db.execute(text("SELECT id FROM applications")).all() == [("a1",)]
+            assert set(db.scalars(ROLES, {"roles": list(INGRESS_ROLES)})) == set(INGRESS_ROLES)
+            assert db.scalar(usage) is False
+    engine.dispose()
+
+
+MANIFEST = text(
+    "INSERT INTO file_manifests (id, agent_id, request_id, sequence, config_sequence, entries, sha256, incomplete,"
+    " status, created_at) VALUES (:id, 'g1', 'r', :sequence, 1, '[]', 'h', '[]', 'complete', now())")
+SERVER_CHANGE = text(
+    "INSERT INTO server_changes (id, application_id, agent_id, fingerprint, manifest_id, baseline_manifest_id, diff,"
+    " incomplete, triage_status, review_decision, created_at)"
+    " VALUES (:id, 'a1', 'g1', 'f', 'm2', 'm1', '{}', '[]', 'disabled', 'pending', now())")
+
+
+def test_postgres_migration_adds_file_manifests_and_server_changes(schema_url):
+    """B05: File manifests unique per (agent, sequence), Server changes unique per (agent,
+    fingerprint) and the agent's Baseline. The downgrade is refused while a Finding has the
+    server_files source, and otherwise drops them and keeps the agents."""
+    migrate(schema_url, "d1e2f3a4b5c6")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        db.execute(APPLICATION)
+        db.execute(AGENT_ROW, {"id": "g1"})
+    for _ in range(2):  # upgrade, then again after a downgrade
+        migrate(schema_url, "head")
+        drift = alembic(schema_url, "check", check=False)
+        assert drift.returncode == 0, drift.stdout + drift.stderr
+        with engine.begin() as db:
+            db.execute(MANIFEST, {"id": "m1", "sequence": 1})
+            db.execute(MANIFEST, {"id": "m2", "sequence": 2})
+            db.execute(SERVER_CHANGE, {"id": "c1"})
+            db.execute(text("UPDATE agents SET baseline_manifest_id = 'm1'"))
+        for statement, values in ((MANIFEST, {"id": "m3", "sequence": 1}), (SERVER_CHANGE, {"id": "c2"})):
+            with pytest.raises(IntegrityError), engine.begin() as db:
+                db.execute(statement, values)
+        with engine.begin() as db:
+            db.execute(text("INSERT INTO findings (id, application_id, source, title, status, data, created_at,"
+                            " updated_at) VALUES ('f1', 'a1', 'server_files', 'Shell', 'open', '{}', now(), now())"))
+        refused = alembic(schema_url, "downgrade", "d1e2f3a4b5c6", check=False)
+        assert refused.returncode != 0 and "Findings f1 have the server_files source" in refused.stderr
+        with engine.begin() as db:
+            db.execute(text("DELETE FROM findings"))
+        alembic(schema_url, "downgrade", "d1e2f3a4b5c6")
+        with engine.begin() as db:
+            assert db.execute(text("SELECT to_regclass('file_manifests'), to_regclass('server_changes')")).one() == (
+                None, None)
+            assert db.execute(text("SELECT id FROM agents")).all() == [("g1",)]
+    engine.dispose()
+
+
+def test_postgres_agent_listener_works_on_the_agent_role_grants(postgres, schema_url):
+    """ADR-0006 decision 5, B04: the agent listener, connected as asset_monitor_agent, stores an
+    Enrollment and signed requests and answers a poll with the signed configuration, all within
+    the role's grants: no RETURNING, no read of agent_requests, no change to an agent's key or
+    status, and nothing on dashboard_keys."""
+    from test_server_agents import AgentClient
+
+    config, factory = postgres
+    vault = Vault(Fernet.generate_key().decode())
+    with factory.begin() as db:
+        db.execute(APPLICATION)
+        application = db.get(Application, "a1")
+        agent, enrollment = servers.create_agent(db, vault, application, "web", "https://10.0.0.5:8792", "ab" * 32)
+        schema = db.scalar(text("SELECT current_schema()"))
+    role = create_engine(make_url(schema_url).update_query_dict(
+        {"options": f"-csearch_path={schema} -crole={AGENT}"}), hide_parameters=True)
+    try:
+        client = AgentClient(ingress.agent_app(sessionmaker(role)), agent.id)
+        assert client.enroll(enrollment["code"]) == (202, {"status": "pending"})
+        servers.process_agent_requests(factory, config.artifact_root)
+        with factory.begin() as db:
+            row = db.get(Agent, agent.id)
+            assert row.status == "pending"
+            row.status, row.watched_roots = "enrolled", list(row.allowed_paths)
+            servers.sign_configuration(db, vault, row, config)
+        nonce = secrets.token_hex(16)
+        status, answer = client.poll(nonce=nonce)
+        assert status == 200 and answer["configuration"]["key_id"] == enrollment["key_id"], answer
+        assert client.poll(nonce=nonce) == (401, {"error": "nonce_reused"})
+        assert client.send("POST", "/agent/v1/report", {"sequence": 1, "config_sequence": 1, "roots": []}) == (202, {"status": "accepted"})
+        assert client.send("POST", "/agent/v1/upload", {"report_sequence": 1, "files": [], "complete": True})[0] == 202
+        assert client.send("POST", "/agent/v1/result", {"type": "configuration", "sequence": 1, "status": "done"})[0] == 202
+        for refused in (
+            "SELECT body FROM agent_requests",
+            "SELECT fingerprint FROM agents",
+            "SELECT secret_hash FROM enrollment_codes",
+            "SELECT data FROM agent_messages",
+            "SELECT 1 FROM dashboard_keys",
+            "UPDATE agents SET status = 'enrolled'",
+            "UPDATE agents SET public_key = 'forged'",
+            "UPDATE enrollment_codes SET used_at = now()",
+            "INSERT INTO agent_messages (id, agent_id, type, sequence, key_id, payload, signature, status, data,"
+            " created_at, updated_at) VALUES ('x', 'y', 'command', 9, 'k', 'p', 's', 'pending', '{}', now(), now())",
+            "UPDATE agent_requests SET processed_at = now()",
+            "DELETE FROM agent_requests",
+        ):
+            with pytest.raises(ProgrammingError) as error, role.begin() as db:
+                db.execute(text(refused))
+            assert isinstance(error.value.orig, InsufficientPrivilege), refused
+    finally:
+        role.dispose()
+    servers.process_agent_requests(factory, config.artifact_root)
+    with factory.begin() as db:
+        outcomes = [row.outcome["status"] for row in db.scalars(select(AgentRequest))]
+        assert outcomes == ["accepted"] * 5, outcomes
+        assert db.get(Agent, agent.id).config_sequence == 1
+        assert db.scalar(select(AgentMessage.status)) == "done"
+        assert db.scalar(select(EnrollmentCode.used_at)) is not None
 
 
 def test_postgres_ingress_roles_survive_a_downgrade_beside_another_schema(schema_url):

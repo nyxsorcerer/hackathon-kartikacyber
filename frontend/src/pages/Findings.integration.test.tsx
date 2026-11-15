@@ -1734,3 +1734,85 @@ it("shows a Finding's Transcripts as text", async () => {
     within(analysis).getByRole("button", { name: "Hide" }),
   ).toHaveAttribute("aria-expanded", "true");
 });
+
+it("approves a Quarantine with the list hash and warns that a Restore puts the payload back", async () => {
+  const posted: { url: string; body: unknown }[] = [];
+  const shell = { root: "/var/www/html", path: "wp-content/uploads/cache.php", sha256: "a".repeat(64) };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      if (url.startsWith("/api/applications/"))
+        return new Response(JSON.stringify(application));
+      if (init?.method === "POST") {
+        posted.push({ url, body: JSON.parse(String(init.body)) });
+        return new Response(JSON.stringify({ id: "cmd" }), { status: 202 });
+      }
+      return new Response(
+        JSON.stringify({
+          ...detail,
+          source: "server_files",
+          source_ref: "web-1",
+          status: "confirmed",
+          lab_runs: [],
+          server_files: [shell],
+          regressed_at: null,
+          quarantine: {
+            agent_id: "agent",
+            agent_name: "web-1",
+            agent_status: "enrolled",
+            list: [shell],
+            list_sha256: "b".repeat(64),
+            commands: [
+              {
+                id: "q-1",
+                name: "quarantine",
+                sequence: 3,
+                status: "done",
+                expires_at: "2026-11-15T00:15:00Z",
+                created_at: "2026-11-15T00:00:00Z",
+                list_sha256: "b".repeat(64),
+                files: [{ ...shell, quarantine_id: "c".repeat(32), status: "quarantined" }],
+                restore: { entries: ["c".repeat(32)], entries_sha256: "d".repeat(64) },
+              },
+            ],
+            quarantined: [{ ...shell, quarantine_id: "c".repeat(32), command_id: "q-1" }],
+          },
+        }),
+      );
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={["/findings/finding"]}>
+      <Routes>
+        <Route path="/findings/:id" element={<FindingDetail />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+  expect(await screen.findAllByText("wp-content/uploads/cache.php")).toHaveLength(2);
+  expect(screen.getByText("Quarantined")).toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Approve Quarantine" }));
+  const quarantine = await screen.findByRole("dialog");
+  expect(within(quarantine).getByText(new RegExp(`list SHA-256 ${"b".repeat(64)}`))).toBeInTheDocument();
+  await user.type(within(quarantine).getByLabelText("Password"), "test-password-long");
+  await user.click(within(quarantine).getByRole("button", { name: "Approve" }));
+  await vi.waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await user.click(screen.getByRole("button", { name: "Restore" }));
+  const dialog = await screen.findByRole("dialog");
+  expect(
+    within(dialog).getByText(/this Finding is Confirmed, so restoring puts the payload back/),
+  ).toBeInTheDocument();
+  await user.type(within(dialog).getByLabelText("Password"), "test-password-long");
+  await user.click(within(dialog).getByRole("button", { name: "Approve" }));
+  await vi.waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(posted).toEqual([
+    {
+      url: "/api/findings/finding/quarantines",
+      body: { list_sha256: "b".repeat(64), password: "test-password-long" },
+    },
+    {
+      url: "/api/findings/finding/restores",
+      body: { command_id: "q-1", entries_sha256: "d".repeat(64), password: "test-password-long" },
+    },
+  ]);
+});

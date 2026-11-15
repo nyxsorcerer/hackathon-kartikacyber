@@ -38,7 +38,9 @@ numen_ingress_grants() {
          FROM information_schema.column_privileges c WHERE c.grantee = r.rolname AND c.privilege_type = 'UPDATE')
         FROM pg_roles r WHERE r.rolname IN ('asset_monitor_push', 'asset_monitor_agent') ORDER BY r.rolname"
 }
-numen_services='app worker scheduler runner-broker fetch-gateway fixtures ingress-push ingress-agent'
+numen_services='app worker scheduler runner-broker fetch-gateway fixtures ingress-push ingress-agent server-standin'
+# The stand-in server's image holds the real On-server agent binary, built from agent/ (B04).
+numen_test_compose build server-standin
 numen_test_compose up -d --wait $numen_services
 numen_ingress_check
 numen_test_compose --profile setup run --rm bootstrap-operator

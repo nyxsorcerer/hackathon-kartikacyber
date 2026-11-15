@@ -7,10 +7,12 @@ import {
   useSearchParams,
 } from "react-router-dom";
 import {
+  Archive,
   Download,
   FlaskConical,
   GitPullRequest,
   PencilLine,
+  RotateCcw,
   Trash2,
   Plus,
   Save,
@@ -84,13 +86,17 @@ const sourceLabels: Record<Finding["source"], string> = {
   served_content: "Served content",
   advisory: "Advisory",
   cve: "CVE",
+  server_files: "Server files",
 };
 /** What opened the Finding: 'Commit abc1234', 'CVE-…', 'Advisory GHSA-…' or 'Watched page /path'. */
 function sourceLabel(finding: Pick<Finding, "source" | "source_ref">) {
   const ref = finding.source_ref;
   if (!ref) return sourceLabels[finding.source];
   if (finding.source === "cve") return ref;
-  return `${finding.source === "served_content" ? "Watched page" : sourceLabels[finding.source]} ${ref}`;
+  const kind = { served_content: "Watched page", server_files: "Agent" }[
+    finding.source as string
+  ];
+  return `${kind || sourceLabels[finding.source]} ${ref}`;
 }
 const causeLabels: Record<string, string> = {
   proof: "Reproduced Proof",
@@ -101,6 +107,8 @@ const causeLabels: Record<string, string> = {
   version_bump: "Version bump",
   baseline_match: "Served content matches the Baseline",
   deployed_version: "Deployed version serves the fix",
+  manifest: "A File manifest without the named files",
+  regression: "A named file was seen again on the server",
   numen: "Carried over from Numen",
 };
 /** What the Deployed version check reports (A06): never a guess. */
@@ -940,6 +948,9 @@ function FindingBody({
       {finding.served_content_sweep && (
         <ServedSweepPanel sweep={finding.served_content_sweep} />
       )}
+      {finding.quarantine && (
+        <QuarantinePanel finding={finding} refresh={refresh} />
+      )}
       <Panel
         title="Reproducible artifacts"
         description={
@@ -1708,7 +1719,11 @@ function HistoryEvent({
                   "Approved · Remediation PR",
                   `${humanize(text(event, "remediation") || "")} · diff SHA-256 ${text(event, "diff_sha256") || "unknown"}`,
                 ]
-              : ["Approved · Lab", undefined]
+              : [
+                  `Approved · ${approvedLabels[text(event, "approved") || ""] || "Lab"}`,
+                  text(event, "command_id") &&
+                    `Command ${text(event, "command_id")}`,
+                ]
             : action === "remediation_pr_opened"
               ? [
                   "Remediation PR opened",
@@ -1733,12 +1748,19 @@ function HistoryEvent({
     </li>
   );
 }
-/** An Approval (A15): the Operator's password, checked on this request alone, then one job. */
+const approvedLabels: Record<string, string> = {
+  lab_run: "Lab",
+  quarantine: "Quarantine",
+  restore: "Restore",
+};
+/** An Approval (A15): the Operator's password, checked on this request alone, then one job,
+ * or what `send` does with it. */
 function Approval({
   title,
   description,
-  path,
+  path = "",
   body = {},
+  send,
   success,
   icon: Icon,
   onClose,
@@ -1746,8 +1768,9 @@ function Approval({
 }: {
   title: string;
   description: string;
-  path: string;
+  path?: string;
   body?: Record<string, unknown>;
+  send?: (password: string) => Promise<unknown>;
   success: string;
   icon: LucideIcon;
   onClose: () => void;
@@ -1764,7 +1787,8 @@ function Approval({
           setBusy(true);
           setError(undefined);
           try {
-            await queueJob(path, { ...body, password }, undefined, success);
+            if (send) await send(password);
+            else await queueJob(path, { ...body, password }, undefined, success);
             refresh();
             onClose();
           } catch (err) {
@@ -1797,6 +1821,170 @@ function Approval({
         </div>
       </form>
     </Modal>
+  );
+}
+/** B07: a server_files Finding's Quarantine. The files it names by SHA-256 in the agent's latest
+ * File manifest, shown as text, move into the agent's Quarantine folder only after your Approval;
+ * each command's verified result is shown per file. Nothing runs or renders the files. */
+function QuarantinePanel({
+  finding,
+  refresh,
+}: {
+  finding: Finding;
+  refresh: () => void;
+}) {
+  const quarantine = finding.quarantine!;
+  const [approving, setApproving] = useState(false);
+  const [restoring, setRestoring] = useState<{
+    id: string;
+    entries_sha256: string;
+    count: number;
+  }>();
+  const quarantinable =
+    ["open", "confirmed"].includes(finding.status) &&
+    quarantine.list.length > 0 &&
+    quarantine.agent_status === "enrolled";
+  const sent = () => notify("Command signed after Approval.");
+  return (
+    <Panel
+      title="Quarantine"
+      description={`The files this Finding names, by SHA-256, in the latest File manifest of ${quarantine.agent_name || "its agent"}. The agent moves them into its Quarantine folder only after your Approval; nothing runs them.`}
+      actions={
+        <button
+          className="primary"
+          disabled={!quarantinable}
+          onClick={() => setApproving(true)}
+        >
+          <Archive size={15} aria-hidden="true" />
+          Approve Quarantine
+        </button>
+      }
+    >
+      {finding.regressed_at && (
+        <Callout tone="danger" title="Regressed">
+          A file this Finding names was seen again on the server (
+          <Time value={finding.regressed_at} absolute />
+          ).
+        </Callout>
+      )}
+      {quarantine.list.length ? (
+        <ServerFileTable files={quarantine.list} />
+      ) : (
+        <p className="muted panel-body">
+          The latest File manifest holds no file this Finding names.
+        </p>
+      )}
+      {quarantine.commands.map((command) => (
+        <article className="lab-run" key={command.id}>
+          <div className="analysis-header">
+            <Badge>
+              {humanize(command.name)} · {humanize(command.status)}
+            </Badge>
+            <span className="mono">{command.id}</span>
+            {command.reason && <span className="muted">{command.reason}</span>}
+            <span className="analysis-time">
+              <Time value={command.created_at} absolute />
+            </span>
+            {command.restore && (
+              <button
+                className="secondary"
+                onClick={() =>
+                  setRestoring({
+                    id: command.id,
+                    entries_sha256: command.restore!.entries_sha256,
+                    count: command.restore!.entries.length,
+                  })
+                }
+              >
+                <RotateCcw size={15} aria-hidden="true" />
+                Restore
+              </button>
+            )}
+          </div>
+          {command.files.length > 0 && (
+            <ServerFileTable files={command.files} />
+          )}
+        </article>
+      ))}
+      {approving && (
+        <Approval
+          title="Approve Quarantine"
+          description={`The agent moves ${quarantine.list.length} file(s) whose SHA-256 this Finding names into its Quarantine folder (list SHA-256 ${quarantine.list_sha256}). Enter your password to approve this Quarantine.`}
+          send={(password) =>
+            mutate(`/findings/${finding.id}/quarantines`, z.unknown(), {
+              list_sha256: quarantine.list_sha256,
+              password,
+            }).then(sent)
+          }
+          success="Quarantine sent after Approval."
+          icon={Archive}
+          onClose={() => setApproving(false)}
+          refresh={refresh}
+        />
+      )}
+      {restoring && (
+        <Approval
+          title="Approve Restore"
+          description={`${
+            ["confirmed", "remediated"].includes(finding.status)
+              ? `Warning: this Finding is ${humanize(finding.status)}, so restoring puts the payload back on the server. `
+              : ""
+          }The agent puts ${restoring.count} quarantined file(s) back at their paths, never over an existing file. Enter your password to approve this Restore.`}
+          send={(password) =>
+            mutate(`/findings/${finding.id}/restores`, z.unknown(), {
+              command_id: restoring.id,
+              entries_sha256: restoring.entries_sha256,
+              password,
+            }).then(sent)
+          }
+          success="Restore sent after Approval."
+          icon={RotateCcw}
+          onClose={() => setRestoring(undefined)}
+          refresh={refresh}
+        />
+      )}
+    </Panel>
+  );
+}
+function ServerFileTable({
+  files,
+}: {
+  files: {
+    root?: string | null;
+    path?: string | null;
+    sha256?: string | null;
+    status?: string;
+    detail?: string;
+  }[];
+}) {
+  return (
+    <div className="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Root</th>
+            <th scope="col">Path</th>
+            <th scope="col">SHA-256</th>
+            {files.some((f) => f.status) && <th scope="col">Result</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {files.map((file, i) => (
+            <tr key={`${file.root}:${file.path}:${i}`}>
+              <td className="mono">{file.root}</td>
+              <td className="mono">{file.path}</td>
+              <td className="mono">{file.sha256?.slice(0, 12)}</td>
+              {file.status && (
+                <td>
+                  {humanize(file.status)}
+                  {file.detail ? ` · ${file.detail}` : ""}
+                </td>
+              )}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 }
 const remediationTones: Record<string, string> = {

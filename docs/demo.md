@@ -33,7 +33,7 @@ Export these in the shell that runs `make`. Never write them to `.env` and never
 
 The GitHub tokens are not yours to set. The seed creates two Provider accounts, "Stand-in GitHub read token" and "Stand-in GitHub write token", which hold placeholders that only the stand-in accepts. The demo project points every GitHub, registry and feed address at the stand-ins, so never add a real GitHub token to it.
 
-**Without model keys,** the seed still completes and prints a `NEEDS MODEL KEYS` line. These parts still work: the pushes and their intake, the Pre-filter, the Advisory check's Findings with their bump Remediation PRs (steps 4 and 5), Served-content changes (php-inject and php-clean) and merge detection (merge-bump, once you approve a bump). What needs Triage or Analysis does not happen: the Findings of steps 1 to 3 (so steps 2 and merge-revert have nothing to merge), step 4's Vulnerability fix and n-day Proof, and the PHP Application's Findings.
+**Without model keys,** the seed still completes and prints a `NEEDS MODEL KEYS` line. These parts still work: the pushes and their intake, the Pre-filter, the Advisory check's Findings with their bump Remediation PRs (steps 4 and 5), Served-content changes (php-inject and php-clean), the Demo server's enrollment and its Server change (server-inject), and merge detection (merge-bump, once you approve a bump). What needs Triage or Analysis does not happen: the Findings of steps 1 to 3 (so steps 2 and merge-revert have nothing to merge), step 4's Vulnerability fix and n-day Proof, and the PHP Application's Findings, its server-files Finding among them, and so its Quarantine.
 
 To change keys or models later, export the new values and run `./scripts/demo.sh seed` again. It is idempotent and updates the Provider accounts and default profiles in place.
 
@@ -55,6 +55,8 @@ To change keys or models later, export the new values and run `./scripts/demo.sh
 | (5b) | `make demo-step STEP=merge-bump` (optional) | Bumped Findings Remediated | Under 1 min |
 | 6 | `make demo-step STEP=php-inject` | Googlebot-only judol links, ClickFix loader host, 3 Findings | Check under 1 min, then Triage and Analysis |
 | 7 | `make demo-step STEP=php-clean` | Every Watched page matches its Baseline, Findings Remediated | Under 1 min |
+| 8 | `make demo-step STEP=server-inject` | A dropped PHP file is one Server change on the Demo server, then a server-files Finding | Rescan under 1 min, then Triage and Analysis |
+| | Approve Quarantine (password) | The agent moves the file into its Quarantine folder, the Finding Remediated | Under 1 min |
 
 Each step prints `STEP <name> DONE.`, followed by what to click next. Triage, Analysis and Labs then go on in the dashboard. You can run `./scripts/demo.sh status` at any time. It lists each Finding, its Remediation PRs and their pull request links, which Approvals are pending, and the stand-in's pull requests.
 
@@ -73,7 +75,7 @@ cat .numen/bootstrap-password
 `make demo-up` does the following:
 
 1. It runs `make build`. On a fresh checkout, that first runs `make init`, which creates `.env` and `.numen/bootstrap-password`.
-2. `./scripts/demo.sh up` starts the normal stack plus the `fixtures` stand-in, under its own Compose project `asset-monitor-demo`, with its own volumes, on 127.0.0.1:8790, and the two Ingress listeners on 127.0.0.1:8793 (push listener) and 127.0.0.1:8794 (agent listener), which no demo step uses yet.
+2. `./scripts/demo.sh up` starts the normal stack plus the `fixtures` stand-in, under its own Compose project `asset-monitor-demo`, with its own volumes, on 127.0.0.1:8790, and the two Ingress listeners on 127.0.0.1:8793 (push listener, which no demo step uses) and 127.0.0.1:8794 (agent listener). It also starts `server-standin`, a stand-in server that runs the real On-server agent binary against a small web root, on an internal stand-ins network only.
 3. It creates the Operator `admin`.
 4. It seeds the demo through the public HTTP API only, with no database edits.
 
@@ -87,6 +89,7 @@ Sign in at http://localhost:8790 as `admin`, with the password from `cat .numen/
 
 - **Demo Node shop.** Its Own repository is `asset-monitor-demo/shop`. It locks `react-server-dom-webpack@19.0.0` and its Dockerfile pins `node:20.11.1-alpine`, which is exposed to the stand-in CVE-2026-111497. From `package-lock.json` the seed derived the Upstream repository `asset-monitor-demo/react`, at Locked version 19.0.0. Both repositories have their Baseline at their head, and the Repositories tab shows them.
 - **Demo PHP storefront.** It has no Own repository. Its Asset is `http://toko-batik.test:8090/served/`, with two Watched pages: the homepage and `/served/verify`. The seed accepted their first Content fingerprints as the Baseline, for the browser and for Googlebot. That is the dashboard's Accept Baseline, which needs no password: accepting a Baseline is not an Approval.
+- **Demo server.** The Demo PHP storefront's On-server agent. The seed added it on the Server files tab, ran the shown enroll command on the stand-in server (with the one-time Enrollment code on standard input), confirmed the fingerprint the agent printed, and accepted its first File manifest as the Baseline. Confirm fingerprint and Accept Baseline are not Approvals and take no password.
 - Scheduled polling is off for both Applications. Each change is picked up when the step runs Check now.
 
 ## Steps
@@ -215,6 +218,20 @@ make demo-step STEP=php-clean
 - **The audience sees:** every row matches its Baseline, and the three Findings become Remediated.
 - **No Accept Baseline here:** the Baseline did not change. Accept Baseline is only for a new, legitimate fingerprint, and a Malicious change's fingerprint can never become the Baseline.
 
+### The On-server agent: server-inject
+
+```sh
+make demo-step STEP=server-inject
+```
+
+- **What the step does:** it writes `wp-content/uploads/cache.php` into the stand-in server's web root, a webshell-like file that is inert (if run, it would only print a marker, and nothing runs it). Then it runs the Demo server's **Check now**, a signed rescan command.
+- **The audience sees, on the Server files tab:** one Server change on the Demo server that adds the file, with its bytes held. Nothing ran: the agent only hashes and uploads the bytes, and the dashboard never executes or renders them.
+- **The audience sees, with model keys:**
+  - Triage and Analysis (on the stored bytes only) give Malicious change, and a server-files Finding opens. Its Alert names the Demo server, never a path.
+  - On the Finding, the Quarantine panel lists the file by root, path and SHA-256. **Approve Quarantine** asks for your password. The agent then moves the file into its Quarantine folder, shows its result per file, and its next File manifest Remediates the Finding.
+  - **Restore** also asks for your password, and warns that it puts the payload back. If you restore, the next manifest shows the SHA-256 again and the Finding regresses to Confirmed, with an Alert.
+- **Time:** the rescan takes under 1 min. Then Triage takes under 2 min and Analysis 5 to 30 min. Quarantine takes under 1 min.
+
 ## Troubleshooting
 
 - **An Analysis shows "Waiting for cap".** Automatic Analyses are capped at 10 per Application and 30 per Provider account per day, reset at 00:00 UTC, and rehearsals count towards the caps. `make demo-down` followed by `make demo-up` starts a fresh database, which resets them.
@@ -226,10 +243,13 @@ make demo-step STEP=php-clean
 - **The node2shell match lists only the ghsa and osv feeds.** The Advisory check caches NVD's answer for 12 hours, and step 3's check cached it while node2shell was not yet published. It is still one Finding.
 - **The seed prints `NOT READY <account>`.** Check the key, and make sure `DEMO_ANALYSIS_MODEL` or `DEMO_TRIAGE_MODEL` names a model in that account's catalogue (Settings > Accounts). Then run `./scripts/demo.sh seed` again.
 - **`make demo-up` says "set ASSET_MONITOR_DEMO_VM=1".** Export it on the demo VM only. The script also refuses any Compose project name except `asset-monitor-demo` or `asset-monitor-demo-*`.
+- **Every Served-content check, Lab or Detection rule fails with "Workload failed".** Docker may have run out of network address pools: each run creates two networks, and the demo project has nine of its own. On a shared host, remove other projects' unused networks first (for example, take down a finished `asset-monitor-test` journey stack with `./scripts/compose.sh -p asset-monitor-test -f compose.yaml -f compose.test.yaml down`), then `make demo-down` and `make demo-up`.
+- **The Demo server is silent: no last seen time moves, or Check now stays pending.** Look at `server-standin` and `ingress-agent` in the logs below. A refused request shows as the agent's last refusal on the Server files tab. A pending command expires after 15 minutes; approve or request it again.
+- **The Demo server's requests are refused with `clock_skew`.** The agent's clock and the dashboard's differ by more than 5 minutes. On the VM both run on the host clock, so sync the host clock (for example `timedatectl set-ntp true`) and restart the stack.
 - **Logs:**
 
   ```sh
-  ./scripts/compose.sh -p asset-monitor-demo -f compose.yaml -f compose.demo.yaml logs --tail=100 app worker runner-broker fixtures
+  ./scripts/compose.sh -p asset-monitor-demo -f compose.yaml -f compose.demo.yaml logs --tail=100 app worker scheduler runner-broker fixtures ingress-agent server-standin
   ```
 
 - **Starting the scenario over:** `make demo-down`, then `make demo-up`. The stand-in repositories are rebuilt with the same commits.

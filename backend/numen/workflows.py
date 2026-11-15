@@ -2,6 +2,7 @@
 
 import base64
 import bisect
+import difflib
 import json
 import hashlib
 import os
@@ -22,12 +23,14 @@ from .models import (
     Account,
     Action,
     AdvisoryCache,
+    Agent,
     Analysis,
     Artifact,
     AuditContext,
     Commit,
     CVE,
     Exposure,
+    FileManifest,
     Finding,
     Job,
     JobAttempt,
@@ -43,6 +46,7 @@ from .models import (
     Repository,
     ServedChange,
     ServedFetch,
+    ServerChange,
     Snapshot,
     Transcript,
     VersionRecipe,
@@ -223,13 +227,18 @@ SCHEMAS = {
         },
     },
 }
-# A served-content change's Triage decides as a commit's does (A03).
-SCHEMAS["served_triage"] = SCHEMAS["commit_triage"]
+# A served-content change's Triage decides as a commit's does (A03), and so does a Server change's (B06).
+SCHEMAS["served_triage"] = SCHEMAS["server_triage"] = SCHEMAS["commit_triage"]
+# Server-file Analysis (B06) returns one of the same four Verdicts as served-content Analysis.
+SCHEMAS["server_analysis"] = json.loads(json.dumps(SCHEMAS["served_analysis"]))
 for _schema in SCHEMAS.values():
     _schema["additionalProperties"] = False
 # The runner's fixed tool profile of each operation that has none of its own (A10): served Triage
 # runs with no tools, served Analysis read-only with no target fetch.
-RUNNER_OPERATIONS = {"served_triage": "commit_triage", "served_analysis": "commit_analysis"}
+RUNNER_OPERATIONS = {"served_triage": "commit_triage", "served_analysis": "commit_analysis",
+                     "server_triage": "commit_triage", "server_analysis": "commit_analysis"}
+# B06: a Server change's Triage lists at most this many entries of each kind; past it, it is incomplete.
+TRIAGE_ENTRIES = 300
 # A Triage run is one tool-less call: the change travels in its prompt, its diff capped (a capped
 # diff counts as incomplete), and the run has a deadline.
 TRIAGE_DIFF_CHARS = 100_000
@@ -273,7 +282,7 @@ def validate_result(operation, result):
         raise DomainError(
             "invalid_agent_output", "Agent did not produce the structured result object", 422
         )
-    if operation == "served_analysis" and result.get("verdict") in VERDICTS:
+    if operation in ("served_analysis", "server_analysis") and result.get("verdict") in VERDICTS:
         check_verdict(result, served_content=True)  # refused as a Verdict, before the schema
     schema = SCHEMAS.get(operation)
     if schema:
@@ -714,7 +723,7 @@ class Workflows:
         result, outputs, state = self.run(
             db, job, "agent", profile, prompt, schema, files, policy=policy, suffix=suffix, limits=limits,
         )
-        if operation in ("commit_triage", "served_triage"):
+        if operation in ("commit_triage", "served_triage", "server_triage"):
             # The raw reply: triage_run redacts and validates it, and keeps it with its prompt.
             return {**result, "prompt": prompt}, outputs, state
         validate_result(operation, result)
@@ -735,7 +744,8 @@ class Workflows:
             # Their rows pin what they act on: the Finding's revision, or the draft's base_ref. Served
             # content is read from the Asset (A10), never from a source generation.
             and job.kind not in ("lab_run", "detection_rule", "patch_drafting", "remediation_draft", "remediation_pr",
-                                 "served_check", "served_triage", "served_analysis", "served_content_sweep")
+                                 "served_check", "served_triage", "served_analysis", "served_content_sweep",
+                                 "server_triage", "server_analysis")
             and job.input.get("source_generation") != owner.source_generation
         ):
             raise DomainError(
@@ -1381,10 +1391,11 @@ class Workflows:
             return None
 
     def set_commit_decision(self, db, job, subject, decision):
-        """Sets the review decision of a Commit or a ServedChange, unless the Operator reviewed it
-        after `job` was queued."""
+        """Sets the review decision of a Commit, ServedChange or ServerChange, unless the Operator
+        reviewed it after `job` was queued."""
         manual = db.scalar(select(Action.id).where(
-            Action.resource_type == ("served_change" if isinstance(subject, ServedChange) else "commit"),
+            Action.resource_type == {ServedChange: "served_change", ServerChange: "server_change"}.get(
+                type(subject), "commit"),
             Action.resource_id == subject.id,
             Action.data["action"].as_string() == "review", Action.created_at >= job.created_at,
         ).limit(1))
@@ -1405,7 +1416,7 @@ class Workflows:
             }
         self.context.fence(db)
         db.refresh(commit, with_for_update=True)
-        served_change = isinstance(commit, ServedChange)
+        served_change = isinstance(commit, (ServedChange, ServerChange))
         commit.triage_status, commit.triage_result = (
             "completed",
             {
@@ -1420,7 +1431,8 @@ class Workflows:
             # A flagged change is analysed automatically, after the changes already waiting for a
             # cap; an incomplete diff is never left unjudged.
             domain.start_waiting(db)
-            (domain.start_served_analysis if served_change else domain.start_analysis)(db, commit)
+            start = {ServedChange: domain.start_served_analysis, ServerChange: domain.start_server_analysis}
+            start.get(type(commit), domain.start_analysis)(db, commit)
         return result
 
     def redacted(self, db, value):
@@ -1512,6 +1524,115 @@ class Workflows:
         }
         parsed = self.triage_run(db, job, "served_triage", change, facts)
         return self.triage_result(db, job, change, parsed, facts["diff_complete"])
+
+    def server_bytes(self, db, sha):
+        """The held bytes of one server file (B05), or None. They are evidence only: read, never run."""
+        return artifacts.resource_files(db, self.config.artifact_root, "server_files", sha).get("content") if sha else None
+
+    def server_triage(self, db, job, application):
+        """Triage of a Server change (B06), as served_triage: its entries with their metadata, and a
+        text diff of the held bytes (each added file whole, each changed one against its held
+        Baseline bytes), cut to TRIAGE_DIFF_CHARS. A cut diff or an incomplete change is incomplete."""
+        change = domain.get(db, ServerChange, job.input["server_change_id"])
+        baseline = {(e["root"], e["path"]): e for e in db.get(FileManifest, change.baseline_manifest_id).entries}
+        parts = []
+        for entry in domain.server_change_files(change):
+            name = f"{entry['root']}/{entry['path']}"
+            after = self.server_bytes(db, entry["sha256"])
+            before_entry = baseline.get((entry["root"], entry["path"]))
+            if before_entry and before_entry["type"] != "file":
+                before_entry = None  # a link that became a file: the file is shown whole
+            before = self.server_bytes(db, before_entry["sha256"]) if before_entry else b""
+            if after is None or before is None:
+                parts.append(f"# {name}: bytes not held\n")
+                continue
+            lines = difflib.unified_diff(
+                before.decode("utf-8", "replace").splitlines(keepends=True),
+                after.decode("utf-8", "replace").splitlines(keepends=True),
+                fromfile="a/" + name if before_entry else "/dev/null", tofile="b/" + name)
+            parts.extend(line if line.endswith("\n") else line + "\n" for line in lines)
+        diff = "".join(parts)
+        cut = triage_cut(diff)
+        listed = {key: change.diff.get(key, [])[:TRIAGE_ENTRIES] for key in ("added", "modified", "removed")}
+        whole = all(len(listed[key]) == len(change.diff.get(key, [])) for key in listed)
+        facts = {
+            "agent": db.get(Agent, change.agent_id).name,
+            "server_change": listed,
+            "incomplete": change.incomplete,
+            "diff": cut,
+            "diff_complete": not change.incomplete and whole and len(cut) == len(diff),
+        }
+        parsed = self.triage_run(db, job, "server_triage", change, facts)
+        return self.triage_result(db, job, change, parsed, facts["diff_complete"])
+
+    def server_analysis(self, db, job, application):
+        """Analysis of a Server change (B06) from stored bytes only, never executed and with no
+        target: each added or changed file's held bytes staged as source/changed/<sha256>, its held
+        Baseline version as source/baseline/<sha256>, and server-files.json, which alone names
+        their server paths. Only the four server-file Verdicts stand (validate_result), and an
+        incomplete change's Unrelated is stored as Insufficient context. A Malicious change opens a
+        server_files Finding whose Alert's source is the agent's name, naming the files the
+        indicators name by path and SHA-256."""
+        change = domain.get(db, ServerChange, job.input["server_change_id"])
+        agent = db.get(Agent, change.agent_id)
+        baseline = {(e["root"], e["path"]): e for e in db.get(FileManifest, change.baseline_manifest_id).entries}
+        files, listing = {}, {}
+
+        def stage(kind, entry):
+            data = self.server_bytes(db, entry["sha256"])
+            name = f"source/{kind}/{entry['sha256']}"
+            listing.setdefault(name, {"root": entry["root"], "path": entry["path"], "sha256": entry["sha256"],
+                                      "held": data is not None})
+            if data is not None:
+                files[name] = data
+
+        for entry in domain.server_change_files(change):
+            if entry["sha256"]:
+                stage("changed", entry)
+            before = baseline.get((entry["root"], entry["path"]))
+            if before and before["type"] == "file" and before.get("sha256"):
+                stage("baseline", before)
+        files["server-files.json"] = json.dumps({"agent": agent.name, "diff": change.diff, "files": listing,
+                                                 "incomplete": change.incomplete}, indent=1).encode()
+        result, outputs, state = self.agent(
+            db, job, "server_analysis", files,
+            {"agent": agent.name, "fingerprint": change.fingerprint, "incomplete": bool(change.incomplete)},
+            limits={"timeout_seconds": ANALYSIS_SECONDS},
+        )
+        transcript = self.session_transcript(db, state)
+        if "report.md" not in outputs:
+            raise DomainError("missing_report", "Analysis completed without report.md", 422)
+        if result["verdict"] == "Unrelated" and change.incomplete:
+            result = {**result, "verdict": "Insufficient context"}  # B05: never Unrelated while incomplete
+        verdict = result["verdict"]
+        self.context.fence(db)
+        db.refresh(change, with_for_update=True)
+        analysis = Analysis(id=uid(), application_id=application.id, kind=job.kind, subject_id=change.id, job_id=job.id,
+                            input_hash=job.input_hash, profile=job.profile, result=result)
+        db.add(analysis)
+        artifacts.publish(db, self.config.artifact_root, "analysis", analysis.id, outputs,
+                          {"agent": agent.name, "fingerprint": change.fingerprint, "profile": job.profile},
+                          all_secrets(db, self.vault))
+        self.store_analysis_transcript(db, job, change.id, analysis.id, state["run_id"], transcript)
+        self.set_commit_decision(db, job, change, VERDICT_REVIEW[verdict])
+        change.verdict = verdict
+        change.analysis_state = {"status": "completed", "analysis_id": analysis.id}
+        entry = {}
+        if verdict == "Malicious change":
+            cause = {"by": "verdict", "verdict": verdict, "confidence": result["confidence"],
+                     "analysis_id": analysis.id, "server_change_id": change.id}
+            finding, _ = domain.open_finding(db, application, "server_files", change.id, result["title"], agent.name,
+                                             cause)
+            entry = {"finding_id": finding.id}
+            if finding.status in ("open", "confirmed"):  # A closed Finding keeps what it was closed with.
+                named, rejected = server_indicator_files(change, baseline, result["indicators"]["files"])
+                # ponytail: the agent-drafted indicators are shown as drafted; their static Proof and
+                # Detection rule validation are deferred (B07).
+                finding.data = {**finding.data, "agent_id": agent.id, "source_analysis_id": analysis.id,
+                                "evidence": result["evidence"], "server_files": named,
+                                "server_indicators": {"analysis_id": analysis.id, "indicators": result["indicators"],
+                                                      "rejected": rejected}}
+        return {"analysis_id": analysis.id, "server_change_id": change.id, **result, **entry}
 
     def triage_run(self, db, job, operation, subject, facts):
         """The one tool-less Triage run of `subject`, a Commit or a ServedChange: its validated reply.
@@ -3880,6 +4001,29 @@ SERVED_POLICY = {"served_content": True, "methods": ["GET"], "request_budget": 1
                  "max_response_bytes": 1024 * 1024, "max_total_bytes": 16 * 1024 * 1024}
 SERVED_TARGET = {"user_agents": list(domain.USER_AGENTS), "max_scripts": 20, "max_bytes": 7 * 1024 * 1024}
 RESOURCE_FIELDS = ("url", "final_url", "status", "sha256", "content_type", "error")
+
+
+def server_indicator_files(change, baseline, names):
+    """The files a server-file Malicious change's indicators name (B07), as [{root, path, sha256}]:
+    each must be an added or changed file of the change, named by root/path or by path, with its
+    SHA-256 from the manifest, and bytes the Baseline did not hold at any path. The rest are
+    listed in rejected, with the reason."""
+    files = {}
+    for entry in domain.server_change_files(change):
+        files.setdefault(f"{entry['root']}/{entry['path']}", entry)
+        files.setdefault(entry["path"], entry)
+    before = {entry.get("sha256") for entry in baseline.values()} - {None}
+    named, rejected = [], []
+    for value in dict.fromkeys(names):
+        entry = files.get(value.removeprefix("source/changed/")) or next(
+            (e for e in files.values() if f"source/changed/{e['sha256']}" == value), None)
+        reason = ("Not an added or changed file of this Server change" if entry is None or not entry["sha256"]
+                  else "The Baseline holds these bytes too" if entry["sha256"] in before else None)
+        if reason:
+            rejected.append({"kind": "file", "value": value, "reason": reason})
+        elif not any(item["root"] == entry["root"] and item["path"] == entry["path"] for item in named):
+            named.append({"root": entry["root"], "path": entry["path"], "sha256": entry["sha256"]})
+    return named, rejected
 
 
 def served_names(fetch):

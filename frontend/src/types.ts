@@ -596,7 +596,7 @@ const servedFetchSchema = z.object({
 });
 export type ServedFetch = z.infer<typeof servedFetchSchema>;
 /** A fingerprint unlike the Baseline, triaged at most once, with its Analysis and Finding. */
-const servedChangeSchema = z.object({
+export const servedChangeSchema = z.object({
   id: z.string(),
   triage_status: z.string(),
   triage_result: unknownRecord.nullable(),
@@ -643,10 +643,11 @@ export const transcriptSummarySchema = z.object({
 export const transcriptSchema = transcriptSummarySchema.extend({
   text: z.string(),
 });
+const serverFileSchema = z.object({ root: z.string(), path: z.string(), sha256: z.string() });
 export const findingSchema = z.object({
   id: z.string(),
   application_id: z.string(),
-  source: z.enum(["commit", "served_content", "advisory", "cve"]),
+  source: z.enum(["commit", "served_content", "advisory", "cve", "server_files"]),
   /** Short SHA, Watched page or advisory id of what opened the Finding. */
   source_ref: z.string().nullable().optional(),
   cve_id: z.string().nullable(),
@@ -730,6 +731,56 @@ export const findingSchema = z.object({
   remediation_prs: z.array(remediationPRSchema).default([]),
   /** The Triage and Analysis Transcripts of what it is about, oldest first (A14). */
   transcripts: z.array(transcriptSummarySchema).default([]),
+  /** B07: the server files a server_files Finding names, and when a named SHA-256 was seen again. */
+  server_files: z.array(serverFileSchema).optional(),
+  regressed_at: z.string().nullable().optional(),
+  /** B07: its Quarantine list and hash, each Quarantine and Restore command with the agent's verified result. */
+  quarantine: z
+    .object({
+      agent_id: z.string().nullable(),
+      agent_name: z.string().nullable(),
+      agent_status: z.string().nullable(),
+      list: z.array(serverFileSchema),
+      list_sha256: z.string(),
+      commands: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          sequence: z.number(),
+          status: z.string(),
+          reason: z.string().nullable().optional(),
+          expires_at: z.string().nullable(),
+          created_at: z.string(),
+          list_sha256: z.string().optional(),
+          entries_sha256: z.string().optional(),
+          files: z.array(
+            z.object({
+              root: z.string().optional(),
+              path: z.string().optional(),
+              sha256: z.string().optional(),
+              quarantine_id: z.string().optional(),
+              status: z.string(),
+              detail: z.string().optional(),
+            }),
+          ),
+          restore: z
+            .object({ entries: z.array(z.string()), entries_sha256: z.string() })
+            .nullable()
+            .optional(),
+        }),
+      ),
+      quarantined: z.array(
+        z.object({
+          quarantine_id: z.string(),
+          command_id: z.string(),
+          root: z.string().nullable(),
+          path: z.string().nullable(),
+          sha256: z.string().nullable(),
+        }),
+      ),
+    })
+    .nullable()
+    .optional(),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -967,3 +1018,117 @@ export const recipeSchema = z.object({
   source_generation: z.number().optional(),
 });
 export const recipesSchema = listSchema(recipeSchema);
+/** B04: a configuration or Agent command signed for an On-server agent, and the agent's answer. */
+export const agentMessageSchema = z.object({
+  id: z.string(),
+  type: z.string(),
+  name: z.string().nullable(),
+  sequence: z.number(),
+  status: z.string(),
+  reason: z.string().nullable(),
+  result: z.record(z.string(), z.unknown()).nullable(),
+  expires_at: z.string().nullable(),
+  created_at: z.string(),
+});
+export type AgentMessage = z.infer<typeof agentMessageSchema>;
+/** B05: one file or symbolic link of a File manifest, as the agent reported it. */
+const manifestEntrySchema = z.object({
+  root: z.string(),
+  path: z.string(),
+  type: z.string(),
+  sha256: z.string().nullable(),
+  size: z.number(),
+  mode: z.number(),
+  uid: z.number(),
+  gid: z.number(),
+  target: z.string().optional(),
+  secret: z.boolean().optional(),
+  over_hash_limit: z.boolean().optional(),
+});
+const incompleteSchema = z.array(
+  z.object({
+    reason: z.string(),
+    root: z.string().optional(),
+    path: z.string().optional(),
+  }),
+);
+/** A Server change: a File manifest unlike the Baseline, with its Triage, Verdict and Finding. */
+const serverChangeSchema = servedChangeSchema.extend({
+  fingerprint: z.string(),
+  diff: z.object({
+    added: z.array(manifestEntrySchema),
+    modified: z.array(
+      z.object({ before: manifestEntrySchema, after: manifestEntrySchema }),
+    ),
+    removed: z.array(manifestEntrySchema),
+  }),
+  incomplete: incompleteSchema,
+  // The SHA-256 values of its added and changed files whose bytes are held.
+  held: z.array(z.string()),
+  created_at: z.string(),
+});
+/** An On-server agent of an Application. Everything it reports is shown as text only. */
+export const agentSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  url: z.string(),
+  // awaiting_enrollment, pending, enrolled or revoked
+  status: z.string(),
+  fingerprint: z.string().nullable(),
+  key_id: z.string().nullable(),
+  allowed_paths: z.array(z.string()),
+  watched_roots: z.array(z.string()),
+  version: z.string().nullable(),
+  os: z.string().nullable(),
+  arch: z.string().nullable(),
+  last_seen_at: z.string().nullable(),
+  last_refusal: z
+    .object({ at: z.string(), route: z.string(), reason: z.string() })
+    .nullable(),
+  configuration: agentMessageSchema.nullable(),
+  commands: z.array(agentMessageSchema),
+  baseline: z
+    .object({
+      manifest_id: z.string(),
+      sha256: z.string(),
+      accepted_at: z.string().nullable(),
+    })
+    .nullable()
+    .default(null),
+  latest_manifest: z
+    .object({
+      id: z.string(),
+      sequence: z.number(),
+      sha256: z.string(),
+      status: z.string(),
+      file_count: z.number(),
+      incomplete: incompleteSchema,
+      created_at: z.string(),
+    })
+    .nullable()
+    .default(null),
+  accept_allowed: z.boolean().default(false),
+  changes: z.array(serverChangeSchema).default([]),
+});
+export type Agent = z.infer<typeof agentSchema>;
+export type ManifestEntry = z.infer<typeof manifestEntrySchema>;
+export type ServerChange = z.infer<typeof serverChangeSchema>;
+export const agentsSchema = z.object({
+  agent_url: z.string(),
+  items: z.array(agentSchema),
+});
+/** Add agent's answer: the enroll command and the one-time Enrollment code, shown once. */
+export const enrollmentSchema = z.object({
+  agent: agentSchema,
+  enrollment: z.object({
+    code: z.string(),
+    command: z.string(),
+    url: z.string(),
+    tls_pin: z.string(),
+    dashboard_key: z.string(),
+    key_id: z.string(),
+    agent_id: z.string(),
+    expires_at: z.string(),
+  }),
+});
+export type Enrollment = z.infer<typeof enrollmentSchema>["enrollment"];

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 from http.cookiejar import CookieJar
+import hashlib
 import json
 from pathlib import Path
+import re
 import time
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -557,7 +559,171 @@ def main():
     assert gone['status'] == 404, gone
     print('PASS after Turn off the old push id is refused at once')
 
-    for application in [github, wordpress, own, node, advisory, served, pushed]:
+    # On-server agent (B04): server-standin runs the real Go agent binary on the stand-ins network.
+    # The fixture drops the enroll command's values and the Enrollment code for it; the agent enrolls
+    # over https://ingress-agent:8084, pinned to NUMEN_AGENT_TLS_PIN, and the scheduler verifies
+    # each stored request again within one loop.
+    server = client.request('POST', '/api/applications', {
+        **common, 'asset_name': f'Server fixture {suffix}', 'product_kind': 'CMS',
+    }, expect=(200, 201))
+    agents_path = f'/api/applications/{server["id"]}/agents'
+    agent_url = client.request('GET', agents_path)['agent_url']
+    assert agent_url == 'https://ingress-agent:8084', agent_url
+    added = client.request('POST', agents_path, {'name': f'web-{suffix}', 'url': agent_url}, expect=(201,))
+    enrollment, agent_id = added['enrollment'], added['agent']['id']
+    for value in (agent_url, enrollment['tls_pin'], enrollment['dashboard_key'], enrollment['key_id'], agent_id):
+        assert value and value in enrollment['command'], (value, enrollment['command'])
+    assert enrollment['code'] not in enrollment['command'] and enrollment['code'] not in json.dumps(client.request('GET', agents_path))
+    # The stand-in web root outlives a failed run: the file this run drops must not be in its Baseline.
+    shell_path = 'wp-content/uploads/cache.php'
+    fixture.request('POST', '/admin/server-files', {'remove': [shell_path]})
+    dropped = fixture.request('POST', '/admin/server/enroll', {key: enrollment[key] for key in (
+        'url', 'tls_pin', 'dashboard_key', 'key_id', 'agent_id', 'code')})
+
+    def enroll_result(number):
+        return next((run for run in fixture.request('GET', '/admin/state')['server']['enroll_results']
+                     if run['number'] == number), None)
+
+    def agent_row():
+        return next(row for row in items(client.request('GET', agents_path)) if row['id'] == agent_id)
+
+    def wait_agent(ready, what, timeout=120):
+        deadline = time.monotonic() + timeout
+        while not ready(row := agent_row()):
+            assert time.monotonic() < deadline, f'{what}: {row}'
+            time.sleep(1)
+        return row
+
+    deadline = time.monotonic() + 120
+    while (enrolled := enroll_result(dropped['number'])) is None:
+        assert time.monotonic() < deadline, 'the stand-in server never ran enroll'
+        time.sleep(1)
+    assert enrolled['returncode'] == 0, enrolled
+    fingerprint = re.search(r'Agent key fingerprint: (sha256:[0-9a-f]{64})', enrolled['stdout'])[1]
+    row = wait_agent(lambda row: row['status'] == 'pending', 'the Enrollment was not bound')
+    assert (row['fingerprint'], row['allowed_paths']) == (fingerprint, ['/var/www/html']), row
+    assert row['configuration'] is None and row['commands'] == [], row
+    print('PASS the real agent enrolls through the stand-in server over pinned TLS, and the agent shows as pending with the fingerprint enroll printed and its Allowed paths')
+
+    confirmed = client.request('POST', f'/api/agents/{agent_id}/confirmations', {'fingerprint': fingerprint})
+    assert (confirmed['status'], confirmed['watched_roots']) == ('enrolled', ['/var/www/html']), confirmed
+    row = wait_agent(lambda row: row['last_seen_at'] and (row['configuration'] or {}).get('status') == 'done',
+                     'the agent never accepted its signed configuration')
+    assert row['config_sequence'] == row['configuration']['sequence'] == 1, row
+    print('PASS Confirm fingerprint signs the first configuration, and the agent polls, verifies and accepts it')
+
+    command = client.request('POST', f'/api/agents/{agent_id}/rescans', {}, expect=(202,))
+    row = wait_agent(lambda row: any(listed['id'] == command['id'] and listed['status'] == 'done'
+                                     for listed in row['commands']), 'the rescan command never ran', 90)
+    assert row['last_refusal'] is None or row['last_refusal']['route'] != 'result', row
+    print('PASS Check now signs a rescan command that the agent runs once and answers done')
+
+    # B05: the agent reports File manifests; the scheduler verifies each report again, asks for the
+    # bytes it does not hold and holds what the agent uploads. The first one becomes the Baseline only
+    # when the Operator accepts it, by its SHA-256 (not an Approval: no password).
+    row = wait_agent(lambda row: (row['latest_manifest'] or {}).get('status') == 'complete'
+                     and row['latest_manifest']['sequence'] >= row['report_sequence'] > 0,
+                     'no complete File manifest', 120)
+    manifest = row['latest_manifest']
+    assert (row['baseline'], row['accept_allowed'], row['changes']) == (None, True, []), row
+    stale = client.request('POST', f'/api/agents/{agent_id}/baselines',
+                           {'manifest_id': manifest['id'], 'manifest_sha256': '0' * 64}, expect=(409,))
+    assert stale['code'] == 'manifest_changed', stale
+    accepted = client.request('POST', f'/api/agents/{agent_id}/baselines',
+                              {'manifest_id': manifest['id'], 'manifest_sha256': manifest['sha256']})
+    assert accepted['baseline']['manifest_id'] == manifest['id'] and not accepted['accept_allowed'], accepted
+    print('PASS the first File manifest is reported, verified again and accepted as the Baseline by its SHA-256')
+
+    # A webshell-like inert PHP file dropped on the server (if run it would only print a marker;
+    # nothing runs it) is one Server change after Check now, with its bytes held.
+    shell = ("<?php /* stand-in dropped shell: if run it would only print a marker */ "
+             "if (isset($_GET['c'])) { echo 'asset-monitor-fixture'; } ?>")
+    fixture.request('POST', '/admin/server-files', {'write': {shell_path: shell}})
+    client.request('POST', f'/api/agents/{agent_id}/rescans', {}, expect=(202,))
+    row = wait_agent(lambda row: row['changes'], 'the dropped file never became a Server change', 180)
+    (change,) = row['changes']
+    added = [entry for entry in change['diff']['added'] if entry['path'] == shell_path]
+    sha = hashlib.sha256(shell.encode()).hexdigest()
+    assert len(added) == 1 and added[0]['sha256'] == sha and sha in change['held'], change
+    assert (change['diff']['modified'], change['diff']['removed'], change['triage_status']) == ([], [], 'disabled'), change
+    assert change['baseline_manifest_id'] == manifest['id'] and not change['incomplete'], change
+    sequence = row['latest_manifest']['sequence']
+    client.request('POST', f'/api/agents/{agent_id}/rescans', {}, expect=(202,))
+    row = wait_agent(lambda row: row['latest_manifest']['sequence'] > sequence
+                     and row['latest_manifest']['status'] == 'complete', 'the second rescan never reported', 120)
+    assert [listed['id'] for listed in row['changes']] == [change['id']], row['changes']
+    assert 'cache.php' not in json.dumps(fixture.request('GET', '/admin/state')['served_requests'])
+    print('PASS a dropped PHP file is exactly one Server change with its bytes held, a second rescan adds none, and nothing requested it')
+
+    # B07: Quarantine and Restore, each only after an Approval with the password on that request.
+    # Triage is off, so the Operator opens the server_files Finding by hand on the Server change.
+    opened = client.request('POST', '/api/findings', {
+        'application_id': server['id'], 'source': 'server_files', 'title': 'A dropped PHP shell',
+        'source_server_change_id': change['id']}, expect=(201,))
+    named = [{'root': '/var/www/html', 'path': shell_path, 'sha256': sha}]
+    assert (opened['source_ref'], opened['server_files'], opened['quarantine']['list']) == (
+        f'web-{suffix}', named, named), opened
+    quarantines = f'/api/findings/{opened["id"]}/quarantines'
+    list_sha256 = opened['quarantine']['list_sha256']
+
+    def shell_finding():
+        return client.request('GET', f'/api/findings/{opened["id"]}')
+
+    def wait_finding(ready, what, timeout=180):
+        deadline = time.monotonic() + timeout
+        while not ready(found := shell_finding()):
+            assert time.monotonic() < deadline, f'{what}: {found}'
+            time.sleep(1)
+        return found
+
+    def server_alerts():
+        return [n for n in fixture.request('GET', '/admin/state')['notifications']
+                if f'Application: Server fixture {suffix}' in n['content']]
+
+    refused = client.request('POST', quarantines, {'password': 'wrong-' + suffix, 'list_sha256': list_sha256}, expect=(403,))
+    assert refused['code'] == 'approval_refused' and shell_finding()['quarantine']['commands'] == [], refused
+    command = client.request('POST', quarantines, {'password': password, 'list_sha256': list_sha256}, expect=(202,))
+    found = wait_finding(lambda f: f['status'] == 'remediated' and f['quarantine']['commands'][0]['status'] == 'done',
+                         'the Quarantine never remediated the Finding')
+    (done,) = found['quarantine']['commands']
+    (moved,) = done['files']
+    assert (done['id'], moved['path'], moved['sha256'], moved['status']) == (command['id'], shell_path, sha, 'quarantined'), done
+    assert found['cause']['by'] == 'manifest', found['cause']
+    listing = fixture.request('GET', '/admin/state')['server']['quarantine']
+    assert {f'{moved["quarantine_id"]}.bin', f'{moved["quarantine_id"]}.json'} <= set(listing), listing
+    assert server_alerts() == []
+    print('PASS Quarantine refuses a wrong password, then the real agent moves the named file into its Quarantine folder and the next manifest Remediates the Finding')
+
+    client.request('POST', f'/api/findings/{opened["id"]}/restores', {
+        'password': password, 'command_id': done['id'], 'entries_sha256': done['restore']['entries_sha256']}, expect=(202,))
+    found = wait_finding(lambda f: f['status'] == 'confirmed' and any(
+        c['name'] == 'restore' and c['status'] == 'done' for c in f['quarantine']['commands']),
+        'the Restore never regressed the Finding')
+    (restored,) = [c for c in found['quarantine']['commands'] if c['name'] == 'restore']
+    assert restored['files'][0]['status'] == 'restored' and found['quarantine']['quarantined'] == [], found['quarantine']
+    assert found['cause']['by'] == 'regression' and found['regressed_at'], found
+    deadline = time.monotonic() + 60
+    while not (alerts := server_alerts()):
+        assert time.monotonic() < deadline, 'the regression Alert was never delivered'
+        time.sleep(1)
+    (alert,) = alerts
+    assert alert['content'].startswith('Asset Monitor: Malicious change · regressed'), alert
+    assert f'Source: web-{suffix}' in alert['content'] and 'cache.php' not in alert['content'], alert
+    print('PASS Restore after a password Approval puts the file back, and the next manifest regresses the Finding to Confirmed with one Alert naming the agent and no path')
+
+    # Revoke: the listener refuses the agent from its next request on, so it is never seen again.
+    revoked = client.request('POST', f'/api/agents/{agent_id}/revocations', {})
+    assert revoked['status'] == 'revoked', revoked
+    time.sleep(6)  # a request stored just before the Revoke is refused by application code
+    seen = agent_row()['last_seen_at']
+    time.sleep(8)
+    row = agent_row()
+    assert (row['status'], row['last_seen_at']) == ('revoked', seen), row
+    assert client.request('POST', quarantines, {'password': password, 'list_sha256': list_sha256}, expect=(409,))['code'] in (
+        'agent_not_enrolled', 'quarantine_not_allowed')
+    print('PASS a revoked agent is refused at its next request and takes no command')
+
+    for application in [github, wordpress, own, node, advisory, served, pushed, server]:
         client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})
     client.request('POST', '/api/auth/logout', {})
     client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(401,), raw=True)

@@ -71,6 +71,7 @@ import { failureGroups } from "./Jobs";
 import { ApplicationRepositories } from "./ApplicationRepositories";
 import { ApplicationAdvisories } from "./ApplicationAdvisories";
 import { ApplicationServedContent } from "./ApplicationServedContent";
+import { ApplicationServerFiles } from "./ApplicationServerFiles";
 import { jobName, jobOutcome } from "../jobSummary";
 type VersionRecord = NonNullable<Application["version"]>;
 export function ApplicationDetail() {
@@ -266,6 +267,7 @@ function ApplicationBody({
           },
           { id: "advisories", label: "Advisories" },
           { id: "served", label: "Served content" },
+          { id: "server", label: "Server files" },
           { id: "version", label: "Version" },
           { id: "commits", label: "Commits", count: count(data.commits) },
           { id: "audit", label: "Audit context", count: count(data.audits) },
@@ -335,6 +337,7 @@ function ApplicationBody({
       {tab === "served" && (
         <ApplicationServedContent application={application} />
       )}
+      {tab === "server" && <ApplicationServerFiles application={application} />}
       {tab === "version" && (
         <VersionTab
           application={application}

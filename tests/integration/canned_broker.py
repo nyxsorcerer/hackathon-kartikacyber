@@ -3,7 +3,7 @@ of the runner-broker for app, worker and scheduler. It speaks the broker contrac
 docs/implementation-contract.md (X-Broker-Token, /internal/runs, /internal/attempts, /health).
 
 Only the agent decisions are replaced. A run of kind `agent` or `capabilities` is answered here at
-once with a canned reply chosen by its operation and the prepared demo commit or served change it is
+once with a canned reply chosen by its operation and the prepared demo commit, served change or Server change it is
 about, and is never forwarded: its credential reaches no provider and is never stored. Every report
 says that no agent ran, the catalogue's model is named 'Canned dry run, no agent', and its session
 read is refused, so no run has an Analysis Transcript. A login run is refused. Every other run (lab,
@@ -120,6 +120,19 @@ def served_analysis(content: dict) -> tuple[dict, dict]:
         'detection-rule.yar': rule}
 
 
+def server_analysis(listing: dict) -> tuple[dict, dict]:
+    """The canned Verdict of the demo server's Server change (B06): the PHP file the change added is a
+    Malicious change, named by its root and path. Its bytes are never run."""
+    added = [f"{e['root']}/{e['path']}" for e in listing['diff']['added'] if e['path'].endswith('.php')]
+    if not added:
+        raise LookupError('no added PHP file in this Server change')
+    title = 'A PHP shell dropped in an uploads folder'
+    return {'verdict': 'Malicious change', 'confidence': 'high', 'title': title, 'summary': CANNED,
+            'evidence': [{'path': 'server-files.json', 'detail': CANNED}], 'open_questions': [],
+            'indicators': {'files': added, 'hosts': [], 'urls': [], 'commands': []}, 'reachable_secrets': []}, {
+        'report.md': report(title, f'{", ".join(added)} appeared on {listing["agent"]} where only media belongs.')}
+
+
 def patch(files: dict) -> tuple[dict, dict]:
     """Step 1's patch Remediation PR: the containment check, diffed against the Own head's server.js."""
     old = files['source/server.js'].decode()
@@ -155,12 +168,16 @@ def reply(request: dict) -> tuple[dict, dict]:
         return {'models': [MODEL]}, {}
     operation, found, files = request['profile'].get('operation'), facts(request['prompt']), inputs(request)
     if operation == 'commit_triage':
-        flagged = 'page_url' in found or subject(found['commit']['message']) in (INVOICE, TELEMETRY, FIX)
+        # A served-content or Server change has no commit: check for them before reading one.
+        flagged = ('page_url' in found or 'server_change' in found
+                   or subject(found['commit']['message']) in (INVOICE, TELEMETRY, FIX))
         decision = {'decision': 'security_candidate' if flagged else 'unrelated',
                     'title': 'Canned dry run: ' + ('a security candidate' if flagged else 'unrelated'), 'reason': CANNED}
         return {'reply': json.dumps(decision)}, {}
     if operation == 'commit_analysis' and 'served-content.json' in files:
         return served_analysis(json.loads(files['served-content.json']))
+    if operation == 'commit_analysis' and 'server-files.json' in files:
+        return server_analysis(json.loads(files['server-files.json']))
     if operation == 'commit_analysis':
         return commit_analysis(json.loads(files['commit.json']), found)
     if operation == 'patch_drafting':
@@ -307,6 +324,12 @@ def check() -> None:
     served = {'page_url': 'p', 'user_agent': 'browser', 'diff': {'script_hosts': {'added': [CLICKFIX_HOST]}}}
     assert run('commit_analysis', {}, {'served-content.json': json.dumps(served).encode()})['result']['indicators']['hosts'] == [CLICKFIX_HOST]
     assert run('commit_analysis', {}, {'commit.json': json.dumps({'message': 'Release 19.0.1'}).encode()})['status'] == 'failed'
+    assert json.loads(run('commit_triage', {'server_change': {'added': []}})['result']['reply'])['decision'] == 'security_candidate'
+    listing = {'agent': 'Demo server', 'diff': {'added': [{'root': '/var/www/html', 'path': 'wp-content/uploads/cache.php'},
+                                                          {'root': '/var/www/html', 'path': 'logo.png'}]}}
+    shell = run('commit_analysis', {}, {'server-files.json': json.dumps(listing).encode()})
+    assert (shell['result']['verdict'], shell['result']['indicators']['files'], [o['path'] for o in shell['outputs']]) == (
+        'Malicious change', ['/var/www/html/wp-content/uploads/cache.php'], ['report.md'])
     assert run(None, {}, kind='capabilities')['result'] == {'models': [MODEL]}
     print('CANNED BROKER CHECK PASSED')
 

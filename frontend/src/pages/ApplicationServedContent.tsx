@@ -89,14 +89,19 @@ function Diff({ diff }: { diff: ServedDiff | null }) {
     />
   );
 }
-/** Where a served-content change stands: its Triage, Analysis, Verdict, Review queue and Finding,
- * with a manual Analysis and, for a change in the Review queue, its dismissal. */
-function Change({
+/** Where a served-content change (or, with route "server-changes", a Server change) stands: its
+ * Triage, Analysis, Verdict, Review queue and Finding, with a manual Analysis and, for a change in
+ * the Review queue, its dismissal. */
+export function Change({
   change,
   refresh,
+  route = "served-changes",
+  noun = "Served-content",
 }: {
   change: ServedChange | null;
   refresh: () => void;
+  route?: string;
+  noun?: string;
 }) {
   if (!change) return <span className="muted">None</span>;
   const queued =
@@ -132,10 +137,10 @@ function Change({
           <ActionButton
             className="secondary"
             onAction={async () => {
-              await mutate(`/served-changes/${change.id}/review`, z.unknown(), {
+              await mutate(`/${route}/${change.id}/review`, z.unknown(), {
                 decision: "dismissed",
               });
-              notify("Served-content change dismissed.");
+              notify(`${noun} change dismissed.`);
               refresh();
             }}
           >
@@ -147,10 +152,10 @@ function Change({
             className="secondary"
             onAction={async () => {
               await queueJob(
-                `/served-changes/${change.id}/analyses`,
+                `/${route}/${change.id}/analyses`,
                 {},
                 undefined,
-                "Served-content Analysis queued.",
+                `${noun} Analysis queued.`,
               );
               refresh();
             }}

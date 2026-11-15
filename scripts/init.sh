@@ -2,10 +2,11 @@
 set -eu
 numen_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$numen_root"
-# An existing .env keeps every line; only missing keys are appended (the release-2 ingress keys).
+# An existing .env keeps every line; only missing keys are appended (the release-2 ingress keys
+# and NUMEN_SIGNING_KEY).
 if [ -f .env ]; then
     numen_complete=1
-    for numen_key in NUMEN_INGRESS_KEY NUMEN_PUSH_DATABASE_PASSWORD NUMEN_AGENT_DATABASE_PASSWORD NUMEN_AGENT_TLS_KEY NUMEN_AGENT_TLS_PIN; do
+    for numen_key in NUMEN_INGRESS_KEY NUMEN_SIGNING_KEY NUMEN_PUSH_DATABASE_PASSWORD NUMEN_AGENT_DATABASE_PASSWORD NUMEN_AGENT_TLS_KEY NUMEN_AGENT_TLS_PIN; do
         grep -q "^$numen_key=" .env || numen_complete=
     done
     if [ -n "$numen_complete" ]; then
@@ -46,10 +47,12 @@ def openssl(*arguments, data=None):
 
 
 def ingress_keys(present):
-    """The ingress keys missing from present (ADR-0006). The TLS key and its pin stay a pair."""
+    """The release-2 keys missing from present (ADR-0006, B04). The TLS key and its pin stay a pair."""
     keys = {}
-    if 'NUMEN_INGRESS_KEY' not in present:
-        keys['NUMEN_INGRESS_KEY'] = fernet_key()
+    # NUMEN_SIGNING_KEY encrypts the Dashboard key (B04); only the app gets it.
+    for name in ('NUMEN_INGRESS_KEY', 'NUMEN_SIGNING_KEY'):
+        if name not in present:
+            keys[name] = fernet_key()
     for name in ('NUMEN_PUSH_DATABASE_PASSWORD', 'NUMEN_AGENT_DATABASE_PASSWORD'):
         if name not in present:
             keys[name] = secrets.token_urlsafe(32)

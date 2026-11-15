@@ -50,7 +50,10 @@ case "${1:-}" in
     up)
         [ "${ASSET_MONITOR_DEMO_VM:-}" = 1 ] || demo_fail "Run the demo only on a disposable VM that holds \
 demo-scoped, spend-capped keys (ADR-0005), and set ASSET_MONITOR_DEMO_VM=1 there."
-        demo_compose up -d --wait app worker scheduler runner-broker fetch-gateway fixtures ingress-push ingress-agent
+        # The stand-in server's image holds the real On-server agent binary, built from agent/ (B04).
+        demo_compose build server-standin
+        demo_compose up -d --wait app worker scheduler runner-broker fetch-gateway fixtures ingress-push ingress-agent \
+            server-standin
         # As the host user, for the same 0600 password file; bootstrap writes only to the database.
         demo_compose --profile setup run --rm --user "$(id -u):$(id -g)" bootstrap-operator
         demo_run demo.py seed

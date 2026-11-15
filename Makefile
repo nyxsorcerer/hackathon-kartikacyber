@@ -60,7 +60,7 @@ test-demo: build
 demo-up: build
 	./scripts/demo.sh up
 
-# One demo step: STEP=1, 2, 3, merge-revert, 4, 5, merge-bump, php-inject or php-clean.
+# One demo step: STEP=1, 2, 3, merge-revert, 4, 5, merge-bump, php-inject, php-clean or server-inject.
 demo-step:
 	./scripts/demo.sh step "$(STEP)"
 

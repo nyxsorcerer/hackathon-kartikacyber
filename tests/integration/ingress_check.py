@@ -76,7 +76,8 @@ def push():
 
 
 def agent(pin: str):
-    check_role('asset_monitor_agent')
+    # B04: it reads signed messages, and may insert agent requests but never read them back.
+    check_role('asset_monitor_agent', reads=('agent_messages',), refused=('agent_requests', 'accounts'))
     served = x509.load_pem_x509_certificate(ssl.get_server_certificate(('ingress-agent', 8084)).encode())
     spki = served.public_key().public_bytes(serialization.Encoding.DER,
                                             serialization.PublicFormat.SubjectPublicKeyInfo)

@@ -66,9 +66,14 @@ services:
     <<: *app
     ports: ["127.0.0.1:${NUMEN_PORT:-8788}:8080"]
     # Encrypts Push webhook secrets. Only ingress-push, the app and the worker hold it (ADR-0006 5).
+    # NUMEN_SIGNING_KEY encrypts the Dashboard key, which signs every agent configuration and command;
+    # only the app holds it (B04). The enroll command shows NUMEN_AGENT_URL and NUMEN_AGENT_TLS_PIN.
     environment:
       <<: *app-env
       NUMEN_INGRESS_KEY: ${NUMEN_INGRESS_KEY:?Run setup first}
+      NUMEN_SIGNING_KEY: ${NUMEN_SIGNING_KEY:?Run setup first}
+      NUMEN_AGENT_TLS_PIN: ${NUMEN_AGENT_TLS_PIN:?Run setup first}
+      NUMEN_AGENT_URL: ${NUMEN_AGENT_URL:-https://127.0.0.1:8792}
     # Agent session chat relays operator input to the broker.
     networks: [application, control]
     healthcheck:

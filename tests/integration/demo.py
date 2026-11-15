@@ -10,7 +10,8 @@ printed.
 `seed` is idempotent: it looks up every account, Application, repository link and Watched page
 before creating one. Each `step` advances the stand-ins, runs Check now (or the Advisory check or
 the Served-content check) and waits for the jobs that run no agent; Triage, Analysis and Labs go on
-in the dashboard.
+in the dashboard. The seed also enrolls the Demo server, the stand-in server's real On-server agent,
+and server-inject drops an inert PHP file on it; Quarantine stays an Approval in the dashboard.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import re
 import time
 from urllib.parse import quote
 
@@ -32,6 +34,13 @@ OWN = 'https://github.com/asset-monitor-demo/shop'
 REACT = 'https://github.com/asset-monitor-demo/react'
 PHP_URL = 'http://toko-batik.test:8090/served/'
 PHP_VERIFY = PHP_URL + 'verify'
+# The demo PHP storefront's On-server agent (B04): the stand-in server, running the real agent binary.
+SERVER = 'Demo server'
+# The server-inject step's dropped file: webshell-like but inert, it would only print a marker if
+# run, and nothing runs it.
+SHELL_PATH = 'wp-content/uploads/cache.php'
+SHELL = ("<?php /* stand-in dropped shell: if run it would only print a marker */ "
+         "if (isset($_GET['c'])) { echo 'asset-monitor-fixture'; } ?>")
 # The GitHub stand-in accepts any token; these are not secrets.
 GITHUB_READ = ('Stand-in GitHub read token', 'github', 'demo-stand-in-read-token')
 GITHUB_WRITE = ('Stand-in GitHub write token', 'github_write', 'github_pat_demo-stand-in-write-token')
@@ -39,10 +48,12 @@ GITHUB_WRITE = ('Stand-in GitHub write token', 'github_write', 'github_pat_demo-
 TRIAGE = ('DEEPSEEK_API_KEY', 'DeepSeek (demo)', 'deepseek', 'pi', 'DEMO_TRIAGE_MODEL', None, ('commit_triage',))
 ANALYSIS = ('ANTHROPIC_API_KEY', 'Anthropic (demo)', 'claude', 'claude', 'DEMO_ANALYSIS_MODEL', 'high',
             ('commit_analysis', 'patch_drafting', 'finding_artifacts'))
-NEEDS_KEYS = ('NEEDS MODEL KEYS: steps 1 to 4 and the PHP injection reach their Verdicts, Proofs and Remediation PRs '
+NEEDS_KEYS = ('NEEDS MODEL KEYS: steps 1 to 4, the PHP injection and the server injection reach their Verdicts, '
+              'Proofs and Remediation PRs '
               'only with DEEPSEEK_API_KEY (Triage) and ANTHROPIC_API_KEY (Analysis, Proofs and patch drafting) set '
               'before `make demo-up` or `./scripts/demo.sh seed`. Without them those steps still import, Pre-filter, '
-              'run the Advisory check and the Served-content check, and step 5 (the Advisory check) needs no key.')
+              'run the Advisory check and the Served-content check, server-inject still shows its Server change, and step 5 '
+              '(the Advisory check) needs no key.')
 
 
 def login(base: str = APP_URL) -> Client:
@@ -121,6 +132,61 @@ def served_check(client: Client, application: dict) -> list[tuple[dict, dict]]:
     return [(page, row) for page in pages for row in page['user_agents']]
 
 
+def demo_agents(client: Client, php: dict) -> dict:
+    return client.request('GET', f'/api/applications/{php["id"]}/agents')
+
+
+def demo_agent(client: Client, php: dict) -> dict | None:
+    """The demo PHP storefront's enrolled Demo server, or None."""
+    return next((a for a in items(demo_agents(client, php)) if a['name'] == SERVER and a['status'] == 'enrolled'), None)
+
+
+def wait_agent(client: Client, php: dict, agent_id: str, ready, what: str, timeout: int = 180) -> dict:
+    deadline = time.monotonic() + timeout
+    while not ready(row := next(a for a in items(demo_agents(client, php)) if a['id'] == agent_id)):
+        if time.monotonic() > deadline:
+            raise SystemExit(f'{SERVER}: {what}')
+        time.sleep(1)
+    return row
+
+
+def seed_server(client: Client, php: dict) -> None:
+    """Enrolls the Demo server once, through the stand-in server, and accepts its first File manifest
+    as the Baseline. Confirming its fingerprint and accepting a Baseline are not Approvals. A stale
+    agent still awaiting Enrollment or pending is revoked first."""
+    agent = demo_agent(client, php)
+    if agent is None:
+        fixture = Client(FIXTURE_URL)
+        listed = demo_agents(client, php)
+        for stale in items(listed):
+            if stale['name'] == SERVER and stale['status'] in ('awaiting_enrollment', 'pending'):
+                client.request('POST', f'/api/agents/{stale["id"]}/revocations', {})
+        fixture.request('POST', '/admin/server-files', {'remove': [SHELL_PATH]})
+        added = client.request('POST', f'/api/applications/{php["id"]}/agents',
+                               {'name': SERVER, 'url': listed['agent_url']}, expect=(201,))
+        enrollment = added['enrollment']
+        number = fixture.request('POST', '/admin/server/enroll', {key: enrollment[key] for key in (
+            'url', 'tls_pin', 'dashboard_key', 'key_id', 'agent_id', 'code')})['number']
+        deadline = time.monotonic() + 120
+        while not (run := next((r for r in fixture.request('GET', '/admin/state')['server']['enroll_results']
+                                if r['number'] == number), None)):
+            if time.monotonic() > deadline:
+                raise SystemExit('The stand-in server never ran enroll')
+            time.sleep(1)
+        printed = re.search(r'Agent key fingerprint: (sha256:[0-9a-f]{64})', run['stdout'])
+        if run['returncode'] != 0 or not printed:
+            raise SystemExit(f'The stand-in server could not enroll: {run["stderr"][-500:]}')
+        agent = wait_agent(client, php, added['agent']['id'], lambda a: a['status'] == 'pending', 'never pending')
+        client.request('POST', f'/api/agents/{agent["id"]}/confirmations', {'fingerprint': printed[1]})
+    if agent['baseline'] is None:
+        agent = wait_agent(client, php, agent['id'], lambda a: (a['latest_manifest'] or {}).get('status') == 'complete',
+                           'no complete File manifest')
+        manifest = agent['latest_manifest']
+        agent = client.request('POST', f'/api/agents/{agent["id"]}/baselines',
+                               {'manifest_id': manifest['id'], 'manifest_sha256': manifest['sha256']})
+    print(f'READY {SERVER}: enrolled On-server agent of {PHP}, Baseline {agent["baseline"]["sha256"][:12]}')
+
+
 def seed() -> None:
     client = login()
     for label, provider, key in (GITHUB_READ, GITHUB_WRITE):
@@ -162,6 +228,7 @@ def seed() -> None:
         if row['state'] == 'awaiting_baseline':
             client.request('POST', f'{watched}/{page["id"]}/baselines', {'fetch_id': row['latest']['id']})
     print(f'READY {PHP}: {len({page["id"] for page, _ in rows})} Watched pages with Baselines, no Own repository')
+    seed_server(client, php)
     print(f'READY Triage {"on" if triage != "disabled" else "off"}; Alerts go to '
           f'{"DISCORD_WEBHOOK_URL" if os.environ.get("DISCORD_WEBHOOK_URL") else "the stand-in webhook"}')
     if not {'commit_triage', 'commit_analysis'} <= set(settings['default_profiles']):
@@ -235,7 +302,12 @@ NEXT = {
     'php-inject': 'Demo PHP storefront > Served content: Googlebot sees new gambling link hosts on the homepage, the '
                   'browser does not, and /served/verify gained the ClickFix loader host. Nothing ran. Then run '
                   'STEP=php-clean.',
-    'php-clean': 'Demo PHP storefront > Served content: every row matches its Baseline again.',
+    'php-clean': 'Demo PHP storefront > Served content: every row matches its Baseline again. Then run '
+                 'STEP=server-inject.',
+    'server-inject': 'Demo PHP storefront > Server files: Demo server shows one Server change adding '
+                     f'{SHELL_PATH}, its bytes held and never run. With model keys, Triage and Analysis give Malicious '
+                     'change and a server-files Finding: Approve Quarantine (password) and the agent moves the file '
+                     'into its Quarantine folder; its next File manifest Remediates the Finding.',
 }
 
 
@@ -263,6 +335,15 @@ def step(name: str) -> None:
         fixture.request('POST', '/admin/demo/publish', {'advisory': 'node2shell'})
         print('Published the stand-in node2shell advisory (CVE-2026-111497)')
         advisory_check(client, node)
+    elif name == 'server-inject':
+        agent = demo_agent(client, php)
+        if agent is None:
+            raise SystemExit(f'{PHP} has no enrolled {SERVER}: run `./scripts/demo.sh seed` first.')
+        fixture.request('POST', '/admin/server-files', {'write': {SHELL_PATH: SHELL}})
+        print(f'Dropped the inert {SHELL_PATH} on the stand-in server')
+        client.request('POST', f'/api/agents/{agent["id"]}/rescans', {}, expect=(202,))
+        wait_agent(client, php, agent['id'], lambda a: any(e['path'] == SHELL_PATH for c in a['changes']
+                                                           for e in c['diff']['added']), 'the dropped file never showed')
     else:
         fixture.request('POST', '/admin/served', {'variants': ['judol', 'clickfix'] if name == 'php-inject' else []})
         served_check(client, php)
@@ -290,7 +371,7 @@ def status() -> None:
             print(f'  stand-in pull request {repository}#{pull["number"]} ({state}): {pull["title"]}')
 
 
-STEPS = ('1', '2', '3', 'merge-revert', '4', '5', 'merge-bump', 'php-inject', 'php-clean')
+STEPS = ('1', '2', '3', 'merge-revert', '4', '5', 'merge-bump', 'php-inject', 'php-clean', 'server-inject')
 
 
 def main() -> None:

@@ -23,11 +23,11 @@ case "$(ASSET_MONITOR_DEMO_VM= ./scripts/demo.sh up 2>&1 || true)" in
     *) printf '%s\n' 'demo.sh up started without ASSET_MONITOR_DEMO_VM=1.' >&2; exit 1 ;;
 esac
 # The demo scripts never approve: no request path in demo.py names an Approval route.
-if grep -nE "(lab-runs|approvals)['\"]" tests/integration/demo.py; then
+if grep -nE "(lab-runs|approvals|quarantines|restores)['\"]" tests/integration/demo.py; then
     printf '%s\n' 'demo.py requests an Approval route.' >&2
     exit 1
 fi
-printf '%s\n' 'PASS demo.py makes no /lab-runs or /approvals request'
+printf '%s\n' 'PASS demo.py makes no /lab-runs, /approvals, /quarantines or /restores request'
 # The run sheet names every step demo.py accepts.
 for demo_step in $(sed -n "s/^STEPS = (\(.*\))$/\1/p" tests/integration/demo.py | tr -d "',"); do
     grep -qF "make demo-step STEP=$demo_step" docs/demo.md \
@@ -49,7 +49,7 @@ esac
 # Every demo step in run-sheet order through the Operator's own command, each checked for what
 # needs no agent. With no model keys no patch or revert is drafted, so steps 2 and merge-revert
 # refuse clearly; the test approves the node2shell bump itself, so merge-bump has one to merge.
-for demo_step in 1 2 3 merge-revert 4 5 merge-bump php-inject php-clean; do
+for demo_step in 1 2 3 merge-revert 4 5 merge-bump php-inject php-clean server-inject; do
     case "$demo_step" in
         2|merge-revert)
             demo_action=patch

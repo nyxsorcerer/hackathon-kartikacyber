@@ -23,12 +23,13 @@ import os
 import time
 from urllib.parse import urlsplit
 
-from demo import (FIXTURE_URL, GITHUB_READ, GITHUB_WRITE, NODE, OWN, PASSWORD, PHP, PHP_VERIFY, REACT,
-                  demo_applications, login, served_check, step, upstream)
+from demo import (FIXTURE_URL, GITHUB_READ, GITHUB_WRITE, NODE, OWN, PASSWORD, PHP, PHP_VERIFY, REACT, SERVER,
+                  SHELL_PATH, demo_agent, demo_agents, demo_applications, login, served_check, step, upstream)
 from journey import Client, items
 
 R2S, NODE2SHELL = 'CVE-2025-55182', 'CVE-2026-111497'
-AGENT_KINDS = ('commit_triage', 'commit_analysis', 'served_triage', 'served_analysis', 'patch_drafting', 'finding_artifacts')
+AGENT_KINDS = ('commit_triage', 'commit_analysis', 'served_triage', 'served_analysis', 'server_triage', 'server_analysis',
+               'patch_drafting', 'finding_artifacts')
 CANNED_BROKER = 'http://canned-broker:8081'
 
 
@@ -93,6 +94,11 @@ def seed(client: Client, fixture: Client) -> None:
     hosts = {urlsplit(r['url']).hostname for _, row in rows for r in row['latest']['resources']}
     assert hosts == {'toko-batik.test'}, hosts
     print('PASS the demo PHP Application has no Own repository, and its Asset stand-in matches its accepted Baselines as browser and Googlebot')
+
+    # The Demo server: one enrolled On-server agent with a Baseline, and no Server change yet.
+    agents = [a for a in items(demo_agents(client, php)) if a['name'] == SERVER and a['status'] == 'enrolled']
+    assert len(agents) == 1 and agents[0]['baseline'] and agents[0]['changes'] == [], agents
+    print(f'PASS the seed enrolled one {SERVER} through the stand-in server, with its first File manifest as the Baseline')
 
     for application in (node, php):
         assert findings(client, application) == []
@@ -253,11 +259,21 @@ def php_clean(client: Client, fixture: Client) -> None:
     rows = served_rows(client, php)
     assert len(rows) == 4 and {row['state'] for row in rows.values()} == {'matches'}, rows
     print('PASS php-clean: every Watched page matches its Baseline again')
+
+
+def server_inject(client: Client, fixture: Client) -> None:
+    php = demo_applications(client)[PHP]
+    (change,) = demo_agent(client, php)['changes']
+    assert [e['path'] for e in change['diff']['added']] == [SHELL_PATH] and change['triage_status'] == 'disabled', change
+    assert change['diff']['added'][0]['sha256'] in change['held'] and not change['incomplete'], change
+    no_agent_run(client, php)
+    assert findings(client, php) == []
+    print('PASS server-inject: the dropped PHP file is one Server change with its bytes held, Triage off, and no Finding')
     print('DEMO SMOKE CHECKS PASSED')
 
 
 STAGES = {'seed': seed, '1': step_1, '3': step_3, '4': step_4, '5': step_5, 'approve': approve, 'merge-bump': merge_bump,
-          'php-inject': php_inject, 'php-clean': php_clean}
+          'php-inject': php_inject, 'php-clean': php_clean, 'server-inject': server_inject}
 
 
 # The dry run (A16, brief 5(b)): the agents are canned, everything else is the demo's own.
@@ -435,8 +451,33 @@ def dry_php(client: Client, fixture: Client, php: dict) -> None:
     print('PASS dry run PHP: the injection opens 3 served-content Malicious change Findings, each Confirmed by a validated '
           'Detection rule, with no Remediation PR and no Lab')
     run_step(client, 'php-clean', php)
-    assert {(f['status'], f['cause']['by']) for f in findings(client, php)} == {('remediated', 'baseline_match')}
+    assert {(f['status'], f['cause']['by']) for f in findings(client, php) if f['source'] == 'served_content'} == {
+        ('remediated', 'baseline_match')}
     print('PASS dry run PHP: serving the Baselines again Remediates all 3')
+
+
+def dry_server(client: Client, fixture: Client, php: dict) -> None:
+    run_step(client, 'server-inject', php)
+    (found,) = [f for f in findings(client, php) if f['source'] == 'server_files']
+    found = finding(client, found)
+    assert (found['status'], found['source_ref'], [f['path'] for f in found['server_files']]) == (
+        'open', SERVER, [SHELL_PATH]), found
+    assert (found['lab_runs'], found['remediation_prs']) == ([], []), found
+    quarantines = f'/api/findings/{found["id"]}/quarantines'
+    digest = found['quarantine']['list_sha256']
+    refused = client.request('POST', quarantines, {'password': 'wrong-dry-run', 'list_sha256': digest}, expect=(403,))
+    assert refused['code'] == 'approval_refused' and finding(client, found)['quarantine']['commands'] == [], refused
+    client.request('POST', quarantines, {'password': PASSWORD.read_text().strip(), 'list_sha256': digest}, expect=(202,))
+    deadline = time.monotonic() + 180
+    while not ((found := finding(client, found))['status'] == 'remediated'
+               and found['quarantine']['commands'][0]['status'] == 'done'):
+        assert time.monotonic() < deadline, found
+        time.sleep(1)
+    assert found['cause']['by'] == 'manifest' and found['quarantine']['commands'][0]['files'][0]['status'] == 'quarantined', found
+    assert fixture.request('GET', '/admin/state')['server']['quarantine'], 'the Quarantine folder is empty'
+    assert (found['lab_runs'], found['remediation_prs']) == ([], []), found
+    print('PASS dry run server: the canned Verdict opens a server-files Finding naming the dropped shell; Quarantine is '
+          'refused with a wrong password, and after a password Approval the agent moves the file and the Finding is Remediated')
 
 
 def dry_run(client: Client, fixture: Client) -> None:
@@ -446,6 +487,7 @@ def dry_run(client: Client, fixture: Client) -> None:
     for check in (dry_step_1, dry_step_2, dry_step_3, dry_step_4, dry_step_5):
         check(client, fixture, node)
     dry_php(client, fixture, php)
+    dry_server(client, fixture, php)
     opened = [f['id'] for application in (node, php) for f in findings(client, application)]
     deadline = time.monotonic() + 60
     while len(alerts := fixture.request('GET', '/admin/state')['notifications']) < len(opened) and time.monotonic() < deadline:

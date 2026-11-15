@@ -46,6 +46,8 @@ WRONG_EVENT = {"code": "event_not_accepted", "message": "Only push and ping even
                "retryable": False}
 NO_DELIVERY = {"code": "delivery_id_required", "message": "X-GitHub-Delivery is required",
                "retryable": False}
+# The agent listener answers as agent/PROTOCOL.md says: {"error": code}.
+AGENT_NOT_FOUND, AGENT_TOO_LARGE = {"error": "not_found"}, {"error": "request_too_large"}
 CAP = ingress.BODY_CAP
 VAULT = Vault(Fernet.generate_key().decode())
 
@@ -61,6 +63,11 @@ def database():
 def push_app(factory=None):
     """A push listener; with no factory, on an empty database."""
     return ingress.push_app(factory or database(), VAULT)
+
+
+def agent_app(factory=None):
+    """An agent listener; with no factory, on an empty database."""
+    return ingress.agent_app(factory or database())
 
 
 def webhook(factory):
@@ -140,9 +147,9 @@ def spki(public):
 def every_kind_of_response(**request):
     """A 200, a 404 and a 413 from the agent listener, and a 404, a 429, a 200 and a 401 from
     the push listener, each from a fresh app, as (status, body, headers without date)."""
-    cases = [(ingress.agent_app, "GET", "/health", b""),
-             (ingress.agent_app, "GET", "/api/auth/session", b""),
-             (ingress.agent_app, "POST", "/health", b"x" * (CAP + 1)),
+    cases = [(agent_app, "GET", "/health", b""),
+             (agent_app, "GET", "/api/auth/session", b""),
+             (agent_app, "POST", "/health", b"x" * (CAP + 1)),
              (push_app, "POST", "/push/x", b"{}")]
     responses = [TestClient(app()).request(method, path, content=body, **request)
                  for app, method, path, body in cases]
@@ -167,7 +174,8 @@ def every_kind_of_response(**request):
 def test_neither_listener_serves_the_dashboard():
     """AC-B01: neither listener serves /api, /api/auth/login, the SPA or /assets. The push
     listener answers nothing but POST /push/<push id>, and the agent listener nothing but
-    GET /health. A wrong method gets 404, never 405, also on a known push id."""
+    GET /health and the /agent/v1 routes (test_server_agents.py). A wrong method gets 404, never
+    405, also on a known push id."""
     dashboard = [("GET", "/"), ("GET", "/index.html"), ("GET", "/assets/index.js"),
                  ("GET", "/api/health"), ("GET", "/api/auth/session"),
                  ("GET", "/api/applications"), ("POST", "/api/auth/login")]
@@ -175,11 +183,11 @@ def test_neither_listener_serves_the_dashboard():
     known, _ = webhook(factory)
     push_listener = push_app(factory)
     push_listener.refresh()
-    for app in (push_listener, ingress.agent_app()):
+    for app, not_found in ((push_listener, NOT_FOUND), (agent_app(), AGENT_NOT_FOUND)):
         client = TestClient(app)
         for method, path in dashboard:
             response = client.request(method, path, json={"password": "x" * 12})
-            assert (response.status_code, response.json()) == (404, NOT_FOUND), (method, path)
+            assert (response.status_code, response.json()) == (404, not_found), (method, path)
     push = TestClient(push_listener)
     requests = [*(("POST", f"/push/{secrets.token_hex(16)}"), ("POST", f"/push/{known}/"),
                   ("POST", f"/push/{known.upper()}")),
@@ -188,9 +196,9 @@ def test_neither_listener_serves_the_dashboard():
         response = push.request(method, path)
         assert (response.status_code, response.json()) == (404, NOT_FOUND), (method, path)
     assert state(factory, known) == (None, None, [])
-    agent = TestClient(ingress.agent_app())
+    agent = TestClient(agent_app())
     response = agent.post("/health")
-    assert (response.status_code, response.json()) == (404, NOT_FOUND)
+    assert (response.status_code, response.json()) == (404, AGENT_NOT_FOUND)
     assert agent.head("/health").status_code == 404
     assert agent.get("/health/").status_code == 404
     response = agent.get("/health")
@@ -206,7 +214,7 @@ def test_importing_the_ingress_never_imports_the_dashboard():
             "from numen.models import Base; from numen.security import Vault; "
             "engine = sqlalchemy.create_engine('sqlite://'); Base.metadata.create_all(engine); "
             "ingress.push_app(sqlalchemy.orm.sessionmaker(engine), Vault('')).refresh(); "
-            "ingress.agent_app(); "
+            "ingress.agent_app(sqlalchemy.orm.sessionmaker(engine)); "
             "print(sorted(name for name in ('numen.api', 'numen.domain', 'numen.workflows', "
             "'numen.worker') if name in sys.modules))")
     result = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parents[1],
@@ -217,29 +225,29 @@ def test_importing_the_ingress_never_imports_the_dashboard():
 def test_the_agent_listener_caps_bodies_on_the_bytes_read():
     """AC-B01: a body over 64 KiB gets 413 request_too_large before anything parses it, also
     when it is sent chunked. A Content-Length over the cap is refused before a byte is read."""
-    client = TestClient(ingress.agent_app())
+    client = TestClient(agent_app())
     response = client.request("GET", "/health", content=b"x" * CAP)
     assert (response.status_code, response.json()) == (200, {"status": "ok"})
     response = client.request("GET", "/health", content=b"x" * (CAP + 1))
-    assert (response.status_code, response.json()) == (413, TOO_LARGE)
+    assert (response.status_code, response.json()) == (413, AGENT_TOO_LARGE)
     chunked = client.build_request("GET", "/health", content=iter([b"x" * (CAP + 1)]))
     assert "content-length" not in chunked.headers
     assert chunked.headers["transfer-encoding"] == "chunked"
     response = client.send(chunked)
-    assert (response.status_code, response.json()) == (413, TOO_LARGE)
+    assert (response.status_code, response.json()) == (413, AGENT_TOO_LARGE)
 
-    app = ingress.agent_app()
+    app = agent_app()
     for length in (str(CAP + 1).encode(), b"10" * 20, b"-1", b"", b"64k"):
         status, body, _ = call(app, "GET", "/health", [(b"content-length", length)])
-        assert (status, body) == (413, TOO_LARGE), length
+        assert (status, body) == (413, AGENT_TOO_LARGE), length
     chunk = {"type": "http.request", "body": b"x" * (30 * 1024), "more_body": True}
-    assert call(app, "GET", "/health", messages=[chunk] * 4) == (413, TOO_LARGE, [chunk])
+    assert call(app, "GET", "/health", messages=[chunk] * 4) == (413, AGENT_TOO_LARGE, [chunk])
     done = {"type": "http.request", "body": b"", "more_body": False}
     assert call(app, "GET", "/health", messages=[chunk, chunk, done]) == (
         200, {"status": "ok"}, [])
     assert call(app, "GET", "/health", [(b"content-length", b"61440")],
                 [chunk, chunk, done])[:2] == (200, {"status": "ok"})
-    assert call(app, "GET", "/health", messages=[chunk])[:2] == (413, TOO_LARGE)  # disconnect
+    assert call(app, "GET", "/health", messages=[chunk])[:2] == (413, AGENT_TOO_LARGE)  # disconnect
 
 
 def test_an_unknown_push_id_gets_404_and_no_query():
@@ -639,7 +647,8 @@ def test_main_serves_each_listener_without_an_access_log(monkeypatch, tmp_path):
     listener serves container port 8083 from NUMEN_DATABASE_URL and NUMEN_INGRESS_KEY, on a pool
     of at most 2 connections (the role's CONNECTION LIMIT is 5) whose error text hides bound
     parameters, with a daemon thread refreshing its known push ids. The agent listener serves
-    8084 over TLS from a fresh temporary directory (the service's tmpfs in Compose)."""
+    8084 over TLS from a fresh temporary directory (the service's tmpfs in Compose), on a pool
+    of its own built the same way."""
     runs, engines, threads = [], [], []
     monkeypatch.setattr(uvicorn, "run", lambda app, **options: runs.append((app, options)))
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
@@ -660,8 +669,9 @@ def test_main_serves_each_listener_without_an_access_log(monkeypatch, tmp_path):
     (push, push_options), (agent, agent_options) = runs
     common = {"host": "0.0.0.0", "access_log": False, "lifespan": "off", "ws": "none"}
     assert push_options == {**common, "port": 8083}
+    # Each listener's own pool, the agent listener's under asset_monitor_agent's limit too.
     assert engines == [{"pool_size": 2, "max_overflow": 0, "pool_pre_ping": True,
-                        "hide_parameters": True}]
+                        "hide_parameters": True}] * 2
     assert threads == [{"target": ingress.refreshing, "args": (push.refresh,), "daemon": True}]
     keyfile, certfile = agent_options.pop("ssl_keyfile"), agent_options.pop("ssl_certfile")
     assert agent_options == {**common, "port": 8084}

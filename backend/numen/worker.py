@@ -20,6 +20,7 @@ from .models import (
     Observation,
     Repository,
     ServedChange,
+    ServerChange,
     VersionRecipe,
     now,
 )
@@ -48,6 +49,8 @@ LONG_KINDS = (
     "served_check",
     "served_content_sweep",
     "served_triage",
+    "server_analysis",
+    "server_triage",
     "version_recipe",
 )
 # Attempts at one Triage of a change; retry n waits n minutes.
@@ -55,9 +58,11 @@ TRIAGE_ATTEMPTS = 3
 
 
 def subject(db, job):
-    """The change a Triage or Analysis job judges: its Commit, or its served-content change."""
+    """The change a Triage or Analysis job judges: its Commit, its served-content change or its Server change."""
     if job.input.get("served_change_id"):
         return db.get(ServedChange, job.input["served_change_id"])
+    if job.input.get("server_change_id"):
+        return db.get(ServerChange, job.input["server_change_id"])
     return db.get(Commit, job.input.get("commit_id"))
 
 
@@ -154,7 +159,7 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                 )
                 if repository and error["code"] not in ("input_changed", "source_check_superseded"):
                     repository.last_error = error
-                if row.kind in ("commit_triage", "jev_triage", "served_triage"):
+                if row.kind in ("commit_triage", "jev_triage", "served_triage", "server_triage"):
                     # A failed Triage has no decision: it is never read as unrelated. It is retried
                     # unless the attempt was cancelled, lost or overtaken by a source change.
                     commit = subject(db, row)
@@ -178,7 +183,7 @@ def run_once(config, factory, broker=None, owner=None, exclude=()):
                             )
                             retry.not_before = now() + timedelta(seconds=60 * attempt_number)
                             commit.triage_result = {**commit.triage_result, "retry_job_id": retry.id}
-                if row.kind in ("commit_analysis", "served_analysis"):
+                if row.kind in ("commit_analysis", "served_analysis", "server_analysis"):
                     # A failed or expired Analysis decides nothing: the review decision and the
                     # Verdict stay as they were, so an expired deadline is never Unrelated.
                     commit = subject(db, row)

@@ -2,11 +2,13 @@ import { detectionChecks, operationNames } from "./types";
 import type { Job, JobSubject } from "./types";
 import { describeError, humanize, sentence } from "./components/ui";
 
-// Served content (A10) jobs, which are not operations the Operator launches with a profile.
+// Served content (A10) and server-file (B06) jobs, which are not operations the Operator launches with a profile.
 const kindNames: Record<string, string> = {
   served_check: "Served-content check",
   served_triage: "Served-content Triage",
   served_analysis: "Served-content Analysis",
+  server_triage: "Server-file Triage",
+  server_analysis: "Server-file Analysis",
   served_content_sweep: "Detection rule sweep of served content",
 };
 export function jobName(kind: string) {
@@ -29,6 +31,7 @@ const subjectLinks: Record<string, string> = {
   source: "Open repositories",
   advisory: "Open Advisories",
   served: "Open Served content",
+  server: "Open Server files",
   version: "Open version evidence",
   audit: "Open audit context",
   cves: "Open CVE records",
@@ -205,7 +208,8 @@ function successSummary(job: Job): {
       };
     }
     case "commit_triage":
-    case "served_triage": {
+    case "served_triage":
+    case "server_triage": {
       const decision = text(r, "decision") || "";
       return {
         summary:
@@ -216,7 +220,8 @@ function successSummary(job: Job): {
       };
     }
     case "commit_analysis":
-    case "served_analysis": {
+    case "served_analysis":
+    case "server_analysis": {
       const verdict = text(r, "verdict") || "Analysis saved";
       if (confidence) facts.push(humanize(confidence));
       return {
@@ -447,7 +452,7 @@ const failureHints: Record<string, string> = {
   github_write_token_required:
     "Add a GitHub write token under Settings → Integrations, then approve again.",
   verdict_not_allowed:
-    "Served content can only be Malicious change, Security hardening, Unrelated or Insufficient context. Retry the Analysis.",
+    "Served content can only be Malicious change, Security hardening, Unrelated or Insufficient context, and so can server files. Retry the Analysis.",
 };
 const labFailure =
   "A Lab is not retried: fix the cause, then start a new Lab from its Finding with a new Approval.";
@@ -576,7 +581,7 @@ export function jobOutcome(job: Job): JobOutcome {
             ? labFailure
             : pr || draft
               ? failureHints[code] || (pr ? remediationFailure : draftFailure)
-              : ["commit_analysis", "served_analysis"].includes(job.kind) &&
+              : ["commit_analysis", "served_analysis", "server_analysis"].includes(job.kind) &&
                   ["timeout", "runtime_timeout"].includes(code)
                 ? analysisTimeout
                 : failureHints[code]) ||

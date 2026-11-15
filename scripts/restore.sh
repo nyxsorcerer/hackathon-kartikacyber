@@ -29,8 +29,10 @@ if not backup.get("NUMEN_SECRET_KEY") or not backup.get("NUMEN_BROKER_TOKEN"):
     raise SystemExit("Backup credential keys are missing.")
 # Release 2 (B01): a Push webhook secret is encrypted with NUMEN_INGRESS_KEY, and the ingress
 # services need their role passwords and the agent listener its TLS key.
+# NUMEN_SIGNING_KEY decrypts the Dashboard key that every enrolled agent pins (B04).
 missing = [key for key in ("NUMEN_INGRESS_KEY", "NUMEN_PUSH_DATABASE_PASSWORD",
-                           "NUMEN_AGENT_DATABASE_PASSWORD", "NUMEN_AGENT_TLS_KEY") if not backup.get(key)]
+                           "NUMEN_AGENT_DATABASE_PASSWORD", "NUMEN_AGENT_TLS_KEY", "NUMEN_SIGNING_KEY")
+           if not backup.get(key)]
 if missing:
     raise SystemExit("Backup deployment.env lacks " + ", ".join(missing) + ". For a backup made before "
                      "release 2, copy them from the current .env into its deployment.env.")

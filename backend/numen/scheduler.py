@@ -1,5 +1,5 @@
 import time
-from . import artifacts
+from . import artifacts, servers
 from .broker import Broker
 from .config import Config
 from .db import make_database
@@ -28,6 +28,7 @@ def main():
             schedule(db)
         with factory.begin() as db:
             nudge_push_deliveries(db)  # B02
+        servers.process_agent_requests(factory, config.artifact_root)  # B04
         with factory.begin() as db:
             schedule_advisory_checks(db)
         with factory.begin() as db:

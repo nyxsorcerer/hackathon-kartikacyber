@@ -1,5 +1,6 @@
 import hmac
 import json
+import os
 import zipfile
 import secrets
 import time
@@ -18,13 +19,14 @@ from pydantic import ValidationError
 from sqlalchemy import and_, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from . import artifacts, cves, domain, prompts
+from . import artifacts, cves, domain, prompts, servers
 from .broker import Broker
 from .config import Config, secret_env
 from .db import make_database
 from .models import (
     Account,
     Action,
+    Agent,
     AdvisoryMatch,
     Analysis,
     Artifact,
@@ -49,14 +51,18 @@ from .models import (
     Repository,
     ServedChange,
     ServedFetch,
+    ServerChange,
     Transcript,
     VersionRecipe,
     WatchedPage,
+    AgentMessage,
     now,
+    uid,
     utc,
 )
 from .schemas import (
     AccountInput,
+    AgentInput,
     ApprovalInput,
     BackfillInput,
     BaselineInput,
@@ -64,12 +70,14 @@ from .schemas import (
     BatchDeleteInput,
     BatchReviewInput,
     FindingInput,
+    FingerprintInput,
     LoginCodeInput,
     LoginInput,
     MAX_INTERVAL,
     MIN_INTERVAL,
     ManualObservation,
     MatchInput,
+    QuarantineApprovalInput,
     OPERATIONS,
     OperationInput,
     ApplicationInput,
@@ -79,7 +87,9 @@ from .schemas import (
     RemediationDraftInput,
     RepositoryInput,
     RepositoryPatch,
+    RestoreApprovalInput,
     ReviewInput,
+    ServerBaselineInput,
     SessionInput,
     TransitionInput,
     WatchedPageInput,
@@ -123,6 +133,10 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 db.add(Operator(id="admin", password_hash=hash_password(admin_password)))
     vault = Vault(config.secret_key)
     ingress_vault = Vault(secret_env("NUMEN_INGRESS_KEY"))  # Push webhook secrets (ADR-0006 5)
+    # The Dashboard key's private half (B04); only the app holds NUMEN_SIGNING_KEY.
+    signing_vault = Vault(secret_env("NUMEN_SIGNING_KEY"))
+    agent_url = os.getenv("NUMEN_AGENT_URL", "https://127.0.0.1:8792")
+    agent_tls_pin = os.getenv("NUMEN_AGENT_TLS_PIN", "")
     broker = Broker(config)
     attempts = defaultdict(deque)
 
@@ -325,9 +339,9 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
                 .limit(20)
             )
         )
-        # The Review queue: Insufficient context Verdicts the Operator has not judged yet, on commits
-        # and on served-content changes (A10), the newest first: a served-content change dates from
-        # when it was first served.
+        # The Review queue: Insufficient context Verdicts the Operator has not judged yet, on commits,
+        # served-content changes (A10) and Server changes (B06), the newest first: a served-content
+        # or Server change dates from when it was first seen.
         # ponytail: sorted in Python because committed_at lives in commit data; index it if it grows.
         def queued_at(row):
             return row.data.get("committed_at") if isinstance(row, Commit) else utc(row.created_at).isoformat()
@@ -335,7 +349,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         queue = sorted(
             [
                 row
-                for model in (Commit, ServedChange)
+                for model in (Commit, ServedChange, ServerChange)
                 for row in db.scalars(
                     select(model).where(model.verdict == "Insufficient context", model.review_decision == "pending")
                 )
@@ -345,6 +359,10 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         )
 
         def queued(row):
+            if isinstance(row, ServerChange):
+                return {"id": row.id, "title": domain.server_change_label(db, row), "revision": row.fingerprint[:12],
+                        "application_id": row.application_id, "committed_at": queued_at(row),
+                        "link": f"/applications/{row.application_id}?tab=server"}
             if isinstance(row, ServedChange):
                 return {"id": row.id, "title": domain.served_change_label(db, row), "revision": row.fingerprint[:12],
                         "application_id": row.application_id, "committed_at": queued_at(row),
@@ -978,6 +996,154 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         domain.accept_baseline(db, page, domain.get(db, ServedFetch, body.fetch_id))
         return domain.watched_page_json(db, page)
 
+    def agent_row(db, ident):
+        agent = db.get(Agent, ident)
+        if agent is None:
+            raise DomainError("not_found", "This On-server agent was not found", 404)
+        return agent
+
+    @router.get("/applications/{ident}/agents")
+    def list_agents(ident: str, db=database_dependency):
+        """The Server files tab (B04): the Application's On-server agents, and the URL to prefill."""
+        application = domain.get(db, Application, ident)
+        agents = db.scalars(select(Agent).where(Agent.application_id == application.id).order_by(Agent.created_at))
+        return {"agent_url": agent_url, "items": [servers.agent_json(db, agent) for agent in agents]}
+
+    @router.post("/applications/{ident}/agents", status_code=201)
+    def add_agent(ident: str, body: AgentInput, db=database_dependency):
+        """Adds an agent awaiting Enrollment. The enroll command and the Enrollment code are shown
+        only in this answer; only the code's hash is stored, and the Action holds neither."""
+        application = domain.get(db, Application, ident)
+        agent, enrollment = servers.create_agent(db, signing_vault, application, body.name, body.url, agent_tls_pin)
+        action(db, "agent", agent.id, {"action": "agent_added", "application_id": application.id, "name": agent.name})
+        return {"agent": servers.agent_json(db, agent), "enrollment": enrollment}
+
+    @router.post("/agents/{ident}/confirmations")
+    def confirm_agent(ident: str, body: FingerprintInput, db=database_dependency):
+        """Confirm fingerprint: enrolls a pending agent whose Agent key has the fingerprint the
+        Operator compared, and signs its first configuration, Watched roots = Allowed paths."""
+        agent = agent_row(db, ident)
+        if agent.status != "pending" or not hmac.compare_digest(body.fingerprint, agent.fingerprint or ""):
+            raise DomainError("fingerprint_mismatch", "This agent is not pending with that fingerprint", 409)
+        agent.status, agent.watched_roots = "enrolled", list(agent.allowed_paths)
+        agent.key_id = servers.dashboard_key(db, signing_vault).id
+        servers.sign_configuration(db, signing_vault, agent, config)
+        action(db, "agent", agent.id, {"action": "agent_enrolled", "fingerprint": agent.fingerprint})
+        return servers.agent_json(db, agent)
+
+    @router.post("/agents/{ident}/revocations")
+    def revoke_agent(ident: str, db=database_dependency):
+        """Revoke: its key is refused from now on and its pending commands are cancelled; its
+        history is kept."""
+        agent = agent_row(db, ident)
+        if agent.status != "revoked":
+            agent.status, agent.revoked_at = "revoked", now()
+            db.execute(update(AgentMessage).where(AgentMessage.agent_id == agent.id, AgentMessage.status == "pending")
+                       .values(status="cancelled", updated_at=now()))
+            action(db, "agent", agent.id, {"action": "agent_revoked"})
+        return servers.agent_json(db, agent)
+
+    @router.post("/agents/{ident}/baselines")
+    def accept_server_baseline(ident: str, body: ServerBaselineInput, db=database_dependency):
+        """Accepts a File manifest as the agent's Baseline (B05). The router's CSRF check protects
+        it; it is not an Approval and takes no password."""
+        agent = agent_row(db, ident)
+        servers.accept_baseline(db, agent, body.manifest_id, body.manifest_sha256)
+        return servers.agent_json(db, agent)
+
+    @router.post("/server-changes/{ident}/review")
+    def review_server_change(ident: str, body: ReviewInput, db=database_dependency):
+        """The Operator's review decision on a Server change, such as one in the Review queue."""
+        row = domain.get(db, ServerChange, ident)
+        row.review_decision = body.decision
+        action(db, "server_change", row.id, {"action": "review", "decision": body.decision})
+        return domain.server_change_json(db, row)
+
+    @router.post("/server-changes/{ident}/analyses")
+    def analyze_server_change(
+        ident: str,
+        body: OperationInput = OperationInput(),
+        key: str | None = Header(None, alias="Idempotency-Key"),
+        db=database_dependency,
+    ):
+        """A manual Analysis of a Server change (B06): uncapped, on the commit_analysis profile."""
+        row = domain.get(db, ServerChange, ident)
+        application = domain.get(db, Application, row.application_id)
+        profile = domain.resolve_profile(
+            db, application, "commit_analysis", body.profile.model_dump() if body.profile else None)
+        job = domain.enqueue(db, "server_analysis", application, {"server_change_id": row.id}, profile, key)
+        if job.status == "queued":  # An idempotent replay may return a finished job.
+            row.analysis_state = {"status": "queued", "job_id": job.id}
+        action(db, "server_change", row.id, {"action": "analysis_requested", "job_id": job.id})
+        return accepted(job)
+
+    @router.post("/agents/{ident}/rescans", status_code=202)
+    def rescan_agent(ident: str, db=database_dependency):
+        """Check now: a signed rescan command for an enrolled agent, which it runs at its next poll."""
+        agent = agent_row(db, ident)
+        if agent.status != "enrolled":
+            raise DomainError("agent_not_enrolled", "Only an enrolled agent takes commands", 409)
+        message = servers.sign_message(db, signing_vault, agent, "command", {"command_id": uid(), "name": "rescan"})
+        action(db, "agent", agent.id, {"action": "agent_rescan", "command_id": message.id})
+        return servers.message_json(message)
+
+    def finding_agent(db, finding):
+        """The enrolled agent of a server_files Finding, locked: its commands are signed under this lock."""
+        agent = (db.get(Agent, finding.data.get("agent_id") or "", with_for_update=True)
+                 if finding.source == "server_files" else None)
+        if agent is None or agent.status != "enrolled":
+            raise DomainError("agent_not_enrolled", "Only an enrolled agent takes commands", 409)
+        return agent
+
+    @router.post("/findings/{ident}/quarantines", status_code=202)
+    def approve_quarantine(ident: str, request: Request, body: QuarantineApprovalInput, db=database_dependency):
+        """Quarantine (B07) after Approval, the password on this very request: a signed command
+        moving the files of the agent's latest complete manifest whose SHA-256 the Finding names
+        into its Quarantine folder, for the list hash the Operator reviewed. A double submit sends
+        one command. It changes no lifecycle by itself."""
+        approval(request, db, body.password)
+        finding = domain.get(db, Finding, ident)
+        if finding.source != "server_files" or finding.status not in ("open", "confirmed"):
+            raise DomainError("quarantine_not_allowed", "Only an Open or Confirmed server-files Finding is quarantined", 409)
+        agent = finding_agent(db, finding)
+        files, digest = domain.quarantine_list(db, finding)
+        if not files:
+            raise DomainError("nothing_to_quarantine", "The latest File manifest holds no file this Finding names", 409)
+        if len(files) > 100:
+            raise DomainError("too_many_files", "A Quarantine command lists at most 100 files", 409)
+        if not hmac.compare_digest(body.list_sha256, digest):
+            raise DomainError("quarantine_list_changed", "The files to quarantine changed since you reviewed them; "
+                              "review the new list", 409)
+        message = servers.approved_command(db, signing_vault, agent, finding, "quarantine",
+                                           f"{finding.application_id}:{finding.id}:{digest}", {"files": files},
+                                           list_sha256=digest)
+        return servers.message_json(message)
+
+    @router.post("/findings/{ident}/restores", status_code=202)
+    def approve_restore(ident: str, request: Request, body: RestoreApprovalInput, db=database_dependency):
+        """Restore (B07) after Approval, the password on this very request: a signed command that
+        puts back the files a done Quarantine command of this Finding holds, by their quarantine
+        ids, for the entries hash the Operator reviewed. The dashboard warns that it puts the
+        payload back when the Finding is Confirmed or Remediated."""
+        approval(request, db, body.password)
+        finding = domain.get(db, Finding, ident)
+        agent = finding_agent(db, finding)
+        commands = domain.finding_commands(db, finding)
+        quarantine = next((m for m in commands if m.id == body.command_id and m.name == "quarantine"
+                           and m.status == "done"), None)
+        if quarantine is None:
+            raise DomainError("not_found", "This Finding has no done Quarantine command with that id", 404)
+        entries, digest = domain.restore_entries(commands, quarantine)
+        if not entries:
+            raise DomainError("nothing_to_restore", "That Quarantine command holds no file to restore", 409)
+        if not hmac.compare_digest(body.entries_sha256, digest):
+            raise DomainError("restore_list_changed", "The files to restore changed since you reviewed them", 409)
+        message = servers.approved_command(db, signing_vault, agent, finding, "restore",
+                                           f"{finding.application_id}:{finding.id}:{quarantine.id}:{digest}",
+                                           {"entries": entries}, quarantine_command_id=quarantine.id,
+                                           entries_sha256=digest)
+        return servers.message_json(message)
+
     @router.get("/applications/{ident}/version-observations")
     def observations(
         ident: str, cursor: str | None = None, limit: int = 50, db=database_dependency
@@ -1164,7 +1330,10 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             commit
             and commit.repository_id
             not in set(db.scalars(domain.linked_repository_ids(body.application_id)))
-        ) or (analysis and not domain.analysis_reaches(db, analysis, body.application_id)):
+        ) or (analysis and not domain.analysis_reaches(db, analysis, body.application_id)) or (
+            body.source_server_change_id
+            and domain.get(db, ServerChange, body.source_server_change_id).application_id != body.application_id
+        ):
             raise DomainError(
                 "invalid_reference", "Finding evidence must belong to the same Application", 422
             )
@@ -1174,13 +1343,20 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         validate_finding_refs(db, body)
         data = body.model_dump()
         commit = db.get(Commit, body.source_commit_id) if body.source_commit_id else None
+        change = db.get(ServerChange, body.source_server_change_id) if body.source_server_change_id else None
+        if change is not None:
+            # B07: about the change, on its agent, naming every added or changed file it holds a SHA-256 for.
+            agent = db.get(Agent, change.agent_id)
+            data.update(subject_id=change.id, agent_id=agent.id, server_files=[
+                {"root": e["root"], "path": e["path"], "sha256": e["sha256"]}
+                for e in domain.server_change_files(change) if e.get("sha256")])
         row = Finding(
             **{k: data.pop(k) for k in ("application_id", "source", "cve_id", "title")},
             status="open",
             data={
                 **data,
                 "cause": {"by": "operator", "at": now().isoformat()},
-                "source_ref": commit.revision[:7] if commit else body.cve_id,
+                "source_ref": agent.name if change else commit.revision[:7] if commit else body.cve_id,
             },
         )
         db.add(row)
@@ -1206,6 +1382,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             "source": row.source,
             "cve_id": row.cve_id,
             "title": row.title,
+            # A Verdict-opened server_files Finding keeps its change as subject_id only.
+            "source_server_change_id": row.data.get("subject_id") if row.source == "server_files" else None,
             **domain.finding_data(row),
         }
         # Only editable fields: the lifecycle, its cause and private keys stay as they are.
@@ -1214,7 +1392,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         validate_finding_refs(db, data)
         if data.application_id != row.application_id:
             raise DomainError("immutable_application", "A finding cannot move to another Application", 422)
-        if data.source != row.source:
+        if data.source != row.source or data.source_server_change_id != current["source_server_change_id"]:
             raise DomainError("immutable_source", "A Finding's source cannot change", 422)
         values = data.model_dump(exclude={"application_id", "source"})
         row.cve_id, row.title = values.pop("cve_id"), values.pop("title")
@@ -1737,7 +1915,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         application = domain.get(db, Application, row.application_id) if row.application_id else None
         job = domain.enqueue(db, row.kind, application, row.input, row.profile, key)
         subject = (db.get(Commit, row.input["commit_id"]) if row.kind == "commit_analysis"
-                   else db.get(ServedChange, row.input["served_change_id"]) if row.kind == "served_analysis" else None)
+                   else db.get(ServedChange, row.input["served_change_id"]) if row.kind == "served_analysis"
+                   else db.get(ServerChange, row.input["server_change_id"]) if row.kind == "server_analysis" else None)
         if subject and job.status == "queued":
             subject.analysis_state = {"status": "queued", "job_id": job.id}
         domain.event(

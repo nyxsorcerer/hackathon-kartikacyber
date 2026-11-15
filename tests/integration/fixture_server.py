@@ -10,7 +10,8 @@ stand-in advisories, published one demo step at a time. `python fixture_server.p
 self-check.
 
 It also hosts the GitHub push stand-in (B02), numen/push-app-<run>, which sends signed Push
-deliveries to ingress-push over the test overlay's stand-ins network.
+deliveries to ingress-push over the test overlay's stand-ins network, and writes the enroll drops
+that the stand-in server (server_standin.py, B04) runs the real On-server agent's enroll from.
 """
 
 from __future__ import annotations
@@ -71,6 +72,14 @@ class FixtureState:
 
 
 STATE = FixtureState()
+# The stand-in server's shared volume (B04): enroll-<n>.json drops and its result-<n>.json runs.
+STANDIN_DROP = Path('/standin/drop')
+# The stand-in server's web root (B05), which server-standin mounts as /var/www/html. The fixture
+# writes and removes files in it; nothing here or there serves or runs them.
+STANDIN_WWW = Path('/standin/www')
+# The agent's state directory, read-only (B07): /admin/state lists its Quarantine folder's names.
+STANDIN_STATE = Path('/standin/state')
+ENROLL_FIELDS = ('url', 'tls_pin', 'dashboard_key', 'key_id', 'agent_id', 'code')
 BASE_SHA = 'a' * 40
 FIX_SHA = 'b' * 40
 OLD_DATED_SHA = 'c' * 40
@@ -265,6 +274,55 @@ NODE_COMMIT = {
     'files': [{'filename': path, 'status': 'added', 'additions': content.count(b'\n'), 'deletions': 0} for path, content in NODE_APP.items()],
     'stats': {'additions': sum(content.count(b'\n') for content in NODE_APP.values()), 'deletions': 0},
 }
+
+
+def standin_number(name: str) -> int:
+    return int(name.split('-', 1)[1].split('.', 1)[0])
+
+
+def enroll_results() -> list[dict]:
+    """Each enroll run of the stand-in server, in order: its exit status and output."""
+    if not STANDIN_DROP.is_dir():
+        return []
+    results = sorted(STANDIN_DROP.glob('result-*.json'), key=lambda path: standin_number(path.name))
+    return [{'number': standin_number(path.name), **json.loads(path.read_text())} for path in results]
+
+
+def quarantined() -> list[str]:
+    """The names in the stand-in agent's Quarantine folder: <id>.bin and <id>.json per file."""
+    folder = STANDIN_STATE / 'quarantine'
+    return sorted(path.name for path in folder.iterdir()) if folder.is_dir() else []
+
+
+def enroll_drop(data: dict) -> dict:
+    """Writes the next enroll drop atomically (a temporary file, then a rename), so the stand-in
+    never reads half of one; its number names the result-<n>.json the run writes."""
+    with STATE.lock:
+        taken = [standin_number(path.name) for path in STANDIN_DROP.glob('*-*.json')]
+        number = max(taken, default=0) + 1
+        temporary = STANDIN_DROP / f'.enroll-{number}.tmp'
+        temporary.write_text(json.dumps({field: str(data[field]) for field in ENROLL_FIELDS}))
+        os.replace(temporary, STANDIN_DROP / f'enroll-{number}.json')
+    return {'number': number}
+
+
+def server_files(data: dict) -> dict:
+    """Writes {relpath: text} and removes [relpath] under the stand-in web root. A path that is
+    absolute or climbs out with .. is refused before anything changes."""
+    write, remove = data.get('write') or {}, data.get('remove') or []
+    if not isinstance(write, dict) or not isinstance(remove, list):
+        raise ValueError('Give write: {relpath: text} and remove: [relpath]')
+    paths = [*write, *remove]
+    if not all(isinstance(p, str) and p and not p.startswith('/') and '..' not in p.split('/') for p in paths) \
+            or not all(isinstance(text, str) for text in write.values()):
+        raise ValueError('Paths are relative, with no .., and contents are text')
+    for relpath, text in write.items():
+        target = STANDIN_WWW / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text)
+    for relpath in remove:
+        (STANDIN_WWW / relpath).unlink(missing_ok=True)
+    return {'written': sorted(write), 'removed': sorted(remove)}
 
 
 def alias(path: str) -> str:
@@ -679,7 +737,8 @@ class Handler(BaseHTTPRequestHandler):
                                   'served_variants': sorted(STATE.served_variants), 'served_requests': STATE.served_requests,
                                   'published': sorted(STATE.published), 'demo_pulls': STATE.demo_pulls,
                                   'hooks': [{'repository': hook['repository'], 'url': hook['url']} for hook in STATE.hooks],
-                                  'deliveries': {ident: {key: sent[key] for key in ('url', 'event', 'status')} for ident, sent in STATE.deliveries.items()}})
+                                  'deliveries': {ident: {key: sent[key] for key in ('url', 'event', 'status')} for ident, sent in STATE.deliveries.items()},
+                                  'server': {'enroll_results': enroll_results(), 'quarantine': quarantined()}})
         if found := demo_repository(path):
             try:
                 return self.demo_read(*found, query)
@@ -864,6 +923,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({'variants': sorted(STATE.served_variants)})
         if path in ('/admin/hooks', '/admin/push', '/admin/hooks/redeliver', '/admin/hooks/replay', '/admin/hooks/forge'):
             return self.push_admin(path, data if isinstance(data, dict) else {})
+        if path == '/admin/server/enroll':
+            if not isinstance(data, dict) or not all(isinstance(data.get(field), str) for field in ENROLL_FIELDS):
+                return self.json({'message': 'Give ' + ', '.join(ENROLL_FIELDS)}, 400)
+            return self.json(enroll_drop(data))
+        if path == '/admin/server-files':
+            try:
+                return self.json(server_files(data if isinstance(data, dict) else {}))
+            except ValueError as error:
+                return self.json({'message': str(error)}, 400)
         if path.startswith('/repos/numen/fixture/'):
             return self.github_write(original, path.removeprefix('/repos/numen/fixture'), data)
         if path.startswith('/webhooks/') or path.startswith('/api/webhooks/'):

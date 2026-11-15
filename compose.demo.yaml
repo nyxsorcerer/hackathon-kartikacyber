@@ -10,8 +10,10 @@ services:
     environment:
       NUMEN_FIXTURE_DEMO: "1"
     entrypoint: [/fixtures/start.sh]
-    volumes: [./tests/integration:/fixtures:ro]
+    # The stand-in server's enroll drops, web root and (read-only) agent state, as in compose.test.yaml (B04, B07).
+    volumes: [./tests/integration:/fixtures:ro, standin-drop:/standin/drop, standin-www:/standin/www, standin-state:/standin/state:ro]
     networks:
+      stand-ins:
       application:
       # The Served-content stand-in (A10): a check's gateway joins this network and reaches only
       # its range. toko-batik.test is the demo PHP Application's Asset; cdn.clickfix-fixture.test
@@ -35,6 +37,8 @@ services:
       NUMEN_PACKAGIST_URL: http://fixtures:8090/packagist
       NUMEN_OSV_URL: http://fixtures:8090/osv
       NUMEN_NVD_API_URL: http://fixtures:8090/rest/json/cves/2.0
+      # The agent listener as the stand-in server sees it, in the enroll command (B04).
+      NUMEN_AGENT_URL: https://ingress-agent:8084
     depends_on:
       fixtures:
         condition: service_healthy
@@ -50,6 +54,33 @@ services:
       # The demo fixture's private range (A10), opened by this overlay only: this project's own
       # served network.
       NUMEN_SERVED_CONTENT_FIXTURE_NETWORK: ${COMPOSE_PROJECT_NAME}_served
+  # The stand-in server (B04) of the server-inject step, as in compose.test.yaml: the real On-server
+  # agent binary on the stand-ins network alone, with no port and no dashboard secret.
+  ingress-agent:
+    networks: [stand-ins]
+  server-standin:
+    image: asset-monitor-server-standin:0.1.0
+    build: {context: ., dockerfile: Dockerfile, target: server-standin}
+    user: root
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER]
+    security_opt: [no-new-privileges:true]
+    init: true
+    entrypoint: [python, /fixtures/server_standin.py]
+    networks: [stand-ins]
+    volumes:
+      - ./tests/integration:/fixtures:ro
+      - standin-drop:/standin/drop
+      - standin-www:/var/www/html
+      - standin-state:/var/lib/asset-monitor-agent
+    tmpfs: ["/etc/asset-monitor-agent:mode=0700", /tmp]
 networks:
   served:
     internal: true
+  stand-ins:
+    internal: true
+volumes:
+  standin-drop:
+  standin-www:
+  standin-state:

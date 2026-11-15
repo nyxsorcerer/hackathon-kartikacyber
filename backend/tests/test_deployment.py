@@ -72,7 +72,8 @@ def overlay_ingress_specs():
 def test_each_ingress_service_is_on_its_own_two_networks():
     """B01, ADR-0006 5: each ingress service joins its own bridge, which carries its port, and its
     own internal network that only it and db share. Neither is on application or control. An
-    overlay adds only the test overlay's stand-ins network, to ingress-push (B02)."""
+    overlay adds only its stand-ins network: the test overlay to ingress-push (B02) and ingress-agent
+    (B04), the demo overlay to ingress-agent."""
     base = compose("compose.yaml")
     services, networks = base["services"], base["networks"]
     for service, expected in INGRESS.items():
@@ -84,13 +85,16 @@ def test_each_ingress_service_is_on_its_own_two_networks():
         assert on_database == {"db", service}, (database, on_database)
     assert all("name" not in (networks[name] or {}) for spec in INGRESS.values() for name in spec["networks"])
     for name, service, spec in overlay_ingress_specs():
-        added = ["stand-ins"] if (name, service) == ("compose.test.yaml", "ingress-push") else None
+        added = ["stand-ins"] if name == "compose.test.yaml" or (name, service) == (
+            "compose.demo.yaml", "ingress-agent") else None
         assert spec.get("networks") == added and "network_mode" not in spec, (name, service)
 
 
 def test_the_stand_ins_network_is_only_in_overlays_and_internal():
     """ADR-0006 5: production has no stand-ins network. Where an overlay defines it, it is internal
-    and its project's own, and only the fixture's GitHub push stand-in and ingress-push join it."""
+    and its project's own, and only the fixture's GitHub push stand-in, ingress-push, the stand-in
+    server and ingress-agent join it; in the demo overlay, the fixture, the stand-in server and
+    ingress-agent."""
     base = compose("compose.yaml")
     assert "stand-ins" not in base["networks"]
     assert not [name for name, spec in base["services"].items() if "stand-ins" in (spec.get("networks") or [])]
@@ -101,14 +105,18 @@ def test_the_stand_ins_network_is_only_in_overlays_and_internal():
             assert overlay["networks"]["stand-ins"] == {"internal": True}, name
         joined |= {(name, service) for service, spec in overlay["services"].items()
                    if "stand-ins" in (spec.get("networks") or [])}
-    assert joined == {("compose.test.yaml", "fixtures"), ("compose.test.yaml", "ingress-push")}, joined
-    assert compose("compose.test.yaml")["networks"]["stand-ins"] == {"internal": True}
+    assert joined == {("compose.test.yaml", service)
+                      for service in ("fixtures", "ingress-push", "ingress-agent", "server-standin")} | {
+        ("compose.demo.yaml", service) for service in ("fixtures", "ingress-agent", "server-standin")}, joined
+    for name in ("compose.test.yaml", "compose.demo.yaml"):
+        assert compose(name)["networks"]["stand-ins"] == {"internal": True}, name
 
 
 def test_each_ingress_service_holds_only_its_own_keys():
     """B01, ADR-0006 5: neither ingress service holds the vault key, the broker token or the owner's
-    database URL. Only ingress-push, the app and the worker hold NUMEN_INGRESS_KEY, and only
-    ingress-agent holds the TLS key."""
+    database URL. Only ingress-push, the app and the worker hold NUMEN_INGRESS_KEY, only
+    ingress-agent holds the TLS key, and only the app holds NUMEN_SIGNING_KEY, which encrypts the
+    Dashboard key (B04), not the x-app anchor the worker and scheduler share."""
     services = compose("compose.yaml")["services"]
     for service, expected in INGRESS.items():
         environment = services[service]["environment"]
@@ -120,11 +128,56 @@ def test_each_ingress_service_holds_only_its_own_keys():
         for value in environment.values():
             assert "POSTGRES_PASSWORD" not in value and other not in value, (service, value)
     holding = {key: {name for name, spec in services.items() if key in (spec.get("environment") or {})}
-               for key in ("NUMEN_INGRESS_KEY", "NUMEN_AGENT_TLS_KEY")}
+               for key in ("NUMEN_INGRESS_KEY", "NUMEN_AGENT_TLS_KEY", "NUMEN_SIGNING_KEY")}
     assert holding == {"NUMEN_INGRESS_KEY": {"ingress-push", "app", "worker"},
-                       "NUMEN_AGENT_TLS_KEY": {"ingress-agent"}}, holding
+                       "NUMEN_AGENT_TLS_KEY": {"ingress-agent"}, "NUMEN_SIGNING_KEY": {"app"}}, holding
+    assert services["app"]["environment"]["NUMEN_SIGNING_KEY"] == "${NUMEN_SIGNING_KEY:?Run setup first}"
     for name, service, spec in overlay_ingress_specs():
         assert "environment" not in spec and "env_file" not in spec, (name, service)
+    for name in OVERLAYS:
+        for service, spec in compose(name)["services"].items():
+            assert "NUMEN_SIGNING_KEY" not in (spec.get("environment") or {}), (name, service)
+
+
+def test_the_enroll_command_names_the_agent_listener_as_the_server_sees_it():
+    """B04: the app shows NUMEN_AGENT_URL, by default the SSH forward of B03, and the TLS pin in the
+    enroll command. The test overlay points it at ingress-agent on the stand-ins network, and runs
+    the app under NUMEN_TEST_MODE, the only mode in which it signs a 2 s poll interval."""
+    app = compose("compose.yaml")["services"]["app"]["environment"]
+    assert app["NUMEN_AGENT_URL"] == "${NUMEN_AGENT_URL:-https://127.0.0.1:8792}"
+    assert app["NUMEN_AGENT_TLS_PIN"] == "${NUMEN_AGENT_TLS_PIN:?Run setup first}"
+    assert "NUMEN_TEST_MODE" not in app
+    test = compose("compose.test.yaml")["services"]["app"]["environment"]
+    assert (test["NUMEN_AGENT_URL"], test["NUMEN_TEST_MODE"]) == ("https://ingress-agent:8084", "1")
+    demo = compose("compose.demo.yaml")["services"]["app"]["environment"]
+    assert (demo["NUMEN_AGENT_URL"], demo["NUMEN_TEST_MODE"]) == ("https://ingress-agent:8084", "1")
+
+
+def test_the_stand_in_server_runs_the_agent_as_its_unit_would():
+    """B04: the stand-in server runs the real agent binary as root, with a read-only root, only
+    the capabilities to read, move and re-own files, no new privileges, on the stand-ins network
+    alone, with no published port and no dashboard secret. Only the test and demo overlays have it."""
+    spec = compose("compose.test.yaml")["services"]["server-standin"]
+    assert spec["image"] == "asset-monitor-server-standin:0.1.0"
+    assert spec["build"] == {"context": ".", "dockerfile": "Dockerfile", "target": "server-standin"}
+    assert (spec["user"], spec["read_only"], spec["init"]) == ("root", True, True)
+    assert spec["cap_drop"] == ["ALL"]
+    assert spec["cap_add"] == ["CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER"]
+    assert spec["security_opt"] == ["no-new-privileges:true"]
+    assert spec["networks"] == ["stand-ins"] and "ports" not in spec and "network_mode" not in spec
+    assert "environment" not in spec and "env_file" not in spec
+    assert spec["entrypoint"] == ["python", "/fixtures/server_standin.py"]
+    assert spec["volumes"] == ["./tests/integration:/fixtures:ro", "standin-drop:/standin/drop",
+                               "standin-www:/var/www/html", "standin-state:/var/lib/asset-monitor-agent"]
+    assert spec["tmpfs"] == ["/etc/asset-monitor-agent:mode=0700", "/tmp"]
+    # The demo overlay runs the same stand-in for its server-inject step; production never does.
+    assert compose("compose.demo.yaml")["services"]["server-standin"] == spec
+    for name in ("compose.yaml", "compose.demo-test.yaml"):
+        assert "server-standin" not in compose(name)["services"], name
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "FROM app AS server-standin" in dockerfile
+    assert ("COPY --from=agent-build /out/asset-monitor-agent-linux-${TARGETARCH}"
+            " /usr/local/bin/asset-monitor-agent") in dockerfile
 
 
 def test_the_ingress_services_are_hardened():

@@ -30,3 +30,15 @@ RUN uv sync --locked --extra dev
 COPY compose.yaml compose.test.yaml compose.demo.yaml compose.demo-test.yaml Dockerfile Dockerfile.runner /app/
 USER 10001:10001
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]
+# The On-server agent (ADR-0007), built as `make agent` builds it: downloads nothing.
+FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS agent-build
+WORKDIR /src
+COPY agent/go.mod agent/build.sh ./
+COPY agent/*.go ./
+RUN ./build.sh /out
+# The test overlay's stand-in server (B04): the real agent binary beside the fixture's Python, run
+# as root as the systemd unit would run it.
+FROM app AS server-standin
+ARG TARGETARCH
+COPY --from=agent-build /out/asset-monitor-agent-linux-${TARGETARCH} /usr/local/bin/asset-monitor-agent
+USER root

@@ -26,9 +26,11 @@ def local_sources(tmp_path, monkeypatch):
     test reaches github.com or plugins.svn.wordpress.org: a repository a test did not build fails
     fast, which leaves its Exposure unknown. OSV and NVD point at hosts that never resolve, so an
     Advisory check a test did not stub records a feed error instead of reaching osv.dev or
-    nvd.nist.gov. Push webhook secrets are encrypted with a fresh NUMEN_INGRESS_KEY. The base
-    that git_repository builds under."""
+    nvd.nist.gov. Push webhook secrets are encrypted with a fresh NUMEN_INGRESS_KEY, and the
+    Dashboard key with a fresh NUMEN_SIGNING_KEY. The base that git_repository builds under."""
     monkeypatch.setenv("NUMEN_INGRESS_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("NUMEN_SIGNING_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("NUMEN_AGENT_TLS_PIN", "ab" * 32)
     monkeypatch.setenv("NUMEN_GITHUB_GIT_URL", (tmp_path / "git").as_uri())
     monkeypatch.setenv("NUMEN_WORDPRESS_SVN_URL", (tmp_path / "svn-missing").as_uri())
     monkeypatch.setenv("NUMEN_OSV_URL", "http://osv.invalid")

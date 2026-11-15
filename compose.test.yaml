@@ -5,7 +5,10 @@ services:
     environment:
       NUMEN_FIXTURE_SVN: "1"
     entrypoint: [/fixtures/start.sh]
-    volumes: [./tests/integration:/fixtures:ro]
+    # /standin/drop: the enroll drops /admin/server/enroll writes for server-standin, and its results;
+    # /standin/www: the stand-in server's web root, which /admin/server-files writes (B05);
+    # /standin/state: the agent's state directory, read-only, whose Quarantine folder /admin/state lists (B07).
+    volumes: [./tests/integration:/fixtures:ro, standin-drop:/standin/drop, standin-www:/standin/www, standin-state:/standin/state:ro]
     ports: ["127.0.0.1:18091:8090"]
     networks:
       application:
@@ -33,6 +36,8 @@ services:
       NUMEN_NPM_REGISTRY_URL: http://fixtures:8090/npm
       NUMEN_PACKAGIST_URL: http://fixtures:8090/packagist
       NUMEN_WORDPRESS_SVN_URL: svn://fixtures:3690
+      # The agent listener as the stand-in server sees it, in the enroll command (B04).
+      NUMEN_AGENT_URL: https://ingress-agent:8084
     depends_on:
       fixtures:
         condition: service_healthy
@@ -46,12 +51,39 @@ services:
     depends_on:
       fixtures:
         condition: service_healthy
-  # Added to its two base networks; production has no stand-ins network (ADR-0006 5).
+  # Added to their two base networks; production has no stand-ins network (ADR-0006 5).
   ingress-push:
     networks: [stand-ins]
+  ingress-agent:
+    networks: [stand-ins]
+  # The stand-in server (B04): the real On-server agent binary, as root with only the capabilities
+  # its unit allows, on the stand-ins network alone, with no port and no dashboard secret. It
+  # enrolls from the drop the fixture writes, then runs the agent against its fixture web root.
+  server-standin:
+    image: asset-monitor-server-standin:0.1.0
+    build: {context: ., dockerfile: Dockerfile, target: server-standin}
+    user: root
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, DAC_READ_SEARCH, FOWNER]
+    security_opt: [no-new-privileges:true]
+    init: true
+    entrypoint: [python, /fixtures/server_standin.py]
+    networks: [stand-ins]
+    volumes:
+      - ./tests/integration:/fixtures:ro
+      - standin-drop:/standin/drop
+      - standin-www:/var/www/html
+      - standin-state:/var/lib/asset-monitor-agent
+    # The agent's configuration directory (enroll writes it 0600, root-owned) and its unit's.
+    tmpfs: ["/etc/asset-monitor-agent:mode=0700", /tmp]
 networks:
   stand-ins:
     internal: true
   served:
     name: asset-monitor-test-served
     internal: true
+volumes:
+  standin-drop:
+  standin-www:
+  standin-state:

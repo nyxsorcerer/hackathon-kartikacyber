@@ -3,14 +3,17 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
+    func,
     text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -453,6 +456,160 @@ class ServedChange(Base):
     verdict: Mapped[str | None] = mapped_column(String, nullable=True)
     analysis_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class Agent(Base):
+    """B04: an On-server agent of an Application. Its id is also its X-Agent-Id. The status goes
+    awaiting_enrollment -> pending (an Enrollment bound its key) -> enrolled (the Operator confirmed
+    the fingerprint) -> revoked. `sequence` is the one per-agent counter of signed configurations
+    and commands; `data` holds {version, os, arch, poll}; `last_refusal` is {at, route, reason}.
+    The agent role reads only id, public_key, status and wanted."""
+
+    __tablename__ = "agents"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    name: Mapped[str] = mapped_column(String)
+    url: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String, default="awaiting_enrollment")
+    public_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
+    # The Dashboard key id it pinned, set at confirmation.
+    key_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    allowed_paths: Mapped[list] = mapped_column(JSON, default=list)
+    watched_roots: Mapped[list] = mapped_column(JSON, default=list)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    sequence: Mapped[int] = mapped_column(Integer, default=0)
+    config_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    report_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    # The File manifest the Operator accepted as the Baseline (B05); data.baseline_accepted_at says when.
+    baseline_manifest_id: Mapped[str | None] = mapped_column(ForeignKey("file_manifests.id", use_alter=True, name="fk_agents_baseline_manifest_id"), nullable=True)
+    # The unsigned wanted list (B05): {report_sequence, sha256: [...]}.
+    wanted: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_refusal: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FileManifest(Base):
+    """B05: a verified report of an On-server agent. `entries` is every root's entries flattened and
+    sorted, each {root, path, type, sha256, size, mode, uid, gid, mtime, target?, secret?,
+    over_hash_limit?}; `sha256` is the hex SHA-256 of their canonical JSON, which a Baseline request
+    names. `incomplete` lists why it is not whole ({reason, root?, path?}). It is awaiting_uploads
+    until the agent sends its wanted bytes, or 10 minutes pass, then complete. request_id has no
+    foreign key: processed requests are pruned."""
+
+    __tablename__ = "file_manifests"
+    __table_args__ = (UniqueConstraint("agent_id", "sequence"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
+    request_id: Mapped[str] = mapped_column(String)
+    sequence: Mapped[int] = mapped_column(Integer)
+    config_sequence: Mapped[int] = mapped_column(Integer)
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    entries: Mapped[list] = mapped_column(JSON, default=list)
+    sha256: Mapped[str] = mapped_column(String)
+    incomplete: Mapped[list] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String, default="awaiting_uploads")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ServerChange(Base):
+    """B05: a Server change, a complete File manifest unlike the agent's Baseline by path, type,
+    SHA-256, mode, owner or link target (never mtime alone), one per (agent, fingerprint), so each
+    distinct one is triaged at most once. `diff` is {added: [entry], modified: [{before, after}],
+    removed: [entry]}; `incomplete` lists why it is not whole. Its Triage and Analysis fields are
+    named as ServedChange's."""
+
+    __tablename__ = "server_changes"
+    __table_args__ = (UniqueConstraint("agent_id", "fingerprint"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    application_id: Mapped[str] = mapped_column(ForeignKey("applications.id"))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
+    fingerprint: Mapped[str] = mapped_column(String)
+    # The first manifest that showed it, and the Baseline it was compared with.
+    manifest_id: Mapped[str] = mapped_column(ForeignKey("file_manifests.id"))
+    baseline_manifest_id: Mapped[str] = mapped_column(ForeignKey("file_manifests.id"))
+    diff: Mapped[dict] = mapped_column(JSON, default=dict)
+    incomplete: Mapped[list] = mapped_column(JSON, default=list)
+    triage_status: Mapped[str] = mapped_column(String, default="disabled")
+    triage_result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    review_decision: Mapped[str] = mapped_column(String, default="pending")
+    verdict: Mapped[str | None] = mapped_column(String, nullable=True)
+    analysis_state: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class EnrollmentCode(Base):
+    """B04: a one-time Enrollment code, `<id>.<secret>`. Only the hex SHA-256 of the secret part is
+    stored; it is good for one use within one hour."""
+
+    __tablename__ = "enrollment_codes"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
+    secret_hash: Mapped[str] = mapped_column(String)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class AgentRequest(Base):
+    """B04: an agent request the agent listener accepted, stored exactly as received, Enrollments
+    included. Postgres sets received_at, which the agent role cannot write. Application code
+    verifies it again, then sets processed_at and outcome ({status: accepted|refused, reason})."""
+
+    __tablename__ = "agent_requests"
+    __table_args__ = (UniqueConstraint("agent_id", "nonce"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
+    route: Mapped[str] = mapped_column(String)  # enroll, poll, report, upload or result
+    method: Mapped[str] = mapped_column(String)
+    target: Mapped[str] = mapped_column(Text)
+    timestamp: Mapped[int] = mapped_column(BigInteger)
+    nonce: Mapped[str] = mapped_column(String)
+    content_sha256: Mapped[str] = mapped_column(String)
+    signature: Mapped[str] = mapped_column(Text)
+    body: Mapped[bytes] = mapped_column(LargeBinary)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class AgentMessage(Base):
+    """B04: a configuration or Agent command signed with the Dashboard key, as the envelope the
+    agent receives (payload and signature, standard base64). A command's id is its command_id; it
+    expires_at 15 minutes after it is signed, and `data` holds its result."""
+
+    __tablename__ = "agent_messages"
+    __table_args__ = (UniqueConstraint("agent_id", "sequence"),)
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.id"))
+    type: Mapped[str] = mapped_column(String)  # configuration or command
+    sequence: Mapped[int] = mapped_column(Integer)
+    key_id: Mapped[str] = mapped_column(String)
+    payload: Mapped[str] = mapped_column(Text)
+    signature: Mapped[str] = mapped_column(Text)
+    name: Mapped[str | None] = mapped_column(String, nullable=True)  # rescan, quarantine or restore
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # pending, done, refused, expired or cancelled
+    status: Mapped[str] = mapped_column(String, default="pending")
+    idempotency_key: Mapped[str | None] = mapped_column(String, unique=True, nullable=True)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class DashboardKey(Base):
+    """B04: the Ed25519 key that signs every configuration and Agent command. Its private half
+    (the base64 seed) is Vault(NUMEN_SIGNING_KEY)-encrypted; only the app holds that key."""
+
+    __tablename__ = "dashboard_keys"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    public_key: Mapped[str] = mapped_column(Text)
+    private_key: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Job(Base):
