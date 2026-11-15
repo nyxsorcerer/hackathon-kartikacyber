@@ -3,7 +3,9 @@ from . import artifacts
 from .broker import Broker
 from .config import Config
 from .db import make_database
-from .domain import prune_transcripts, schedule, schedule_advisory_checks, schedule_served_checks
+from .domain import (
+    nudge_push_deliveries, prune_transcripts, schedule, schedule_advisory_checks, schedule_served_checks,
+)
 from .queue import recover
 
 
@@ -24,6 +26,8 @@ def main():
         recover(factory, broker)
         with factory.begin() as db:
             schedule(db)
+        with factory.begin() as db:
+            nudge_push_deliveries(db)  # B02
         with factory.begin() as db:
             schedule_advisory_checks(db)
         with factory.begin() as db:

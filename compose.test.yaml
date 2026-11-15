@@ -13,6 +13,8 @@ services:
       # range. cdn.clickfix-fixture.test is the fixture itself, posing as an external script host.
       served:
         aliases: [cdn.clickfix-fixture.test]
+      # The GitHub push stand-in (B02) sends Push deliveries to ingress-push over this network only.
+      stand-ins:
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]
       interval: 3s
@@ -44,7 +46,12 @@ services:
     depends_on:
       fixtures:
         condition: service_healthy
+  # Added to its two base networks; production has no stand-ins network (ADR-0006 5).
+  ingress-push:
+    networks: [stand-ins]
 networks:
+  stand-ins:
+    internal: true
   served:
     name: asset-monitor-test-served
     internal: true

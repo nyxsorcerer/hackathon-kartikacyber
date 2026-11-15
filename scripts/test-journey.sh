@@ -27,11 +27,15 @@ numen_ingress_check() {
     numen_test_compose run --rm --no-deps -T --volume "$numen_root/tests/integration:/journey:ro" \
         --entrypoint python ingress-agent /journey/ingress_check.py agent "$(sed -n 's/^NUMEN_AGENT_TLS_PIN=//p' .env)"
 }
-# Each ingress role with its LOGIN, CONNECTION LIMIT and statement_timeout, and every table privilege.
+# Each ingress role with its LOGIN, CONNECTION LIMIT and statement_timeout, every table privilege,
+# and every column UPDATE (B02: the push role's UPDATE (last_accepted, last_refusal) on push_webhooks,
+# which table_privileges does not list).
 numen_ingress_grants() {
     numen_test_compose exec -T db psql -U numen -d numen -tAc "SELECT r.rolname, r.rolcanlogin, r.rolconnlimit, r.rolconfig,
         (SELECT string_agg(p.table_name || ':' || p.privilege_type, ',' ORDER BY p.table_name, p.privilege_type)
-         FROM information_schema.table_privileges p WHERE p.grantee = r.rolname)
+         FROM information_schema.table_privileges p WHERE p.grantee = r.rolname),
+        (SELECT string_agg(c.table_name || '.' || c.column_name || ':' || c.privilege_type, ',' ORDER BY c.table_name, c.column_name)
+         FROM information_schema.column_privileges c WHERE c.grantee = r.rolname AND c.privilege_type = 'UPDATE')
         FROM pg_roles r WHERE r.rolname IN ('asset_monitor_push', 'asset_monitor_agent') ORDER BY r.rolname"
 }
 numen_services='app worker scheduler runner-broker fetch-gateway fixtures ingress-push ingress-agent'
@@ -54,8 +58,8 @@ export COMPOSE_PROJECT_NAME=asset-monitor-test COMPOSE_FILE=compose.yaml:compose
 [ "$(./scripts/compose.sh config | head -n 1)" = 'name: asset-monitor-test' ] || { printf '%s\n' 'The backup round trip must run on asset-monitor-test.' >&2; exit 1; }
 numen_grants=$(numen_ingress_grants)
 case "$numen_grants" in
-    asset_monitor_agent\|t\|*asset_monitor_push\|t\|*) ;;
-    *) printf '%s\n' "$numen_grants" 'Both ingress roles must exist with LOGIN before the backup.' >&2; exit 1 ;;
+    asset_monitor_agent\|t\|*asset_monitor_push\|t\|*\|push_deliveries:INSERT,push_webhooks:SELECT\|push_webhooks.last_accepted:UPDATE,push_webhooks.last_refusal:UPDATE) ;;
+    *) printf '%s\n' "$numen_grants" 'Both ingress roles must exist with LOGIN, and the push role with its push grants, before the backup.' >&2; exit 1 ;;
 esac
 numen_backup=.numen/test-backups/$(date -u +%Y%m%dT%H%M%SZ)
 ./scripts/backup.sh "$numen_backup"

@@ -7,6 +7,7 @@ Every agent reply and session comes from FixtureBroker; no test reaches a real h
 
 import base64
 import json
+import os
 from datetime import timedelta
 from pathlib import Path
 
@@ -14,7 +15,10 @@ from sqlalchemy import select
 
 from conftest import FixtureBroker, application, github_account
 from numen import artifacts, scheduler
-from numen.models import Account, Action, ApplicationCVE, Artifact, Finding, Job, JobEvent, Transcript, now, uid
+from numen.models import (
+    Account, Action, ApplicationCVE, Artifact, Finding, Job, JobEvent, PushWebhook, Repository, Transcript, now, uid,
+)
+from numen.security import Vault
 from numen.worker import run_once
 from test_artifacts import bundle, queue_cve_analysis
 from test_commit_review import assessment, pinned_bundle, prepared
@@ -25,6 +29,7 @@ READ_TOKEN = "fixture-github-token"  # github_account()'s
 WRITE_TOKEN = "github_pat_fixture_write_token_0001"
 NVD_KEY = "fixture-nvd-key-0123456789"
 WEBHOOK = "http://fixture.local/api/webhooks/1/transcript-webhook-secret"
+PUSH_SECRET = "push-webhook-secret-fixture-0123456789abcdef"
 PASSWORD = "test-password-long"  # the Operator's: stored only as a hash, so no agent ever has it
 SKIPPED = ("notification", "detection_rule", "patch_drafting", "remediation_draft", "finding_artifacts")
 SCREEN = ("=== session-transcripts/pi/run.jsonl ===\n[user]\nAnalyse the change\n\n[assistant]\n"
@@ -55,17 +60,23 @@ def analysed(system, screen, reason=CANDIDATE["reason"]):
 
 def configure_secrets(system):
     """Every kind of configured secret: the GitHub read and write tokens, the NVD key, the Discord
-    webhook, and with prepared()'s Analysis API key and the vault key, all their values."""
+    webhook, a Push webhook secret, and with prepared()'s Analysis API key, the vault key and the
+    ingress key, all their values."""
     app, client, config = system
     github_account(app)
+    ingress_key = os.environ["NUMEN_INGRESS_KEY"]
     with app.state.factory.begin() as db:
         for provider, key in (("github_write", WRITE_TOKEN), ("nvd", NVD_KEY)):
             db.add(Account(label=provider, provider=provider, auth_type="api_key",
                            credential=app.state.vault.encrypt({"api_key": key}),
                            data={"status": "unchecked", "models": [], "usage": None}))
+        own = Repository(source_kind="github", source_url="https://github.com/acme/pushed")
+        db.add(own)
+        db.flush()
+        db.add(PushWebhook(repository_id=own.id, push_id="0" * 32, secret=Vault(ingress_key).encrypt(PUSH_SECRET)))
     response = client.patch("/api/settings", json={"webhook_enabled": False, "webhook_url": WEBHOOK})
     assert response.status_code == 200, response.text
-    return [API_KEY, READ_TOKEN, WRITE_TOKEN, NVD_KEY, WEBHOOK, config.secret_key]
+    return [API_KEY, READ_TOKEN, WRITE_TOKEN, NVD_KEY, WEBHOOK, PUSH_SECRET, config.secret_key, ingress_key]
 
 
 def test_no_stored_transcript_contains_a_configured_secret(system, github):

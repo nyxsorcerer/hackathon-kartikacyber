@@ -4,13 +4,15 @@ import { GitBranch } from "lucide-react";
 import { ApiError, mutate } from "../api";
 import {
   jobAcceptedSchema,
+  pushWebhookSecretSchema,
   repositoryLabel,
   repositoryLinkSchema,
 } from "../types";
-import type { Application, RepositoryLink } from "../types";
+import type { Application, PushWebhookSecret, RepositoryLink } from "../types";
 import {
   ActionButton,
   Badge,
+  CopyButton,
   describeError,
   DetailGrid,
   Empty,
@@ -123,6 +125,13 @@ export function ApplicationRepositories({ application, refresh }: Props) {
           <OwnForm application={application} refresh={refresh} />
         )}
       </Panel>
+      {own && (
+        <PushWebhookPanel
+          application={application}
+          link={own}
+          refresh={refresh}
+        />
+      )}
       <Panel
         title="Upstream repositories"
         description="Watched for commits, never changed. A repository shared with other Applications is polled and triaged once."
@@ -206,6 +215,148 @@ export function ApplicationRepositories({ application, refresh }: Props) {
         />
       )}
     </div>
+  );
+}
+/** Why the push listener refused the last Push delivery; a code it learns later shows as is. */
+const REFUSALS: Record<string, string> = {
+  wrong_signature: "Wrong signature",
+  event_not_accepted: "Event not accepted",
+  delivery_id_missing: "Delivery id missing",
+  body_too_large: "Body too large",
+  rate_limited: "Too many deliveries",
+};
+/** B02: the Own repository's Push webhook. Its path and secret are shown once, in the setup
+ * dialog, and dropped when it closes. Every value is rendered as text. */
+function PushWebhookPanel({
+  application,
+  link,
+  refresh,
+}: Props & { link: RepositoryLink }) {
+  const [shown, setShown] = useState<PushWebhookSecret>();
+  const url = `${path(application, link)}/push-webhook`;
+  const webhook = link.push_webhook;
+  async function reveal(target: string) {
+    setShown(await mutate(target, pushWebhookSecretSchema));
+    refresh();
+  }
+  return (
+    <Panel
+      title="Push webhook"
+      description="GitHub reports each push through your Public tunnel, and the Own repository is checked within about 15 s. Commits are still read from the GitHub API, and scheduled checks go on."
+      actions={
+        webhook ? (
+          <>
+            <ActionButton
+              className="secondary"
+              confirm="Confirm regenerate"
+              onAction={() => reveal(`${url}/secret`)}
+            >
+              Regenerate
+            </ActionButton>
+            <ActionButton
+              className="secondary"
+              confirm="Confirm turn off"
+              onAction={async () => {
+                await mutate(url, repositoryLinkSchema, {}, "DELETE");
+                notify("Push webhook turned off. Its push id is refused now.");
+                refresh();
+              }}
+            >
+              Turn off
+            </ActionButton>
+          </>
+        ) : (
+          <ActionButton className="primary" onAction={() => reveal(url)}>
+            Set up push webhook
+          </ActionButton>
+        )
+      }
+      padded
+    >
+      {webhook ? (
+        <DetailGrid
+          items={[
+            ["Set up", <Time value={webhook.created_at} />],
+            [
+              "Last accepted delivery",
+              webhook.last_accepted ? (
+                <>
+                  <Time value={webhook.last_accepted.at} />
+                  {webhook.last_accepted.event === "ping"
+                    ? " · ping received · "
+                    : " · push · "}
+                  <span className="mono">
+                    {webhook.last_accepted.delivery_id}
+                  </span>
+                </>
+              ) : (
+                <span className="muted">None yet</span>
+              ),
+            ],
+            [
+              "Last refusal",
+              webhook.last_refusal ? (
+                <>
+                  <Time value={webhook.last_refusal.at} />
+                  {" · "}
+                  {REFUSALS[webhook.last_refusal.reason] ??
+                    webhook.last_refusal.reason}
+                </>
+              ) : (
+                <span className="muted">None</span>
+              ),
+            ],
+          ]}
+        />
+      ) : (
+        <p className="hint">
+          Off. The Own repository is checked at its interval and on Check now.
+        </p>
+      )}
+      {shown && (
+        <Modal
+          title="Register the Push webhook in GitHub"
+          description="In the repository's Settings, under Webhooks, add a webhook with these values."
+          onClose={() => setShown(undefined)}
+        >
+          <DetailGrid
+            items={[
+              [
+                "Payload URL",
+                <>
+                  Your Public tunnel URL followed by{" "}
+                  <code>{shown.path}</code>{" "}
+                  <CopyButton value={shown.path} label="Copy the path" />
+                </>,
+              ],
+              ["Content type", <code>application/json</code>],
+              [
+                "Secret",
+                <>
+                  <code>{shown.secret}</code>{" "}
+                  <CopyButton value={shown.secret} label="Copy the secret" />
+                </>,
+              ],
+              ["Which events", "Just the push event"],
+            ]}
+          />
+          <p className="hint">
+            The secret is shown only now. The push listener accepts the push id
+            within 15 s, and GitHub's first ping then shows as the last accepted
+            delivery.
+          </p>
+          <div className="form-actions">
+            <button
+              type="button"
+              className="primary"
+              onClick={() => setShown(undefined)}
+            >
+              Done
+            </button>
+          </div>
+        </Modal>
+      )}
+    </Panel>
   );
 }
 function Revision({ value }: { value: string | null }) {

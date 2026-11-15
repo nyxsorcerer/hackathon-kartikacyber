@@ -405,3 +405,142 @@ it("adds an Upstream repository by hand", async () => {
   ).toBeDisabled();
   expect(screen.getByLabelText("Plugin slug")).toHaveValue("");
 });
+
+const PATH = `/push/${"a".repeat(32)}`;
+const pushPanel = async () =>
+  (await screen.findByRole("heading", { name: "Push webhook" })).closest(
+    "section",
+  )!;
+const ownLink = (fields: Link = {}) =>
+  link("portal", {
+    role: "own",
+    source_url: "https://github.com/example/portal",
+    ...fields,
+  });
+const webhook = (fields: Link = {}) => ({
+  created_at: "2026-11-14T08:00:00Z",
+  last_accepted: null,
+  last_refusal: null,
+  ...fields,
+});
+
+it("sets up the Push webhook and shows its secret once", async () => {
+  const own = ownLink();
+  const state = application([own, ...upstreams()]);
+  const calls = serve(state, ({ method, url }) => {
+    if (method !== "POST" || !url.endsWith("/portal/push-webhook")) return;
+    own.push_webhook = webhook();
+    return json({ path: PATH, secret: "s3cret-shown-once" }, 201);
+  });
+  const user = userEvent.setup();
+  open();
+  const panel = within(await pushPanel());
+  expect(panel.getByText(/Public tunnel/)).toBeInTheDocument();
+  await user.click(
+    panel.getByRole("button", { name: "Set up push webhook" }),
+  );
+  expect(calls[0]).toEqual({
+    method: "POST",
+    url: "/api/applications/app-1/repositories/portal/push-webhook",
+    body: {},
+  });
+  const dialog = within(await screen.findByRole("dialog"));
+  expect(dialog.getByText(/Public tunnel URL followed by/)).toBeInTheDocument();
+  expect(dialog.getByText(PATH)).toBeInTheDocument();
+  expect(dialog.getByText("application/json")).toBeInTheDocument();
+  expect(dialog.getByText("s3cret-shown-once")).toBeInTheDocument();
+  expect(dialog.getByText("Just the push event")).toBeInTheDocument();
+  expect(dialog.getByText(/shown only now/)).toBeInTheDocument();
+  expect(dialog.getByText(/within 15 s/)).toBeInTheDocument();
+  await user.click(dialog.getByRole("button", { name: "Done" }));
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.queryByText("s3cret-shown-once")).not.toBeInTheDocument();
+  expect(screen.queryByText(new RegExp(PATH))).not.toBeInTheDocument();
+  const on = within(await pushPanel());
+  expect(await on.findByRole("button", { name: "Regenerate" })).toBeVisible();
+  expect(on.getByRole("button", { name: "Turn off" })).toBeVisible();
+  expect(
+    on.queryByRole("button", { name: "Set up push webhook" }),
+  ).not.toBeInTheDocument();
+});
+
+it("regenerates and turns off the Push webhook", async () => {
+  const own = ownLink({ push_webhook: webhook() });
+  const state = application([own]);
+  const calls = serve(state, ({ method, url }) => {
+    if (method === "POST" && url.endsWith("/portal/push-webhook/secret"))
+      return json({ path: PATH, secret: "new-secret" });
+    if (method === "DELETE" && url.endsWith("/portal/push-webhook")) {
+      own.push_webhook = null;
+      return json(own);
+    }
+  });
+  const user = userEvent.setup();
+  open();
+  const panel = within(await pushPanel());
+  await user.click(panel.getByRole("button", { name: "Regenerate" }));
+  expect(calls).toHaveLength(0);
+  await user.click(panel.getByRole("button", { name: "Confirm regenerate" }));
+  expect(calls[0]).toEqual({
+    method: "POST",
+    url: "/api/applications/app-1/repositories/portal/push-webhook/secret",
+    body: {},
+  });
+  const dialog = within(await screen.findByRole("dialog"));
+  expect(dialog.getByText("new-secret")).toBeInTheDocument();
+  await user.click(dialog.getByRole("button", { name: "Close dialog" }));
+  expect(screen.queryByText("new-secret")).not.toBeInTheDocument();
+  await user.click(panel.getByRole("button", { name: "Turn off" }));
+  await user.click(panel.getByRole("button", { name: "Confirm turn off" }));
+  expect(calls[1]).toMatchObject({
+    method: "DELETE",
+    url: "/api/applications/app-1/repositories/portal/push-webhook",
+  });
+  expect(
+    await screen.findByRole("button", { name: "Set up push webhook" }),
+  ).toBeInTheDocument();
+});
+
+it("shows the last accepted delivery and the last refusal as text", async () => {
+  const own = ownLink({
+    push_webhook: webhook({
+      last_accepted: {
+        at: "2026-11-14T09:00:00Z",
+        event: "push",
+        delivery_id: "<img src=x onerror=alert(1)>",
+      },
+      last_refusal: { at: "2026-11-14T09:05:00Z", reason: "wrong_signature" },
+    }),
+  });
+  serve(application([own, ...upstreams()]));
+  const view = open();
+  const panel = await pushPanel();
+  expect(
+    within(panel).getByText("<img src=x onerror=alert(1)>"),
+  ).toBeInTheDocument();
+  expect(panel.querySelector("img")).toBeNull();
+  expect(within(panel).getByText(/Wrong signature/)).toBeInTheDocument();
+  // Upstream repositories stay polled: no push controls on their rows.
+  for (const name of ["facebook/react", "WordPress · akismet"])
+    expect(
+      within(row(name)).queryByRole("button", {
+        name: /push webhook|Regenerate|Turn off/,
+      }),
+    ).not.toBeInTheDocument();
+  expect(screen.getAllByRole("heading", { name: "Push webhook" })).toHaveLength(
+    1,
+  );
+
+  view.unmount();
+  own.push_webhook = webhook({
+    last_accepted: { at: "2026-11-14T10:00:00Z", event: "ping", delivery_id: "d-2" },
+    last_refusal: { at: "2026-11-14T10:05:00Z", reason: "<b>new_code</b>" },
+  });
+  open();
+  const again = await pushPanel();
+  const reopened = within(again);
+  expect(reopened.getByText(/ping received/)).toBeInTheDocument();
+  expect(reopened.getByText("d-2")).toBeInTheDocument();
+  expect(reopened.getByText(/<b>new_code<\/b>/)).toBeInTheDocument();
+  expect(again.querySelector("b")).toBeNull();
+});

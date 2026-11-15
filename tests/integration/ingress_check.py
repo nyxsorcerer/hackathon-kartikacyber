@@ -25,22 +25,29 @@ import psycopg
 from sqlalchemy import create_engine, exc, text
 
 
-def check_role(role: str):
+def check_role(role: str, reads=(), refused=('accounts',)):
+    """The role reads each of `reads` and is refused SELECT on each of `refused`, so after a restore
+    this proves its grants came back."""
     engine = create_engine(os.environ['NUMEN_DATABASE_URL'])
     with engine.connect() as connection:
         assert connection.scalar(text('SELECT current_user')) == role
         # Schema-qualified: a schema the role has no USAGE on drops out of its search_path, which
         # would turn the refusal into 'does not exist'. The refusal must be on the table: one on
         # the schema means a restore lost PUBLIC's USAGE on public, and every grant with it.
-        try:
-            connection.execute(text('SELECT 1 FROM public.accounts'))
-        except exc.ProgrammingError as error:
-            assert isinstance(error.orig, psycopg.errors.InsufficientPrivilege), error
-            assert 'permission denied for table accounts' in str(error.orig), error
-        else:
-            raise AssertionError(f'{role} read accounts')
+        for table in reads:
+            connection.execute(text(f'SELECT 1 FROM public.{table} LIMIT 1'))
+        for table in refused:
+            try:
+                connection.execute(text(f'SELECT 1 FROM public.{table}'))
+            except exc.ProgrammingError as error:
+                assert isinstance(error.orig, psycopg.errors.InsufficientPrivilege), error
+                assert f'permission denied for table {table}' in str(error.orig), error
+                connection.rollback()
+            else:
+                raise AssertionError(f'{role} read {table}')
     engine.dispose()
-    print(f'PASS {role} logs in through its own network and cannot read Accounts')
+    print(f'PASS {role} logs in through its own network' + ''.join(f', reads {table}' for table in reads)
+          + ' and cannot read ' + ' or '.join(refused))
 
 
 def fetch(url: str, method='GET', context=None):
@@ -62,7 +69,7 @@ def expect(url: str, status: int, method='GET', context=None):
 
 
 def push():
-    check_role('asset_monitor_push')
+    check_role('asset_monitor_push', reads=('push_webhooks',), refused=('push_deliveries', 'accounts'))
     expect(f'http://ingress-push:8083/push/{uuid.uuid4().hex}', 404, 'POST')
     expect('http://ingress-push:8083/api/health', 404)
     print('PASS the push listener answers 404 to an unknown push id and does not serve /api')

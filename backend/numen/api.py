@@ -20,7 +20,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from . import artifacts, cves, domain, prompts
 from .broker import Broker
-from .config import Config
+from .config import Config, secret_env
 from .db import make_database
 from .models import (
     Account,
@@ -43,6 +43,8 @@ from .models import (
     Application,
     ApplicationCVE,
     ApplicationRepository,
+    PushDelivery,
+    PushWebhook,
     RemediationPR,
     Repository,
     ServedChange,
@@ -120,6 +122,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
             if not db.get(Operator, "admin"):
                 db.add(Operator(id="admin", password_hash=hash_password(admin_password)))
     vault = Vault(config.secret_key)
+    ingress_vault = Vault(secret_env("NUMEN_INGRESS_KEY"))  # Push webhook secrets (ADR-0006 5)
     broker = Broker(config)
     attempts = defaultdict(deque)
 
@@ -499,7 +502,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         db.flush()
         domain.source_changed(db, application, previous.id if previous else None)
         action(db, "application", application.id, {"repository_id": link.repository_id, **change})
-        return domain.link_json(link, db.get(Repository, link.repository_id))
+        return domain.link_json(db, link, db.get(Repository, link.repository_id))
 
     @router.post("/applications/{ident}/repositories", status_code=201)
     def add_repository(ident: str, body: RepositoryInput, db=database_dependency):
@@ -583,6 +586,53 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         link.removed_at = link.removed_at or now()
         return changed_link(db, application, link, previous, {"action": "repository_removed"})
 
+    def own_link(db, ident, repository_id):
+        """B02: Push webhooks are offered only for the active Own repository, on GitHub."""
+        domain.get(db, Application, ident)
+        link = application_link(db, ident, repository_id)
+        repository = db.get(Repository, repository_id)
+        if link.role != "own" or link.removed_at or repository.source_kind != "github":
+            raise DomainError(
+                "push_webhook_own_only", "Push webhooks are offered only for Own repositories on GitHub", 422
+            )
+        return link, repository, db.scalar(select(PushWebhook).where(PushWebhook.repository_id == repository_id))
+
+    def push_webhook_secret(db, ident, webhook, change):
+        """The path and the new Push webhook secret, shown once (B02); the Action holds neither."""
+        secret = secrets.token_hex(32)
+        webhook.secret = ingress_vault.encrypt(secret)
+        db.flush()
+        action(db, "application", ident, {"action": change, "repository_id": webhook.repository_id})
+        return {"path": f"/push/{webhook.push_id}", "secret": secret}
+
+    @router.post("/applications/{ident}/repositories/{repository_id}/push-webhook", status_code=201)
+    def set_up_push_webhook(ident: str, repository_id: str, db=database_dependency):
+        if own_link(db, ident, repository_id)[2]:
+            raise DomainError("push_webhook_exists", "This repository already has a Push webhook", 409)
+        webhook = PushWebhook(repository_id=repository_id, push_id=secrets.token_hex(16))
+        db.add(webhook)
+        return push_webhook_secret(db, ident, webhook, "push_webhook_set_up")
+
+    @router.post("/applications/{ident}/repositories/{repository_id}/push-webhook/secret")
+    def regenerate_push_webhook(ident: str, repository_id: str, db=database_dependency):
+        """Regenerate: the old secret is refused from now on; the push id stays."""
+        webhook = own_link(db, ident, repository_id)[2]
+        if not webhook:
+            raise DomainError("not_found", "This repository has no Push webhook", 404)
+        return push_webhook_secret(db, ident, webhook, "push_webhook_regenerated")
+
+    @router.delete("/applications/{ident}/repositories/{repository_id}/push-webhook")
+    def turn_off_push_webhook(ident: str, repository_id: str, db=database_dependency):
+        """Turn off: the push id is removed with its deliveries, so it is refused from now on."""
+        link, repository, webhook = own_link(db, ident, repository_id)
+        if not webhook:
+            raise DomainError("not_found", "This repository has no Push webhook", 404)
+        db.execute(delete(PushDelivery).where(PushDelivery.push_webhook_id == webhook.id))
+        db.delete(webhook)
+        db.flush()
+        action(db, "application", ident, {"action": "push_webhook_turned_off", "repository_id": repository_id})
+        return domain.link_json(db, link, repository)
+
     @router.post("/applications/{ident}/repositories/{repository_id}/backfills")
     def backfill_repository(
         ident: str, repository_id: str, body: BackfillInput, db=database_dependency
@@ -605,6 +655,8 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
     ):
         """Check now: one source check per polled repository, reusing a check already active."""
         row = domain.get(db, Application, ident)
+        # The Application before each Repository (active_source_check), the order schedule() takes.
+        db.execute(select(Application.id).where(Application.id == ident).with_for_update(key_share=True))
         repositories = domain.active_repositories(db, row)
         if not repositories:
             raise DomainError(

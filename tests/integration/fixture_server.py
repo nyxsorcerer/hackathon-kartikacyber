@@ -8,6 +8,9 @@ In demo mode (NUMEN_FIXTURE_DEMO=1, A16) it also hosts the demo stand-ins: the d
 and a stand-in React Upstream repository as real git repositories behind the GitHub API, and the
 stand-in advisories, published one demo step at a time. `python fixture_server.py check` is its
 self-check.
+
+It also hosts the GitHub push stand-in (B02), numen/push-app-<run>, which sends signed Push
+deliveries to ingress-push over the test overlay's stand-ins network.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import base64
 import gzip
 import hashlib
+import hmac
 from datetime import datetime, timezone
 import io
 import json
@@ -28,6 +32,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -58,6 +63,11 @@ class FixtureState:
         # pull requests.
         self.published: set[str] = set() if DEMO else {'node2shell'}
         self.demo_pulls: dict[str, list[dict]] = {}
+        # The GitHub push stand-in (B02): each numen/push-app-<run>'s commits, newest first, the hooks
+        # registered on them, and every delivery sent, by delivery id.
+        self.push_repos: dict[str, list[dict]] = {}
+        self.hooks: list[dict] = []
+        self.deliveries: dict[str, dict] = {}
 
 
 STATE = FixtureState()
@@ -570,6 +580,63 @@ def demo_repository(path: str) -> tuple[Path, str] | None:
     return (repo, unquote(match[2] or '')) if repo and repo.is_dir() else None
 
 
+# The GitHub push stand-in (B02): numen/push-app-<run>. Its first read creates its base commit, and
+# only /admin/push adds one, so /admin/advance never moves it. Each commit changes VERSION, with a
+# sha fixed by the repository and the commit's number. A push payload lists only PAYLOAD_SHA, which
+# no GitHub route serves: a check imports the pushed commit from the API, never from the payload.
+PUSH_REPOSITORY = r'numen/push-app-[0-9a-f]+'
+PAYLOAD_SHA = 'f' * 40
+
+
+def push_commit(repository: str, number: int, parent: str | None) -> dict:
+    """The push stand-in's commit `number`, with its files: VERSION becomes 1.0.<number>."""
+    sha = hashlib.sha1(f'{repository}:{number}'.encode()).hexdigest()
+    date = iso(str(FIRST_DATE + 60 * number))
+    return {
+        'sha': sha, 'html_url': f'https://github.com/{repository}/commit/{sha}',
+        'commit': {'message': f'Release 1.0.{number}', 'author': {'name': 'Fixture Maintainer', 'email': 'fixture@example.invalid', 'date': date},
+                   'committer': {'name': 'Fixture Maintainer', 'date': date}},
+        'parents': [{'sha': parent}] if parent else [],
+        'files': [{'filename': 'VERSION', 'status': 'modified' if parent else 'added', 'additions': 1, 'deletions': 1 if parent else 0,
+                   'patch': f'@@ -1 +1 @@\n-1.0.{number - 1}\n+1.0.{number}' if parent else '@@ -0,0 +1 @@\n+1.0.0'}],
+    }
+
+
+def push_commits(repository: str) -> list[dict]:
+    """The push stand-in's commits, newest first. The caller holds STATE.lock."""
+    return STATE.push_repos.setdefault(repository, [push_commit(repository, 0, None)])
+
+
+def push_payload(repository: str, before: str, after: str) -> bytes:
+    listed = {'id': PAYLOAD_SHA, 'message': 'Listed in the payload only', 'url': f'https://github.com/{repository}/commit/{PAYLOAD_SHA}'}
+    return json.dumps({'ref': 'refs/heads/main', 'before': before, 'after': after,
+                       'repository': {'full_name': repository, 'html_url': f'https://github.com/{repository}'},
+                       'pusher': {'name': 'Fixture Maintainer'}, 'commits': [listed], 'head_commit': listed}).encode()
+
+
+def signature(secret: str, body: bytes) -> str:
+    return 'sha256=' + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def deliver(url: str, event: str, body: bytes, signed: str, delivery_id: str | None = None) -> dict:
+    """Records a delivery and POSTs it to `url` as GitHub does, under a new delivery id unless one is
+    given: {delivery_id, status}, the listener's status."""
+    delivery_id = delivery_id or str(uuid.uuid4())
+    with STATE.lock:
+        STATE.deliveries[delivery_id] = {'url': url, 'event': event, 'body': body, 'signature': signed, 'status': None}
+    request = Request(url, body, {'Content-Type': 'application/json', 'User-Agent': 'GitHub-Hookshot/fixture', 'X-GitHub-Event': event,
+                                  'X-GitHub-Delivery': delivery_id, 'X-Hub-Signature-256': signed}, method='POST')
+    try:
+        response = urlopen(request, timeout=10)
+    except HTTPError as error:
+        response = error
+    with response:
+        status = response.status
+    with STATE.lock:
+        STATE.deliveries[delivery_id]['status'] = status
+    return {'delivery_id': delivery_id, 'status': status}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'NumenTestFixture/1'
 
@@ -610,12 +677,16 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.lock:
                 return self.json({'generation': STATE.generation, 'version': STATE.version, 'score': STATE.score, 'notifications': STATE.notifications, 'requests': STATE.requests, 'pulls': STATE.pulls, 'writes': STATE.writes,
                                   'served_variants': sorted(STATE.served_variants), 'served_requests': STATE.served_requests,
-                                  'published': sorted(STATE.published), 'demo_pulls': STATE.demo_pulls})
+                                  'published': sorted(STATE.published), 'demo_pulls': STATE.demo_pulls,
+                                  'hooks': [{'repository': hook['repository'], 'url': hook['url']} for hook in STATE.hooks],
+                                  'deliveries': {ident: {key: sent[key] for key in ('url', 'event', 'status')} for ident, sent in STATE.deliveries.items()}})
         if found := demo_repository(path):
             try:
                 return self.demo_read(*found, query)
             except (subprocess.CalledProcessError, ValueError):
                 return self.json({'message': 'Not Found'}, 404)
+        if match := re.fullmatch(rf'/repos/({PUSH_REPOSITORY})(/.*)?', path):
+            return self.push_read(match[1], match[2] or '')
         if path == '/served' or path.startswith('/served/'):
             return self.served(path)
         if path in ('/target', '/'):
@@ -783,11 +854,16 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.pulls.clear()
                 STATE.served_variants.clear()
                 STATE.served_requests.clear()
+                STATE.push_repos.clear()
+                STATE.hooks.clear()
+                STATE.deliveries.clear()
             return self.json({'ok': True})
         if path == '/admin/served':
             with STATE.lock:
                 STATE.served_variants = set(data.get('variants', []))
             return self.json({'variants': sorted(STATE.served_variants)})
+        if path in ('/admin/hooks', '/admin/push', '/admin/hooks/redeliver', '/admin/hooks/replay', '/admin/hooks/forge'):
+            return self.push_admin(path, data if isinstance(data, dict) else {})
         if path.startswith('/repos/numen/fixture/'):
             return self.github_write(original, path.removeprefix('/repos/numen/fixture'), data)
         if path.startswith('/webhooks/') or path.startswith('/api/webhooks/'):
@@ -815,6 +891,64 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/served/beacon.js', '/served/loader.js'):
             return self.send(200, SERVED_BEACON if path == '/served/beacon.js' else SERVED_LOADER, 'application/javascript')
         return self.send(404, b'Not found', 'text/plain')
+
+    def push_read(self, repository: str, rest: str) -> None:
+        """The GitHub REST reads of a source check, answered from the push stand-in. Contents and
+        every other route answer 404, so derivation finds no manifest."""
+        with STATE.lock:
+            commits = list(push_commits(repository))
+        shas = [item['sha'] for item in commits]
+        if rest == '/commits':
+            body = json.dumps(commits).encode()
+            etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+            if self.headers.get('If-None-Match') == etag:
+                return self.send(304, b'', headers={'ETag': etag})
+            return self.send(200, body, headers={'ETag': etag})
+        if rest.startswith('/commits/') and (sha := rest.removeprefix('/commits/')) in shas:
+            return self.json(commits[shas.index(sha)])
+        base, _, head = rest.removeprefix('/compare/').partition('...')
+        if rest.startswith('/compare/') and base in shas and head in shas[:shas.index(base) + 1]:
+            ahead = commits[shas.index(head):shas.index(base)][::-1]  # chronological, as GitHub lists them
+            return self.json({'status': 'ahead' if ahead else 'identical', 'ahead_by': len(ahead), 'behind_by': 0,
+                              'total_commits': len(ahead), 'commits': ahead})
+        return self.json({'message': 'Not Found'}, 404)
+
+    def push_admin(self, path: str, data: dict) -> None:
+        """The push stand-in's hooks (B02). Registering a hook sends it a signed ping, as GitHub does.
+        A push adds one commit to that repository only and sends a signed push delivery to each of
+        its hooks. Redeliver resends a delivery as it was, replay resends its body and signature under
+        a new delivery id, and forge sends each hook a push signed with the wrong secret."""
+        if path in ('/admin/hooks/redeliver', '/admin/hooks/replay'):
+            ident = str(data.get('delivery_id', ''))
+            with STATE.lock:
+                sent = STATE.deliveries.get(ident)
+            if not sent:
+                return self.json({'message': 'No such delivery'}, 404)
+            return self.json(deliver(sent['url'], sent['event'], sent['body'], sent['signature'],
+                                     ident if path == '/admin/hooks/redeliver' else None))
+        repository = str(data.get('repository', ''))
+        if not re.fullmatch(PUSH_REPOSITORY, repository):
+            return self.json({'message': 'repository is numen/push-app-<hex>'}, 400)
+        if path == '/admin/hooks':
+            url, secret = str(data.get('url', '')), str(data.get('secret', ''))
+            if not url.startswith('http://') or not secret:
+                return self.json({'message': 'url and secret are required'}, 400)
+            with STATE.lock:
+                STATE.hooks.append({'repository': repository, 'url': url, 'secret': secret})
+                hook_id = len(STATE.hooks)
+            body = json.dumps({'zen': 'Keep it logically awesome.', 'hook_id': hook_id, 'repository': {'full_name': repository},
+                               'hook': {'type': 'Repository', 'events': ['push'], 'config': {'content_type': 'json', 'url': url}}}).encode()
+            return self.json(deliver(url, 'ping', body, signature(secret, body)))
+        with STATE.lock:
+            commits = push_commits(repository)
+            if path == '/admin/push':
+                commits.insert(0, push_commit(repository, len(commits), commits[0]['sha']))
+            head = commits[0]['sha']
+            body = push_payload(repository, commits[1]['sha'] if len(commits) > 1 else head, head)
+            hooks = [hook for hook in STATE.hooks if hook['repository'] == repository]
+        forged = path == '/admin/hooks/forge'
+        return self.json({'sha': head, 'deliveries': [
+            deliver(hook['url'], 'push', body, signature(hook['secret'] + '-forged' if forged else hook['secret'], body)) for hook in hooks]})
 
     def github_write(self, original: str, path: str, data: dict) -> None:
         """The git data and pull request writes of a Remediation PR (A08), kept in memory."""

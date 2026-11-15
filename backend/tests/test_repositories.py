@@ -238,7 +238,7 @@ def test_commit_belongs_to_an_application_that_still_uses_its_repository(system)
 
 
 def test_check_now_queues_one_source_check_per_linked_repository(system):
-    _, client, _ = system
+    app, client, _ = system
     p = application(client)
     base = f"/api/applications/{p['id']}/repositories"
 
@@ -250,12 +250,19 @@ def test_check_now_queues_one_source_check_per_linked_repository(system):
     second = link("https://github.com/demo/second")
     client.patch(f"{base}/{link('https://github.com/demo/off')}", json={"enabled": False})
     client.delete(f"{base}/{link('https://github.com/demo/gone')}")
+    plugin = p["repositories"][0]["repository_id"]
+    # Links added at the same instant are listed by link id, whatever the clock does.
+    with app.state.factory.begin() as db:
+        live = db.scalars(select(ApplicationRepository).where(
+            ApplicationRepository.repository_id.in_([plugin, second]))).all()
+        for row in live:
+            row.created_at = live[0].created_at
+        order = [row.repository_id for row in sorted(live, key=lambda row: row.id)]
     endpoint = f"/api/applications/{p['id']}/checks"
     response = client.post(endpoint, headers={"Idempotency-Key": "check-1"})
     assert response.status_code == 202, response.text
     items = response.json()["items"]
-    plugin = p["repositories"][0]["repository_id"]
-    assert [i["repository_id"] for i in items] == [plugin, second]
+    assert [i["repository_id"] for i in items] == order
     assert all(i["status_url"] == f"/api/jobs/{i['job_id']}" for i in items)
     jobs = [client.get(i["status_url"]).json() for i in items]
     assert {j["kind"] for j in jobs} == {"source_check"} and len({j["id"] for j in jobs}) == 2
@@ -264,7 +271,7 @@ def test_check_now_queues_one_source_check_per_linked_repository(system):
     assert client.post(endpoint).json()["items"] == items
     other = application(client, asset_name="Other", source_url="https://github.com/demo/second")
     shared = client.post(f"/api/applications/{other['id']}/checks").json()["items"]
-    assert shared == [items[1]]
+    assert shared == [i for i in items if i["repository_id"] == second]
     empty, _ = bare(client)
     refused = client.post(f"/api/applications/{empty}/checks")
     assert refused.status_code == 422 and refused.json()["code"] == "repository_required"

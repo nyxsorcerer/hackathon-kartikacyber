@@ -2,7 +2,7 @@ import json
 import re
 from urllib.parse import quote, urlparse
 from datetime import timedelta
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from . import advisories, artifacts, cves, detection, served
@@ -26,6 +26,8 @@ from .models import (
     Application,
     ApplicationCVE,
     ApplicationRepository,
+    PushDelivery,
+    PushWebhook,
     RemediationPR,
     Repository,
     ServedChange,
@@ -277,12 +279,13 @@ def enqueue(db, kind, application=None, inputs=None, profile=None, idempotency_k
 
 def links(db, application):
     """The Application's repository links with their repositories: the Own one first, then
-    in the order they were added. Removed links are included."""
+    in the order they were added (by link id when added at the same instant). Removed links are
+    included."""
     return db.execute(
         select(ApplicationRepository, Repository)
         .join(Repository, Repository.id == ApplicationRepository.repository_id)
         .where(ApplicationRepository.application_id == application.id)
-        .order_by(ApplicationRepository.role != "own", ApplicationRepository.created_at)
+        .order_by(ApplicationRepository.role != "own", ApplicationRepository.created_at, ApplicationRepository.id)
     ).all()
 
 
@@ -328,7 +331,7 @@ def linked_applications(db, repository):
         select(Application, ApplicationRepository)
         .join(ApplicationRepository, ApplicationRepository.application_id == Application.id)
         .where(ApplicationRepository.repository_id == repository.id)
-        .order_by(ApplicationRepository.created_at)
+        .order_by(ApplicationRepository.created_at, ApplicationRepository.id)
     ).all()
 
 
@@ -533,6 +536,14 @@ def repository_input(repository, **data):
 
 
 def active_source_check(db, repository):
+    """The repository's queued, running or cancelling source check. It first takes the Repository
+    row lock (FOR NO KEY UPDATE) until the transaction ends, so the scheduler, Check now and a
+    nudge (B02), which all look here before they queue one, never queue two. Callers lock their
+    Application FOR NO KEY UPDATE first."""
+    # ponytail: a transaction that queues for several repositories locks them in link order, so
+    # two crossing over shared repositories can deadlock and Postgres aborts one; lock them in id
+    # order if that is ever seen.
+    db.execute(select(Repository.id).where(Repository.id == repository.id).with_for_update(key_share=True))
     return db.scalar(
         select(Job)
         .where(
@@ -673,7 +684,9 @@ def release_branch_status(link, repository):
     return "matched" if link.release_branch else "unknown"
 
 
-def link_json(link, repository):
+def link_json(db, link, repository):
+    # B02: only an Own link has a Push webhook. It shows the last delivery, never its push id or secret.
+    webhook = link.role == "own" and db.scalar(select(PushWebhook).where(PushWebhook.repository_id == repository.id))
     return {
         "repository_id": repository.id,
         "role": link.role,
@@ -693,6 +706,11 @@ def link_json(link, repository):
         "baseline_revision": repository.baseline_revision,
         "last_check_at": utc(repository.last_check_at),
         "last_error": repository.last_error,
+        "push_webhook": {
+            "created_at": utc(webhook.created_at),
+            "last_accepted": webhook.last_accepted,
+            "last_refusal": webhook.last_refusal,
+        } if webhook else None,
     }
 
 
@@ -715,7 +733,7 @@ def application_json(db, row):
     for name in ("last_check_at", "next_check_at"):
         result[name] = utc(result[name])
     rows = links(db, row)
-    result["repositories"] = [link_json(link, repository) for link, repository in rows]
+    result["repositories"] = [link_json(db, link, repository) for link, repository in rows]
     result["unresolved_dependencies"] = next(
         (link.unresolved for link, _ in rows if link.role == "own" and link.removed_at is None), []
     )
@@ -2281,8 +2299,17 @@ def notify(db, event_key, *, verdict, link, application=None, account=None, sour
         pass
 
 
+def github_token(db):
+    """Whether a GitHub read token is configured: GitHub repositories are never polled without one (A02)."""
+    return db.scalar(
+        select(Account.id).where(Account.provider == "github", Account.credential.is_not(None)).limit(1)
+    )
+
+
 def schedule(db):
     current = now()
+    # FOR NO KEY UPDATE: a worker's source_check holds a Repository lock that active_source_check
+    # waits for, and inserts Jobs of these Applications, which take a key-share lock on them.
     due = list(
         db.scalars(
             select(Application)
@@ -2291,16 +2318,14 @@ def schedule(db):
                 Application.archived.is_(False),
                 (Application.next_check_at.is_(None)) | (Application.next_check_at <= current),
             )
-            .with_for_update(skip_locked=True)
+            .with_for_update(skip_locked=True, key_share=True)
         )
     )
-    github_token = db.scalar(
-        select(Account.id).where(Account.provider == "github", Account.credential.is_not(None)).limit(1)
-    )
+    token = github_token(db)
     for application in due:
         # A repository shared by several due Applications is polled once.
         for repository in active_repositories(db, application):
-            if repository.source_kind == "github" and not github_token:
+            if repository.source_kind == "github" and not token:
                 repository.last_error = github_token_required().as_dict()
             elif not active_source_check(db, repository):
                 enqueue(db, "source_check", application, repository_input(repository))
@@ -2326,6 +2351,36 @@ def schedule(db):
             )
     start_waiting(db)
     return len(due)
+
+
+def nudge_push_deliveries(db):
+    """B02: turns the accepted Push deliveries not yet processed into source checks. A nudge acts
+    only for the enabled Own repository of an Application that is not archived, whether or not
+    scheduled monitoring is on, under A02's GitHub read token rule. It reuses a queued check;
+    while one is running the deliveries wait, so the first loop after it queues exactly one more.
+    It never touches next_check_at or last_check_at. Deliveries older than 7 days are pruned
+    first, so a body is unique among the last 7 days'."""
+    current = now()
+    db.execute(delete(PushDelivery).where(PushDelivery.received_at < current - timedelta(days=7)))
+    token = github_token(db)
+    pending = select(PushDelivery.push_webhook_id).where(PushDelivery.processed_at.is_(None))
+    for webhook in db.scalars(select(PushWebhook).where(PushWebhook.id.in_(pending))).all():
+        # Only these are marked processed: one accepted meanwhile waits for the next loop.
+        ids = db.scalars(select(PushDelivery.id).where(
+            PushDelivery.push_webhook_id == webhook.id, PushDelivery.processed_at.is_(None))).all()
+        repository = db.get(Repository, webhook.repository_id)
+        application = next((a for a, link in linked_applications(db, repository)
+                            if link.role == "own" and in_use(a, link)), None)
+        if application and not token:
+            repository.last_error = github_token_required().as_dict()
+        elif application:
+            db.execute(select(Application.id).where(Application.id == application.id).with_for_update(key_share=True))
+            check = active_source_check(db, repository)
+            if check and check.status != "queued":
+                continue
+            if not check:
+                enqueue(db, "source_check", application, repository_input(repository))
+        db.execute(update(PushDelivery).where(PushDelivery.id.in_(ids)).values(processed_at=current))
 
 
 def start_waiting(db):

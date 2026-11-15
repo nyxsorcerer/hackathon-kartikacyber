@@ -17,6 +17,7 @@ import httpx
 from sqlalchemy import and_, select
 from . import advisories, artifacts, cves, dependencies, detection, domain, exposure, prompts, remediation, served
 from . import fingerprints as fingerprinting
+from .config import secret_env
 from .models import (
     Account,
     Action,
@@ -37,6 +38,7 @@ from .models import (
     Application,
     ApplicationCVE,
     ApplicationRepository,
+    PushWebhook,
     RemediationPR,
     Repository,
     ServedChange,
@@ -52,7 +54,7 @@ from .models import (
 from .schemas import (
     AUDIT_MAX_FUNCTIONS, CHANGE_KINDS, CONFIDENCES, SERVED_CONTENT_VERDICTS, VERDICTS, ModelCapability,
 )
-from .security import DomainError, fingerprint, retry_delay
+from .security import DomainError, Vault, fingerprint, retry_delay
 from .prefilter import MANIFESTS, prefilter
 from .sources import Sources, github_write_token_required, release_branch_candidates
 
@@ -420,6 +422,12 @@ def all_secrets(db, vault):
         )
     if vault.key:
         secrets.append(vault.key)
+    # Push webhook secrets (A14). Without NUMEN_INGRESS_KEY, decrypt raises vault_unconfigured rather
+    # than let one through unredacted.
+    ingress = Vault(secret_env("NUMEN_INGRESS_KEY"))
+    secrets.extend(ingress.decrypt(value) for value in db.scalars(select(PushWebhook.secret)))
+    if ingress.key:
+        secrets.append(ingress.key)
     return secrets
 
 

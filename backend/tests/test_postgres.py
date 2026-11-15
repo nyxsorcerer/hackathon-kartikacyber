@@ -1,9 +1,12 @@
 """Actual PostgreSQL lock/lease/migration/session proof in a disposable isolated schema."""
 
+import hashlib
+import hmac
 import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -15,19 +18,21 @@ from dataclasses import replace
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from psycopg.errors import InsufficientPrivilege
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, ProgrammingError
-from sqlalchemy.orm import Session, load_only
+from sqlalchemy.orm import Session, load_only, sessionmaker
 
+from numen import ingress
 from numen.api import create_app
 from numen.cli import INGRESS_ROLES, ingress_roles
 from numen.config import Config
 from numen.db import make_database
 from numen.domain import enqueue, schedule
-from numen.models import Account, Job, Application, now
+from numen.models import Account, Job, Application, PushDelivery, PushWebhook, now
 from numen.queue import ExecutionContext, claim, recover
-from numen.security import DomainError
+from numen.security import DomainError, Vault
 from conftest import FixtureBroker, github_account
 
 
@@ -772,55 +777,204 @@ def test_postgres_migration_adds_transcript_size(schema_url):
 
 
 ROLES = text("SELECT rolname FROM pg_roles WHERE rolname = ANY(:roles)")
+REPOSITORY = text(
+    "INSERT INTO repositories (id, source_kind, source_url, source_generation, watched_branches, created_at)"
+    " VALUES (:id, 'github', :url, 1, '{}', now())"
+)
+WEBHOOK = text("INSERT INTO push_webhooks (id, repository_id, push_id, secret, created_at)"
+               " VALUES (:id, :repository, :push_id, 'encrypted', now())")
+DELIVERY = text("INSERT INTO push_deliveries (id, push_webhook_id, delivery_id, body_sha256, received_at)"
+                " VALUES (:id, 'w1', :delivery, :sha, now())")
+
+
+def test_postgres_migration_adds_push_webhook_tables(schema_url):
+    """B02: one Push webhook per repository with a unique push id, and one Push delivery per delivery
+    id and per body SHA-256. Existing repositories survive the upgrade and the downgrade, which
+    drops no ingress role."""
+    migrate(schema_url, "b8c9d0e1f2a3")
+    engine = create_engine(schema_url)
+    with engine.begin() as db:
+        for ident in ("r1", "r2"):
+            db.execute(REPOSITORY, {"id": ident, "url": f"https://github.com/demo/{ident}"})
+    for _ in range(2):  # upgrade, then again after a downgrade
+        migrate(schema_url, "head")
+        drift = alembic(schema_url, "check", check=False)
+        assert drift.returncode == 0, drift.stdout + drift.stderr
+        with engine.begin() as db:
+            db.execute(WEBHOOK, {"id": "w1", "repository": "r1", "push_id": "a" * 32})
+            db.execute(DELIVERY, {"id": "d1", "delivery": "g1", "sha": "1" * 64})
+        for statement, values in (
+            (WEBHOOK, {"id": "w2", "repository": "r1", "push_id": "b" * 32}),  # same repository
+            (WEBHOOK, {"id": "w2", "repository": "r2", "push_id": "a" * 32}),  # same push id
+            (DELIVERY, {"id": "d2", "delivery": "g1", "sha": "2" * 64}),  # same delivery id
+            (DELIVERY, {"id": "d2", "delivery": "g2", "sha": "1" * 64}),  # same body
+        ):
+            with pytest.raises(IntegrityError), engine.begin() as db:
+                db.execute(statement, values)
+        alembic(schema_url, "downgrade", "b8c9d0e1f2a3")
+        with engine.begin() as db:
+            assert db.execute(text("SELECT to_regclass('push_webhooks'), to_regclass('push_deliveries')")
+                              ).one() == (None, None)
+            assert db.execute(text("SELECT id, source_url FROM repositories ORDER BY id")).all() == [
+                ("r1", "https://github.com/demo/r1"), ("r2", "https://github.com/demo/r2")]
+            assert set(db.scalars(ROLES, {"roles": list(INGRESS_ROLES)})) == set(INGRESS_ROLES)
+    engine.dispose()
+
+
+PUSH = "asset_monitor_push"
 
 
 def test_postgres_ingress_roles_hold_no_grant_on_release_1_tables(postgres):
-    """AC-B01: neither ingress role can read Accounts, Settings, Operators, sessions or Findings,
-    insert a job or queue an Alert. No push or agent table exists yet, so this every-table check
-    also holds the push role off agent tables and the agent role off push tables until phases 13
-    and 15b add them and their grants."""
+    """AC-B01 and ADR-0006 decision 5: neither ingress role can read Accounts, Settings, Operators,
+    sessions or Findings, insert a job or queue an Alert, and the agent role holds nothing on the
+    push tables. The push role may read push_webhooks, update only its last_accepted and
+    last_refusal, and insert into push_deliveries. Column privileges are listed too, so a
+    column-level grant cannot hide."""
     _, factory = postgres
     roles = list(INGRESS_ROLES)
     tables = text("SELECT relname FROM pg_class WHERE relkind = 'r'"
                   " AND relnamespace = to_regnamespace(current_schema())")
-    granted = text(
-        "SELECT r.rolname, c.relname FROM pg_class c CROSS JOIN pg_roles r WHERE c.relkind = 'r'"
-        " AND c.relnamespace = to_regnamespace(current_schema()) AND r.rolname = ANY(:roles)"
-        " AND has_table_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')"
+    on_tables = text(
+        "SELECT r.rolname, c.relname, p FROM pg_class c CROSS JOIN pg_roles r"
+        " CROSS JOIN unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) p"
+        " WHERE c.relkind = 'r' AND c.relnamespace = to_regnamespace(current_schema()) AND r.rolname = ANY(:roles)"
+        " AND has_table_privilege(r.oid, c.oid, p)"
     )
+    on_columns = text(
+        "SELECT r.rolname, c.relname, a.attname, p FROM pg_class c"
+        " JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped"
+        " CROSS JOIN pg_roles r CROSS JOIN unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'REFERENCES']) p"
+        " WHERE c.relkind = 'r' AND c.relnamespace = to_regnamespace(current_schema()) AND r.rolname = ANY(:roles)"
+        " AND has_column_privilege(r.oid, c.oid, a.attnum, p)"
+    )
+    webhook, delivery = (set(model.__table__.columns.keys()) for model in (PushWebhook, PushDelivery))
     with factory.begin() as db:
         assert set(db.scalars(ROLES, {"roles": roles})) == set(roles)
-        assert {"accounts", "settings", "operators", "sessions", "findings", "jobs",
-                "notification_outbox"} <= set(db.scalars(tables))
-        assert db.execute(granted, {"roles": roles}).all() == []
+        assert {"accounts", "settings", "operators", "sessions", "findings", "jobs", "notification_outbox",
+                "push_webhooks", "push_deliveries"} <= set(db.scalars(tables))
+        assert set(db.execute(on_tables, {"roles": roles}).all()) == {
+            (PUSH, "push_webhooks", "SELECT"), (PUSH, "push_deliveries", "INSERT")}
+        assert set(db.execute(on_columns, {"roles": roles}).all()) == {
+            *((PUSH, "push_webhooks", column, "SELECT") for column in webhook),
+            (PUSH, "push_webhooks", "last_accepted", "UPDATE"), (PUSH, "push_webhooks", "last_refusal", "UPDATE"),
+            *((PUSH, "push_deliveries", column, "INSERT") for column in delivery),
+        }
+
+
+def test_postgres_push_role_cannot_change_a_secret_or_read_deliveries(postgres, schema_url):
+    """ADR-0006 decision 5, run as asset_monitor_push. The schema's owner is a superuser, so
+    `role` at connect time needs no password and the shared cluster's role passwords stay as the
+    journey stack set them."""
+    _, factory = postgres
+    with factory.begin() as db:
+        db.execute(REPOSITORY, {"id": "r1", "url": "https://github.com/demo/r1"})
+        db.execute(WEBHOOK, {"id": "w1", "repository": "r1", "push_id": "a" * 32})
+        schema = db.scalar(text("SELECT current_schema()"))
+    push = create_engine(make_url(schema_url).update_query_dict(
+        {"options": f"-csearch_path={schema} -crole={PUSH}"}))
+    try:
+        with push.begin() as db:
+            assert db.scalar(text("SELECT current_user")) == PUSH
+            assert db.execute(text("SELECT id, repository_id FROM push_webhooks WHERE push_id = :p"),
+                              {"p": "a" * 32}).one() == ("w1", "r1")
+            assert db.execute(text("UPDATE push_webhooks SET last_refusal = CAST(:r AS json) WHERE push_id = :p"),
+                              {"r": '{"reason": "wrong_signature"}', "p": "a" * 32}).rowcount == 1
+            db.execute(DELIVERY, {"id": "d1", "delivery": "g1", "sha": "1" * 64})
+        for refused in (
+            "UPDATE push_webhooks SET secret = 'forged'",
+            "UPDATE push_webhooks SET push_id = 'b'",
+            "DELETE FROM push_webhooks",
+            "SELECT delivery_id FROM push_deliveries",
+            "UPDATE push_deliveries SET processed_at = now()",
+            "DELETE FROM push_deliveries",
+            "SELECT 1 FROM accounts",
+            "INSERT INTO jobs (id, kind, status, input, input_hash, progress, created_at, attempts)"
+            " VALUES ('j1', 'source_check', 'queued', '{}', 'h', '{}', now(), 0)",
+        ):
+            with pytest.raises(ProgrammingError) as error, push.begin() as db:
+                db.execute(text(refused))
+            assert isinstance(error.value.orig, InsufficientPrivilege), refused
+    finally:
+        push.dispose()
+    with factory.begin() as db:
+        assert db.execute(text("SELECT secret, last_refusal FROM push_webhooks")).one() == (
+            "encrypted", {"reason": "wrong_signature"})
+        assert db.execute(text("SELECT delivery_id FROM push_deliveries")).all() == [("g1",)]
+
+
+def test_postgres_push_listener_works_on_the_push_role_grants(postgres, schema_url):
+    """ADR-0006 decision 5, B02: the push listener, connected as asset_monitor_push, accepts a
+    push, answers a redelivery and a replay 200 as duplicates, records a refusal and a ping, all
+    within the role's grants: no RETURNING and no read of push_deliveries."""
+    _, factory = postgres
+    vault, secret = Vault(Fernet.generate_key().decode()), "s3cret"
+    with factory.begin() as db:
+        db.execute(REPOSITORY, {"id": "r1", "url": "https://github.com/demo/r1"})
+        db.add(PushWebhook(id="w1", repository_id="r1", push_id="a" * 32, secret=vault.encrypt(secret)))
+        schema = db.scalar(text("SELECT current_schema()"))
+    push = create_engine(make_url(schema_url).update_query_dict(
+        {"options": f"-csearch_path={schema} -crole={PUSH}"}), hide_parameters=True)
+    try:
+        listener = ingress.push_app(sessionmaker(push), vault)
+        listener.refresh()
+        client = TestClient(listener)
+
+        def deliver(body, delivery, event="push", key=secret):
+            signature = "sha256=" + hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
+            response = client.post(f"/push/{'a' * 32}", content=body, headers={
+                "X-GitHub-Event": event, "X-GitHub-Delivery": delivery, "X-Hub-Signature-256": signature})
+            return response.status_code, response.json()
+
+        assert deliver(b'{"after": "1"}', "g1") == (200, {"status": "accepted"})
+        assert deliver(b'{"after": "1"}', "g1") == (200, {"status": "duplicate"})
+        assert deliver(b'{"after": "1"}', "g2") == (200, {"status": "duplicate"})
+        assert deliver(b'{"after": "2"}', "g3", key="wrong")[0] == 401
+        assert deliver(b'{"zen": "z"}', "p1", event="ping") == (200, {"status": "ping received"})
+        with push.connect() as db:
+            assert db.scalar(text("SELECT current_user")) == PUSH
+    finally:
+        push.dispose()
+    with factory.begin() as db:
+        row = db.get(PushWebhook, "w1")
+        assert row.last_accepted == {"at": row.last_accepted["at"], "event": "ping", "delivery_id": "p1"}
+        assert row.last_refusal == {"at": row.last_refusal["at"], "reason": "wrong_signature"}
+        assert vault.decrypt(row.secret) == secret
+        assert db.execute(select(PushDelivery.delivery_id, PushDelivery.body_sha256)).all() == [
+            ("g1", hashlib.sha256(b'{"after": "1"}').hexdigest())]
 
 
 def test_postgres_ingress_roles_survive_a_downgrade_beside_another_schema(schema_url):
     """ADR-0006 decision 8: roles belong to the cluster, which many schemas share. Downgrading one
-    schema drops no role and leaves another schema's grants alone, and upgrading it again works."""
+    schema drops no role and leaves another schema's push grants alone, and upgrading it again works."""
     roles = list(INGRESS_ROLES)
     privileges = text(
-        "SELECT grantee, table_name, privilege_type FROM information_schema.table_privileges"
-        " WHERE table_schema = current_schema() AND grantee = ANY(:roles) ORDER BY 1, 2, 3"
+        "SELECT grantee, table_name, NULL, privilege_type FROM information_schema.table_privileges"
+        " WHERE table_schema = current_schema() AND grantee = ANY(:roles)"
+        " UNION ALL SELECT grantee, table_name, column_name, privilege_type FROM information_schema.column_privileges"
+        " WHERE table_schema = current_schema() AND grantee = ANY(:roles) ORDER BY 1, 2, 3, 4"
     )
+    usage = text(f"SELECT has_schema_privilege('{PUSH}', current_schema(), 'USAGE')")
     with isolated_schema(os.environ["NUMEN_TEST_DATABASE_URL"]) as other:
         migrate(schema_url, "head")
         migrate(other, "head")
-        engine = create_engine(other)
+        engine, own = create_engine(other), create_engine(schema_url)
         try:
             with engine.begin() as db:
-                # Stands in for the grants the push and agent migrations add in phases 13 and 15b.
-                db.execute(text("GRANT SELECT ON applications TO asset_monitor_push"))
                 before = db.execute(privileges, {"roles": roles}).all()
                 version = db.scalar(text("SELECT version_num FROM alembic_version"))
-            assert before
-            alembic(schema_url, "downgrade", "a7b8c9d0e1f2")
-            with engine.begin() as db:
-                assert set(db.scalars(ROLES, {"roles": roles})) == set(roles)
-                assert db.execute(privileges, {"roles": roles}).all() == before
-                assert db.scalar(text("SELECT version_num FROM alembic_version")) == version
+            assert (PUSH, "push_webhooks", "last_refusal", "UPDATE") in before
+            for revision in ("b8c9d0e1f2a3", "a7b8c9d0e1f2"):
+                alembic(schema_url, "downgrade", revision)
+                with own.begin() as db:
+                    assert db.scalar(usage) is False
+                with engine.begin() as db:
+                    assert set(db.scalars(ROLES, {"roles": roles})) == set(roles)
+                    assert db.execute(privileges, {"roles": roles}).all() == before
+                    assert db.scalar(usage) is True
+                    assert db.scalar(text("SELECT version_num FROM alembic_version")) == version
         finally:
             engine.dispose()
+            own.dispose()
     migrate(schema_url, "head")
     drift = alembic(schema_url, "check", check=False)
     assert drift.returncode == 0, drift.stdout + drift.stderr
@@ -1283,3 +1437,69 @@ def test_postgres_scheduler_deduplicates_and_api_survives_replacement(postgres):
         assert client.get(f"/api/applications/{created['id']}").json()["asset_name"] == "Persistent"
         assert len(client.get("/api/jobs").json()["items"]) == 1
         assert client.post(f"/api/applications/{created['id']}/checks").status_code == 403
+
+
+def blocked_by(factory, pid):
+    """Waits until another backend waits for a lock that backend `pid` holds."""
+    deadline = time.monotonic() + 20
+    while True:
+        with factory() as db:
+            if db.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'"
+                              " AND :pid = ANY(pg_blocking_pids(pid))"), {"pid": pid}):
+                return
+        assert time.monotonic() < deadline, "the contender never waited for the Repository lock"
+        time.sleep(0.05)
+
+
+@pytest.mark.parametrize("contender", ["check_application", "schedule", "nudge_push_deliveries"])
+def test_postgres_source_checks_are_queued_once_under_the_repository_lock(postgres, contender):
+    """B02 and decision 16: domain.active_source_check takes the Repository row lock before it
+    looks, so Check now, the scheduler and a nudge that look while another transaction queues a
+    source check wait for it and reuse its check. Each holds its Application FOR NO KEY UPDATE,
+    which lets that check's insert take its key-share lock, so neither deadlocks."""
+    from numen import domain
+    from numen.models import ApplicationRepository, Repository
+
+    original, factory = postgres
+    config = replace(original, secret_key=Fernet.generate_key().decode(), test_mode=True)
+    app = create_app(config=config, admin_password="test-password-long")
+    try:
+        with TestClient(app) as client:
+            client.headers["X-CSRF-Token"] = client.post("/api/auth/login", json={
+                "username": "admin", "password": "test-password-long"}).json()["csrf_token"]
+            github_account(app)
+            with factory.begin() as db:
+                application = create_application(db)
+                repository = Repository(source_kind="github", source_url="https://github.com/acme/shop")
+                db.add(repository)
+                db.flush()
+                db.add(ApplicationRepository(application_id=application.id, repository_id=repository.id, role="own"))
+                webhook = PushWebhook(repository_id=repository.id, push_id="a" * 32, secret="encrypted")
+                db.add(webhook)
+                db.flush()
+                db.add(PushDelivery(push_webhook_id=webhook.id, delivery_id="g1", body_sha256="1" * 64))
+                ident, repository_id = application.id, repository.id
+
+            def contend():
+                if contender == "check_application":
+                    response = client.post(f"/api/applications/{ident}/checks")
+                    assert response.status_code == 202, response.text
+                    return
+                with factory.begin() as db:
+                    getattr(domain, contender)(db)
+
+            with ThreadPoolExecutor(1) as pool:
+                with factory.begin() as holder:
+                    held = holder.get(Repository, repository_id)
+                    assert domain.active_source_check(holder, held) is None
+                    contending = pool.submit(contend)
+                    blocked_by(factory, holder.scalar(text("SELECT pg_backend_pid()")))
+                    queued = domain.enqueue(holder, "source_check", holder.get(Application, ident),
+                                            domain.repository_input(held)).id
+                contending.result(timeout=30)
+        with factory() as db:
+            assert db.scalars(select(Job.id).where(Job.kind == "source_check")).all() == [queued]
+            processed = db.scalar(select(PushDelivery.processed_at))
+            assert (processed is not None) == (contender == "nudge_push_deliveries")
+    finally:
+        app.state.factory.kw["bind"].dispose()

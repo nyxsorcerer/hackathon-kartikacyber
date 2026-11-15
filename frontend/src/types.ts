@@ -99,6 +99,25 @@ export const configSchema = z
     monitor_interval_inherited: z.boolean().optional(),
   })
   .passthrough();
+/** B02: an Own repository's Push webhook. Its push id and secret are shown once, never here. */
+export const pushWebhookSchema = z.object({
+  created_at: z.string(),
+  last_accepted: z
+    .object({
+      at: z.string(),
+      event: z.enum(["push", "ping"]),
+      delivery_id: z.string(),
+    })
+    .nullable(),
+  // reason: wrong_signature, event_not_accepted, delivery_id_missing, body_too_large, rate_limited.
+  last_refusal: z.object({ at: z.string(), reason: z.string() }).nullable(),
+});
+/** Set up and Regenerate: the path to append to the Public tunnel's URL and the secret, once. */
+export const pushWebhookSecretSchema = z.object({
+  path: z.string(),
+  secret: z.string(),
+});
+export type PushWebhookSecret = z.infer<typeof pushWebhookSecretSchema>;
 /** An Own or Upstream repository as one Application links it. */
 export const repositoryLinkSchema = z.object({
   repository_id: z.string(),
@@ -121,6 +140,7 @@ export const repositoryLinkSchema = z.object({
   baseline_revision: z.string().nullable(),
   last_check_at: z.string().nullable(),
   last_error: z.unknown().nullable(),
+  push_webhook: pushWebhookSchema.nullable().default(null),
 });
 export type RepositoryLink = z.infer<typeof repositoryLinkSchema>;
 export const applicationSchema = z.object({

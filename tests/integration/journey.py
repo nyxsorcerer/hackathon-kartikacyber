@@ -492,7 +492,72 @@ def main():
     assert not [job for job in items(client.request('GET', f'/api/jobs?application_id={served["id"]}')) if job['kind'] == 'served_triage']
     print('PASS no fetched script ran, both fixed user agents fetched the scripts, and Triage off starts no served Triage')
 
-    for application in [github, wordpress, own, node, advisory, served]:
+    # Push webhooks (B02): the fixture's GitHub push stand-in numen/push-app-<run> sends signed Push
+    # deliveries to ingress-push over the test overlay's stand-ins network, and the scheduler's
+    # nudge turns an accepted one into a source check. Scheduled monitoring stays off throughout.
+    push_repo = f'numen/push-app-{suffix}'
+    pushed = client.request('POST', '/api/applications', {
+        **common, 'asset_name': f'Push fixture {suffix}', 'product_kind': 'CMS',
+    }, expect=(200, 201))
+    client.request('POST', f'/api/applications/{pushed["id"]}/repositories', {
+        'role': 'own', 'source_kind': 'github', 'source_url': f'https://github.com/{push_repo}', 'source_ref': 'main',
+    }, expect=(201,))
+    assert [job['result']['imported'] for job in check_now(client, pushed)] == [0]
+    (link,) = client.request('GET', f'/api/applications/{pushed["id"]}')['repositories']
+    push_webhook = f'/api/applications/{pushed["id"]}/repositories/{link["repository_id"]}/push-webhook'
+    shown = client.request('POST', push_webhook, {}, expect=(201,))
+    assert set(shown) == {'path', 'secret'} and shown['path'].startswith('/push/'), shown
+
+    def webhook_row():
+        return client.request('GET', f'/api/applications/{pushed["id"]}')['repositories'][0]['push_webhook']
+
+    def source_checks():
+        return {job['id'] for job in items(client.request('GET', f'/api/jobs?application_id={pushed["id"]}')) if job['kind'] == 'source_check'}
+
+    # As GitHub does, registering the hook sends a ping. The listener knows a new push id only after
+    # its next 15 s refresh and answers 404 until then, so redeliver the ping until it is accepted.
+    ping = fixture.request('POST', '/admin/hooks', {'repository': push_repo, 'url': f'http://ingress-push:8083{shown["path"]}', 'secret': shown['secret']})
+    deadline = time.monotonic() + 30
+    while ping['status'] != 200:
+        assert ping['status'] == 404 and time.monotonic() < deadline, ping
+        time.sleep(1)
+        ping = fixture.request('POST', '/admin/hooks/redeliver', {'delivery_id': ping['delivery_id']})
+    assert webhook_row()['last_accepted']['event'] == 'ping'
+    print('PASS a Push webhook set up on the Own repository accepts its signed ping within the 15 s refresh, and the repository shows it')
+
+    checked = source_checks()
+    delivered = fixture.request('POST', '/admin/push', {'repository': push_repo})
+    (delivery,) = delivered['deliveries']
+    assert delivery['status'] == 200, delivered
+    # No Check now: within one scheduler loop the nudge queues exactly one source check.
+    deadline = time.monotonic() + 60
+    while not (nudged := source_checks() - checked):
+        assert time.monotonic() < deadline, 'no source check followed the Push delivery'
+        time.sleep(1)
+    (nudge,) = nudged
+    assert client.wait({'job_id': nudge})['result']['imported'] == 1
+    revisions = {row['revision'] for row in items(client.request('GET', f'/api/applications/{pushed["id"]}/commits'))}
+    assert delivered['sha'] in revisions and 'f' * 40 not in revisions, revisions
+    print('PASS a Push delivery imports the pushed commit through the GitHub API with no Check now, and never a commit listed only in its payload')
+
+    redelivered = fixture.request('POST', '/admin/hooks/redeliver', {'delivery_id': delivery['delivery_id']})
+    replayed = fixture.request('POST', '/admin/hooks/replay', {'delivery_id': delivery['delivery_id']})
+    (forged,) = fixture.request('POST', '/admin/hooks/forge', {'repository': push_repo})['deliveries']
+    assert (redelivered['status'], replayed['status'], forged['status']) == (200, 200, 401), (redelivered, replayed, forged)
+    time.sleep(20)  # more than one scheduler loop
+    assert source_checks() == checked | nudged
+    row = webhook_row()
+    assert (row['last_accepted']['event'], row['last_accepted']['delivery_id']) == ('push', delivery['delivery_id']), row
+    assert row['last_refusal']['reason'] == 'wrong_signature', row
+    print('PASS a redelivery and a replayed body queue no second check, and a forged delivery is refused and the repository shows why')
+
+    client.request('DELETE', push_webhook)
+    assert webhook_row() is None
+    (gone,) = fixture.request('POST', '/admin/push', {'repository': push_repo})['deliveries']
+    assert gone['status'] == 404, gone
+    print('PASS after Turn off the old push id is refused at once')
+
+    for application in [github, wordpress, own, node, advisory, served, pushed]:
         client.request('PATCH', f'/api/applications/{application["id"]}', {'archived': True, 'monitor_enabled': False})
     client.request('POST', '/api/auth/logout', {})
     client.request('GET', f'/api/findings/{finding["id"]}/download', expect=(401,), raw=True)

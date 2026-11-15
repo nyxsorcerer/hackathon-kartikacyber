@@ -71,7 +71,8 @@ def overlay_ingress_specs():
 
 def test_each_ingress_service_is_on_its_own_two_networks():
     """B01, ADR-0006 5: each ingress service joins its own bridge, which carries its port, and its
-    own internal network that only it and db share. Neither is on application or control."""
+    own internal network that only it and db share. Neither is on application or control. An
+    overlay adds only the test overlay's stand-ins network, to ingress-push (B02)."""
     base = compose("compose.yaml")
     services, networks = base["services"], base["networks"]
     for service, expected in INGRESS.items():
@@ -83,7 +84,25 @@ def test_each_ingress_service_is_on_its_own_two_networks():
         assert on_database == {"db", service}, (database, on_database)
     assert all("name" not in (networks[name] or {}) for spec in INGRESS.values() for name in spec["networks"])
     for name, service, spec in overlay_ingress_specs():
-        assert "networks" not in spec and "network_mode" not in spec, (name, service)
+        added = ["stand-ins"] if (name, service) == ("compose.test.yaml", "ingress-push") else None
+        assert spec.get("networks") == added and "network_mode" not in spec, (name, service)
+
+
+def test_the_stand_ins_network_is_only_in_overlays_and_internal():
+    """ADR-0006 5: production has no stand-ins network. Where an overlay defines it, it is internal
+    and its project's own, and only the fixture's GitHub push stand-in and ingress-push join it."""
+    base = compose("compose.yaml")
+    assert "stand-ins" not in base["networks"]
+    assert not [name for name, spec in base["services"].items() if "stand-ins" in (spec.get("networks") or [])]
+    joined = set()
+    for name in OVERLAYS:
+        overlay = compose(name)
+        if "stand-ins" in (overlay.get("networks") or {}):
+            assert overlay["networks"]["stand-ins"] == {"internal": True}, name
+        joined |= {(name, service) for service, spec in overlay["services"].items()
+                   if "stand-ins" in (spec.get("networks") or [])}
+    assert joined == {("compose.test.yaml", "fixtures"), ("compose.test.yaml", "ingress-push")}, joined
+    assert compose("compose.test.yaml")["networks"]["stand-ins"] == {"internal": True}
 
 
 def test_each_ingress_service_holds_only_its_own_keys():

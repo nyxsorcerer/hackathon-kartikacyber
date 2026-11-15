@@ -146,6 +146,37 @@ class ApplicationRepository(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
+class PushWebhook(Base):
+    """B02: the Push webhook of an Own repository, reached at /push/<push id>. The ingress role reads
+    it and writes only last_accepted ({at, event: push or ping, delivery_id}) and last_refusal
+    ({at, reason}: wrong_signature, event_not_accepted, body_too_large, delivery_id_missing or
+    rate_limited)."""
+
+    __tablename__ = "push_webhooks"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    repository_id: Mapped[str] = mapped_column(ForeignKey("repositories.id"), unique=True)
+    # 32 lowercase hex characters.
+    push_id: Mapped[str] = mapped_column(String, unique=True)
+    # The Push webhook secret, Vault(NUMEN_INGRESS_KEY).encrypt(secret).
+    secret: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    last_accepted: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    last_refusal: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class PushDelivery(Base):
+    """B02: an accepted Push delivery, once per delivery id and per body SHA-256. The nudge sets
+    processed_at and prunes rows older than 7 days, so a body is unique among the last 7 days."""
+
+    __tablename__ = "push_deliveries"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    push_webhook_id: Mapped[str] = mapped_column(ForeignKey("push_webhooks.id"))
+    delivery_id: Mapped[str] = mapped_column(String, unique=True)
+    body_sha256: Mapped[str] = mapped_column(String, unique=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Commit(Base):
     __tablename__ = "commits"
     __table_args__ = (UniqueConstraint("repository_id", "source_generation", "revision"),)
