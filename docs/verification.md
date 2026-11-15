@@ -1785,6 +1785,181 @@ Phase 11 covers A16 and AC-A16 (the demo Node Application's five steps and the d
     - a Linux host's file permissions.
   - **Why it can differ from the dry run:** real agents are not deterministic. The prepared commits are designed so the intended Verdict follows from the diff alone (the fix commit's message names GHSA-fv66-9v8q-g76r), but a real Analysis may still differ. Each squash-merged Remediation PR commit also gets a paid Triage, and maybe an Analysis.
 
+## Phase 12: Ingress (2026-11-15)
+
+Phase 12 is the first phase of release 2. It covers B01 and AC-B01 of `docs/prd/asset-monitor-r2-prd.md`, with defaulted decisions 9, 12, 13, 22 and the Ingress parts of 15, and ADR-0006. One Alembic migration, `b8c9d0e1f2a3`, creates two roles and changes no table. `docs/implementation-contract.md` has a new "Ingress (B01, ADR-0006)" section, and every shape below is described there.
+
+- **T1, `numen.ingress`: the push listener and the agent listener.**
+  - **The module.** `backend/numen/ingress.py` builds two ASGI apps through `listener()`:
+    - `listener()` serves `http` scopes only. It removes every `Cookie` header, whatever its case, before the app sees the request, and wraps the app in `security.SecurityHeaders`.
+    - `push_app()` takes from its global `push` bucket first (`PUSH_LISTENER_PER_MINUTE` = 120) and answers `429` `rate_limited` with `retryable: true` when it is empty. Every other request, `POST /push/<anything>` included, gets `404` `not_found`, and its body is never read.
+    - `agent_app()` reads every body through `read_body(BODY_CAP)` (64 KiB) and answers `413` `request_too_large` when it is refused. Only `GET /health` gets `200 {"status": "ok"}`. Every other method and path gets `404`, never `405`.
+    - `read_body` refuses an invalid or over-cap `Content-Length` before the first `receive()`. Otherwise it adds up every `http.request` chunk and refuses once the total passes the cap, or on a disconnect.
+    - `Buckets` keeps a sliding window per key, never per client address. A refused take is not counted, and an emptied key is dropped.
+    - `tls_files` decodes the base64 DER PKCS#8 key, refuses anything but P-256, and writes `key.pem` and a self-signed `cert.pem`, each `O_EXCL` and 0600.
+    - `main()` runs uvicorn on 8083 (push) or 8084 (agent, with the TLS files in a fresh `mkdtemp()`), with `access_log=False`, `lifespan="off"` and `ws="none"`.
+    - The module imports only the standard library, starlette's `JSONResponse`, `cryptography`, `numen.config.secret_env` and `numen.security`.
+  - **Tests.** `backend/tests/test_ingress.py` has 10 tests:
+    - `test_neither_listener_serves_the_dashboard`;
+    - `test_importing_the_ingress_never_imports_the_dashboard`, in a fresh interpreter, for `numen.api`, `numen.domain`, `numen.workflows` and `numen.worker`;
+    - `test_the_agent_listener_caps_bodies_on_the_bytes_read`;
+    - `test_an_unknown_push_id_gets_404_and_no_query`, whose `Engine` listener first proves it records a statement, so it cannot pass vacuously;
+    - `test_a_session_cookie_changes_nothing`;
+    - `test_every_ingress_response_carries_the_dashboard_headers`;
+    - `test_buckets_count_each_key_apart`;
+    - `test_the_push_listener_has_one_global_bucket`, from two client addresses;
+    - `test_the_agent_listener_certificate_carries_its_key`;
+    - `test_main_serves_each_listener_without_an_access_log`.
+
+    Starlette's `TestClient` may send an iterator body as one message. So the cap test also drives the ASGI app directly: with a `receive()` that fails the test if it is awaited (an over-cap or invalid `Content-Length`), with four 30 KiB `more_body` chunks (`413`, and the fourth chunk is never read), with chunked bodies within the cap, with `Content-Length` plus chunks, and with a disconnect. Its `TestClient` case sends an iterator body with `Transfer-Encoding: chunked` and no `Content-Length`.
+  - **Fault checks, not committed.** The module was broken 10 ways in a throwaway container, one at a time: cookie stripping, the `Content-Length` check, byte counting, counting refused takes, the security headers, the access log, keeping empty buckets, a world-readable key, the disconnect path, and importing `numen.domain`. Each break failed at least one test.
+  - **Live check, not committed.** Both listeners ran under real uvicorn in a container with no network:
+    - the push listener gave `404` for a request with a cookie;
+    - the agent listener served TLS, and its certificate's public key matched `NUMEN_AGENT_TLS_KEY`;
+    - the agent listener gave `413` for a 70 KB body and for a 90 KB chunked body, and `200` for a 60 KB chunked `GET /health`;
+    - every response carried the CSP and none set a cookie, and neither process wrote an access-log line.
+
+- **T2, the Ingress database roles.**
+  - **Migration** `backend/migrations/versions/b8c9d0e1f2a3_ingress_roles.py`, chained from `a7b8c9d0e1f2`. Its upgrade runs one `DO` block that creates `asset_monitor_push` and `asset_monitor_agent` `NOLOGIN` when missing, and grants nothing. Its downgrade does nothing, citing ADR-0006 decision 8. There is no model change, and `alembic check` is clean.
+  - **`python -m numen.cli ingress-roles`** (`ingress_roles(db, passwords)` in `backend/numen/cli.py`):
+    - It runs the same create-if-missing block, then `ALTER ROLE ... WITH LOGIN PASSWORD ... CONNECTION LIMIT 5` and `ALTER ROLE ... SET statement_timeout = '5s'`, composed with `psycopg.sql.Identifier` and `Literal`. It grants nothing and can run any number of times.
+    - `main()` checks for `ingress-roles` before the admin-password prompt. Without both passwords it exits before it connects, with "NUMEN_PUSH_DATABASE_PASSWORD and NUMEN_AGENT_DATABASE_PASSWORD must be set: run make init". Otherwise it prints "Ingress database roles configured", never the password.
+  - **Tests** in `backend/tests/test_postgres.py`. The schema create and drop moved from the `schema_url` fixture into an `isolated_schema(base)` context manager, which the fixture now uses.
+    - `test_postgres_ingress_roles_hold_no_grant_on_release_1_tables`: both roles are in `pg_roles`. The schema's table list must include `accounts`, `settings`, `operators`, `sessions`, `findings`, `jobs` and `notification_outbox`, so the check cannot pass on an empty list. `has_table_privilege` is false for every table, both roles and all seven privileges.
+    - `test_postgres_ingress_roles_survive_a_downgrade_beside_another_schema`: schemas A and B are migrated to head. B grants `SELECT ON applications TO asset_monitor_push`, and B's rows in `information_schema.table_privileges` for both roles and its `alembic_version` are recorded. A is then downgraded to `a7b8c9d0e1f2`. Both roles remain, and B's grants and `alembic_version` are unchanged. A upgrades to head again with no `alembic check` drift.
+    - `test_postgres_ingress_roles_command_gives_login_password_and_limits`: `ingress_roles` runs twice over two throwaway roles (`asset_monitor_test_<hex>`), with passwords that hold `:`, `%`, `@` and `/`.
+      - `pg_roles` shows `(True, 5, ['statement_timeout=5s'])`.
+      - Each password logs in as its role, and `SHOW statement_timeout` gives `5s`.
+      - `SELECT 1 FROM accounts` is refused with "permission denied for table accounts".
+      - `python -m numen.cli ingress-roles`, with both password variables and their `_FILE` forms removed, exits non-zero naming both and `make init`.
+      - The throwaway roles are dropped afterwards. The cluster's real roles, and the passwords a running journey stack depends on, are never touched.
+  - **Fault check, not committed.** With `GRANT INSERT ON jobs TO asset_monitor_agent` added to the migration, the grant test failed with `[('asset_monitor_agent', 'jobs')]`. The file was then restored.
+  - T2's own `make test-integration` run was still going (past 91% with no failure) when T2 reported. T3's full run passed, and so does T5's below.
+
+- **T3, the `.env` keys, the Compose services and the deployment tests.**
+  - **`scripts/init.sh`:**
+    - When `.env` holds all five keys (each matched with `grep -q "^KEY="`), it prints the "preserved" message and exits without Docker.
+    - Otherwise it runs the pinned bootstrap container. A new `.env` is created as before (`O_EXCL`, mode 0600, plus `.numen/bootstrap-password`), now with the five keys. On an existing `.env` it appends only the missing keys with `open('a')`, after a newline if the file lacks a trailing one, and prints their names, never their values. It never touches `.numen/bootstrap-password`.
+    - `NUMEN_INGRESS_KEY` is a Fernet key, made by the same `fernet_key()` helper as `NUMEN_SECRET_KEY`. Each role password is `secrets.token_urlsafe(32)`.
+    - `NUMEN_AGENT_TLS_KEY` is one line of standard base64 of `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER`. `NUMEN_AGENT_TLS_PIN` is the lowercase hex SHA-256 of `openssl pkey -inform DER -pubout -outform DER` over that key.
+    - The key and the pin stay a pair. A missing pin is derived from the existing key. A pin with no key, or a key that does not decode, stops init with an error and nothing changed.
+    - In a scratch copy of the script, these cases all behaved as described: a fresh `.env`; a complete one, without Docker; a release-1 `.env` with no trailing newline; only the pin missing (the derived pin equals the original); the key missing with a pin present; and a bad key. In the backend-test image, `numen.ingress.tls_files` accepted the generated key, the SHA-256 of the certificate's SPKI equalled `NUMEN_AGENT_TLS_PIN`, and `Fernet()` accepted `NUMEN_INGRESS_KEY`.
+  - **The Operator's `.env`, checked by hand.**
+    - `.env` was first copied to `.numen/env-before-phase12`. `make init` then printed "Added to .env: NUMEN_INGRESS_KEY, NUMEN_PUSH_DATABASE_PASSWORD, NUMEN_AGENT_DATABASE_PASSWORD, NUMEN_AGENT_TLS_KEY, NUMEN_AGENT_TLS_PIN".
+    - `grep -Fxv -f .env .numen/env-before-phase12` printed nothing. The original bytes are an exact prefix of the new `.env` (`cmp`), and each of the five keys appears once.
+    - `.env` is still mode 600, and the SHA-256 of `.numen/bootstrap-password` is unchanged.
+    - A second `make init` took the fast path, with no container, and left `.env` byte-identical. The copy was then deleted.
+  - **`compose.yaml`:**
+    - `migrate` runs `sh -c "alembic upgrade head && python -m numen.cli ingress-roles"`, with the anchor's environment plus both role passwords.
+    - `app` and `worker` get `NUMEN_INGRESS_KEY`. It is not on the anchor, so the scheduler, `migrate`, `bootstrap-operator` and `backend-tests` do not get it.
+    - `db` is on `application`, `push-db` and `agent-db`.
+    - `ingress-push` and `ingress-agent` run from `asset-monitor-app:0.1.0` with no build, `restart: unless-stopped`, `init: true`, `user: "10001:10001"`, `read_only`, `cap_drop: [ALL]` and `no-new-privileges:true`, and `depends_on: migrate: service_completed_successfully`. Their commands are `python -m numen.ingress push` and `agent`.
+    - `ingress-push` is on `push-inbound` and `push-db`, published on `127.0.0.1:${NUMEN_PUSH_PORT:-8791}:8083`. `ingress-agent` is on `agent-inbound` and `agent-db`, published on `127.0.0.1:${NUMEN_AGENT_PORT:-8792}:8084`, with a `/tmp` tmpfs (`size=1m`, uid and gid 10001, mode 0700). Each has exactly the two environment keys of the plan.
+    - The push healthcheck is a TCP connect, because an HTTP check would spend the global bucket. The agent healthcheck is `GET /health` over unverified TLS.
+    - `push-inbound` and `agent-inbound` are plain bridges, and `push-db` and `agent-db` are internal. None has a fixed name.
+  - **Other files.** The Dockerfile's test stage also copies `Dockerfile` and `Dockerfile.runner`. `make up` and `make logs` include both services. `.env.example` has placeholders for the five keys, plus `NUMEN_PUSH_PORT=8791` and `NUMEN_AGENT_PORT=8792`.
+  - **Tests** in `backend/tests/test_deployment.py`:
+    - `test_every_published_port_is_bound_to_loopback` now also covers both Ingress ports;
+    - `test_each_ingress_service_is_on_its_own_two_networks`;
+    - `test_each_ingress_service_holds_only_its_own_keys`;
+    - `test_the_ingress_services_are_hardened`;
+    - `test_every_external_base_image_is_pinned_by_digest`.
+
+    They failed before the change (5 failed, 2 passed) and pass after it (7 passed).
+  - **Fault checks, not committed.** Eight broken compose files and Dockerfiles were mounted over the image's copies, one at a time. Each failed the test meant to catch it: `ingress-push` on `application`; `NUMEN_SECRET_KEY` on `ingress-push`; `NUMEN_INGRESS_KEY` on the anchor; `agent-db` not internal; the push port off loopback; an overlay giving `ingress-push` a network; `ingress-agent` not read-only; an unpinned `FROM`.
+  - **Smoke check on `asset-monitor-test`** (ports 18791 and 18792). Only the `asset-monitor-app:0.1.0` tag was rebuilt, and the Operator's containers kept their image.
+    - `up -d --wait ingress-push ingress-agent`: `db` became healthy, `migrate` exited after "Ingress database roles configured", and both services became healthy.
+    - `POST http://127.0.0.1:18791/push/abc` and `GET /api/health` on the push port gave `404`.
+    - `https://127.0.0.1:18792/health` gave `{"status":"ok"}`, `/api/health` gave `404`, and plain http got no answer.
+    - Every response carried the CSP and no `Set-Cookie`. The certificate's SPKI SHA-256 matched `NUMEN_AGENT_TLS_PIN`.
+    - From inside each Ingress container, psycopg logged in as its role with `statement_timeout` `5s`, and the hosts `app`, `runner-broker` and `fixtures` did not resolve.
+
+- **T4, operations: backup and restore, the journey and the demo scripts.**
+  - **`backup.sh`** stops and restarts `app|worker|scheduler|ingress-push|ingress-agent`.
+  - **`restore.sh`:**
+    - It refuses a backup whose `deployment.env` lacks any of `NUMEN_INGRESS_KEY`, `NUMEN_PUSH_DATABASE_PASSWORD`, `NUMEN_AGENT_DATABASE_PASSWORD` or `NUMEN_AGENT_TLS_KEY`, with "Backup deployment.env lacks <keys>. For a backup made before release 2, copy them from the current .env into its deployment.env." This runs before any service stops or any data changes.
+    - Both Ingress services are in its stop and resume list.
+    - Before `DROP SCHEMA public`, it pipes the migration's create-if-missing `DO` block to `exec -T db psql -v ON_ERROR_STOP=1`.
+  - **`tests/integration/ingress_check.py`** runs inside each Ingress service's own container and prints `PASS` lines:
+    - `push`: `current_user` is `asset_monitor_push`, and the role cannot read `public.accounts`. `POST /push/<random hex>` and `GET /api/health` each get `404`, with the CSP and no `Set-Cookie`.
+    - `agent <pin>`: the same role check for `asset_monitor_agent`. The SHA-256 of the served certificate's SPKI must equal the pin. `GET /health` gets `200 {"status":"ok"}`, and `/api/health` gets `404`.
+    - It fails, as it should, with a wrong pin, when the agent check runs from the push container (the name does not resolve), and when the push role is given `SELECT` on `accounts`.
+  - **`scripts/test-journey.sh`:**
+    - It exports `NUMEN_PUSH_PORT=18791` and `NUMEN_AGENT_PORT=18792`, and both services are in its service list.
+    - `numen_ingress_check` runs `ingress_check.py` after the first `up` and again after the restore.
+    - `numen_ingress_grants` records each role's `LOGIN`, `CONNECTION LIMIT`, `rolconfig` and every table privilege. Before `backup.sh`, both roles must have `LOGIN`.
+    - After `down -v`, it restores a copy whose `deployment.env` lacks the `NUMEN_INGRESS_KEY` line. That restore must be refused with the message, and `.env` must still equal the backup's `deployment.env`. Had the restore gone on, the script would first copy the good `deployment.env` back over `.env`, then fail.
+    - After the real restore, before any `migrate` runs, both roles must be in `pg_roles`. After `up --wait`, `numen_ingress_grants` must equal the recorded value.
+    - New lines: "PASS restore.sh refuses a backup without the ingress keys and changes nothing", "PASS the ingress roles exist right after restore.sh on a fresh database volume" and "PASS the restore brings back the ingress roles, their limits and their grants".
+  - **`demo.sh`** exports `NUMEN_PUSH_PORT` and `NUMEN_AGENT_PORT` (8793 and 8794 by default, from `NUMEN_DEMO_PUSH_PORT` and `NUMEN_DEMO_AGENT_PORT`), and `up` starts both services. **`test-demo.sh`** sets 18793 and 18794. `compose config` confirmed `127.0.0.1:18793` and `18794` for the demo test, and 8793 and 8794 by default.
+  - **The grant round trip, checked by hand on `asset-monitor-test`.** The push role was granted `SELECT` on `applications` and the agent role `INSERT` on `jobs`, then `backup.sh` ran, and `pg_dump` wrote those GRANTs.
+    - On a fresh volume, loading `database.sql` directly fails with `role "asset_monitor_push" does not exist`, while `restore.sh` succeeds.
+    - Straight after the restore the grants are back, with `NOLOGIN`. After `up`, `LOGIN`, the limit of 5 and `statement_timeout=5s` match too, and the output equals the value before the backup.
+    - The grants were revoked afterwards.
+
+- **T5, the documents and this record.**
+  - **README.md:**
+    - Start: `make init` appends missing keys to an existing `.env` and never changes a line; after updating to release 2 run it, or `make up`; until then every Compose command, `backup.sh` and `restore.sh` stops with `Run setup first`.
+    - Access: the dashboard stays on 127.0.0.1:8788. The push listener on 127.0.0.1:8791 (`POST /push/<push id>` only) is the only port a Public tunnel may point at. The agent listener on 127.0.0.1:8792 serves TLS pinned by `NUMEN_AGENT_TLS_PIN`, reached by one Agent tunnel per server, with the `restrict,port-forwarding,permitopen="127.0.0.1:8792",command="/bin/false"` example. No tunnel from a server may point at 8788, and neither listener has cookies, sessions or CSRF.
+    - Checks: the journey's 18791 and 18792. Demo: 8793 and 8794, and 18793 and 18794 for `make test-demo`.
+    - Backup and restore: both services are paused and resumed; restore creates the roles before it loads and `migrate` gives them `LOGIN`; the refusal and the release-1 workaround (copy the four keys from the current `.env` into the backup's `deployment.env`, which is safe because nothing in such a backup is encrypted with them). `make logs` includes both services.
+  - **`docs/implementation-contract.md`** gains the "Ingress (B01, ADR-0006)" section: services, ports and commands; the Phase 12 routes, status codes and error codes; the caps; the buckets wired now and later; cookies, headers and logs; the key and pin formats and the certificate; the role attributes and the `migrate` command; the environment split; the networks; `make init`; and restore's checks.
+  - **`docs/demo.md`**: `demo.sh up` also publishes the two Ingress listeners on 127.0.0.1:8793 and 8794.
+
+- **Phase 12 acceptance, each mapped to its tests.**
+  - **AC-B01:**
+    - *Every published port, both Ingress listeners included, is on `127.0.0.1`:* `test_every_published_port_is_bound_to_loopback`, over all four compose files.
+    - *Neither listener serves `/api`, `/api/auth/login`, the SPA or `/assets`, and the push listener answers nothing but `POST /push/<push id>`:* `test_neither_listener_serves_the_dashboard`, plus the journey's `ingress_check.py`, live on both listeners.
+    - *Importing `numen.ingress` does not import `numen.api`:* `test_importing_the_ingress_never_imports_the_dashboard`.
+    - *Neither role can read Accounts, Settings, Operators, sessions or Findings, or insert a job:* `test_postgres_ingress_roles_hold_no_grant_on_release_1_tables`, plus `ingress_check.py`'s live refusal on `public.accounts` for each role. Phase 12 adds no push or agent table, so "no grant on the other listener's tables" and "cannot change an agent's key or status" hold trivially now. Phases 13 and 15b test them on their tables.
+    - *A body over its route's cap gets `413` before it is parsed, chunked too:* `test_the_agent_listener_caps_bodies_on_the_bytes_read`.
+    - *An unknown push id gets `404` and makes no database query:* `test_an_unknown_push_id_gets_404_and_no_query`.
+    - *A `numen_session` cookie changes nothing:* `test_a_session_cookie_changes_nothing`.
+    - *No request to the Ingress sends an Alert by itself:* the import test (neither `numen.domain`, `numen.workflows` nor `numen.worker`, where Alerts are made, is loaded), plus the grant test's `jobs` and `notification_outbox` checks.
+    - *Two schemas in one cluster, one downgraded, keep the roles and the other schema's grants:* `test_postgres_ingress_roles_survive_a_downgrade_beside_another_schema`.
+    - *A backup restored into a fresh database volume brings back the grants:* the journey's `numen_ingress_grants` round trip ("PASS the ingress roles exist right after restore.sh on a fresh database volume" and "PASS the restore brings back the ingress roles, their limits and their grants"), plus T4's hand check with real grants.
+  - **The plan's deployment bullets:** the four new `test_deployment.py` tests above. The role command's attributes: `test_postgres_ingress_roles_command_gives_login_password_and_limits`. The listener's bucket: `test_the_push_listener_has_one_global_bucket` and `test_buckets_count_each_key_apart`. The headers: `test_every_ingress_response_carries_the_dashboard_headers`.
+  - **Done when "AC-B01 has tests":** the mapping above.
+  - **Done when "`make up` starts both Ingress services next to an unchanged dashboard":** proven on the isolated `asset-monitor-test` project, never the Operator's (see Runs). The dashboard's own suites still pass: `make test-ui`, `make test-integration` and the journey.
+  - **Done when "the journey's backup round trip passes":** `make test-journey` printed `JOURNEY PASSED`, the Transcript round-trip lines and T4's three Ingress lines (see Runs).
+  - **Known failures:** none.
+
+- **Deviations and choices, for the orchestrator to record.** No PRD, ADR or glossary file was edited.
+  - **Rate limits.** Phase 12 has no route that names an identity. Only the keyed limiter (`Buckets`, never per client address) and the push listener's global bucket of 120 a minute are wired. The per-push-id bucket (60 a minute) comes with Phase 13. The per-agent (600 a minute), per-Enrollment-code (10 an hour) and unknown-agent-or-code (60 a minute in all) buckets come with Phase 15b.
+  - **Body caps.** The push route answers `404` before it reads any body, as B01 orders: the push id is checked first, and none exists yet. The 1 MiB Push delivery cap therefore first gets a route test in Phase 13. In Phase 12, `read_body`'s `Content-Length`, chunked and byte-counting paths are proven on the agent listener, which caps every request at 64 KiB.
+  - **The push id check.** The push id format check, and the in-memory set of known push ids refreshed every 15 s, are left to Phase 13. With no `push_webhooks` table they would have no observable effect. Neither Ingress service opens a database connection in Phase 12, and the journey's `ingress_check.py` proves their role logins.
+  - **Choices B01 leaves open** (recorded in the contract): `CONNECTION LIMIT` 5 and `statement_timeout` 5s per role; the TLS key as a P-256 key in base64 DER PKCS#8; the pin as the lowercase hex SHA-256 of the DER SubjectPublicKeyInfo, which the Go agent of Phases 15a and 15b must use too; a self-signed certificate valid for 1 year, made again at every start; and an agent healthcheck with an unverified TLS context, because the container holds the key, not the pin. Later phases should size their SQLAlchemy pools under the connection limit, for example `pool_size` 2 and `max_overflow` 0.
+  - **Release-1 backups.** `restore.sh` now refuses every release-1 backup, because each lacks the four Ingress keys. That is the plan's rule. README.md gives the workaround: copy the keys from the current `.env` into the backup's `deployment.env`.
+  - **For Phase 13: `GRANT USAGE ON SCHEMA`.** Backend tests migrate into non-public schemas (`numen_test_<hex>`), where `PUBLIC` has no `USAGE`. A database restored by a release-1 `restore.sh` also has a `public` schema without `PUBLIC`'s `USAGE`, because it re-created it with `CREATE SCHEMA public AUTHORIZATION numen`. Phase 13's grant migration must therefore `GRANT USAGE ON SCHEMA` to the roles in every case. `restore.sh` now re-creates `public` as initdb makes it (`AUTHORIZATION pg_database_owner` and `GRANT USAGE ON SCHEMA public TO PUBLIC`), the ACL `pg_dump` assumes, and the journey's `ingress_check.py` requires each role's refusal to be on the `accounts` table, not on the schema, after the restore too. `pg_dump` writes that grant, so it survives a restore once it exists. Phase 12 itself grants nothing.
+  - **The shared test cluster.** The migration creates the real roles `NOLOGIN` in the `asset-monitor-test` cluster, and the journey's `migrate` gives them `LOGIN` with `.env`'s passwords. T2's command test therefore uses throwaway role names and drops them, so `make test-integration` never changes passwords a running journey stack depends on.
+  - **The Operator's main project was not restarted.** Its `.env` now holds the five keys (checked above), and its running stack still runs the old image on 127.0.0.1:8788. When the Operator runs `make up`, Compose recreates `db` (new networks), `migrate`, `app` and `worker` (new environment), keeps the volumes, and starts both Ingress services on 127.0.0.1:8791 and 8792.
+
+- **Runs** on Docker Desktop (Engine 20.10, 8 GB), on the final code, with no request to an outside host. The Operator's `asset-monitor` project was left untouched: `docker ps --filter name=asset-monitor-app-1` gave `dcce11745c74 2026-11-15 10:25:07 +0700 WIB Up 3 hours (healthy)` before the runs and the same line after them, and 127.0.0.1:8788 still answered `200`.
+  - `make build` passed. `make check` passed: ruff "All checks passed!", and the frontend lint, typecheck and build.
+  - With `COMPOSE_PROJECT_NAME=asset-monitor-test` and `COMPOSE_FILE=compose.yaml:compose.test.yaml` exported, so the Operator's database was not used:
+    - `make test-unit` passed: 250 passed; runner 145 passed, 69 skipped.
+    - `make test-integration` passed: 631 passed. That is the 614 of Phase 11 plus the 17 new tests: 10 in `test_ingress.py`, 3 in `test_postgres.py` and 4 in `test_deployment.py`.
+    - `make test-runtime` passed: 213 passed, 1 skipped.
+    - `make test-ui` passed: 161 passed in 22 files.
+  - `make test-journey` passed. It printed `JOURNEY PASSED`, "PASS a container rebuild keeps the Transcripts" and "PASS a backup, an empty project and a restore keep the Transcripts". It also printed `ingress_check.py`'s five `PASS` lines after the first `up` and again after the restore, and the three new Ingress lines of T4.
+  - **The isolated `make up`.** The journey's stack was stopped without `-v`. Then `make up` ran with `COMPOSE_PROJECT_NAME=asset-monitor-test COMPOSE_FILE=compose.yaml:compose.test.yaml NUMEN_PORT=18788 NUMEN_DASHBOARD_URL=http://localhost:18788 NUMEN_PUSH_PORT=18791 NUMEN_AGENT_PORT=18792`.
+    - `migrate` exited, every service reported Healthy, `ingress-push` and `ingress-agent` included, and `bootstrap-operator` printed "Operator already exists".
+    - `curl -s http://127.0.0.1:18788/api/health` gave `{"status":"ok"}`. `./scripts/compose.sh ps` showed `ingress-push` on `127.0.0.1:18791->8083/tcp` and `ingress-agent` on `127.0.0.1:18792->8084/tcp`, both `(healthy)`, next to a healthy app.
+    - `POST http://127.0.0.1:18791/push/abc` gave `404` with `{"code":"not_found","message":"Not found","retryable":false}`, the CSP, `nosniff`, `no-referrer` and no `Set-Cookie`. `GET /api/health` on the push port gave `404`.
+    - `https://127.0.0.1:18792/health` gave `200 {"status":"ok"}` with the same headers, `/api/health` gave `404`, and plain http got no answer (curl exit 52).
+    - The SHA-256 of the served certificate's SPKI (`openssl s_client`, `x509 -pubkey`, `pkey -pubin -outform DER`) equalled `NUMEN_AGENT_TLS_PIN` from `.env`.
+    - The stack was then stopped without `-v`.
+  - `make test-demo` passed on `asset-monitor-demo-test` (127.0.0.1:18790, 18793 and 18794), after the journey and never at the same time. It printed `DEMO SMOKE PASSED` and `DEMO DRY RUN PASSED`, with "PASS docs/demo.md names every demo step", and both Ingress services became Healthy in both phases. Its containers were removed afterwards.
+
+### Phase 12 review fixes (2026-11-15)
+
+- **A restore no longer drops `PUBLIC`'s `USAGE` on `public`.** `restore.sh` re-created `public` with `CREATE SCHEMA public AUTHORIZATION numen`, which gives `{numen=UC/numen}`. `pg_dump` writes the owner and ACL of `public` only where they differ from initdb's `{owner=UC/owner,=U/owner}`, so nothing in `database.sql` put the `USAGE` back. A restored cluster could therefore hold every table `GRANT` while neither ingress role could reach any table, and the journey's grant comparison, which reads only `information_schema.table_privileges`, would still pass. `restore.sh` now runs `CREATE SCHEMA public AUTHORIZATION pg_database_owner; GRANT USAGE ON SCHEMA public TO PUBLIC;`, the ACL a fresh cluster has. `ingress_check.py`'s `check_role` now requires `permission denied for table accounts`, so a refusal on the schema fails the journey, before and after the restore.
+- **The test cluster was repaired once.** The first journey run after the fix failed at its first `ingress_check.py`, before any restore, with `permission denied for schema public`. The `asset-monitor-test` database volume had last been restored by the release-1 `restore.sh`: its `public` was `numen|{numen=UC/numen}`, while the same cluster's `postgres` database showed `pg_database_owner|{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`. `ALTER SCHEMA public OWNER TO pg_database_owner; GRANT USAGE ON SCHEMA public TO PUBLIC;` on `asset-monitor-test` only reset it to initdb's state. After the next journey's restore, `public` again read `pg_database_owner|{pg_database_owner=UC/pg_database_owner,=U/pg_database_owner}`. The Operator's main cluster was not touched. If it was ever restored by the release-1 `restore.sh`, it lacks the same `USAGE`, and Phase 13's `GRANT USAGE ON SCHEMA` to the roles covers that.
+- **Runs**, on the final code, with the Operator's `asset-monitor` project untouched (its six containers kept their uptimes):
+  - `make build` passed. `make check` passed: ruff "All checks passed!", and the frontend lint, typecheck and build.
+  - With `COMPOSE_PROJECT_NAME=asset-monitor-test` and `COMPOSE_FILE=compose.yaml:compose.test.yaml` exported: `make test-unit` passed (250 passed; runner 145 passed, 69 skipped). `make test-integration` passed (631 passed). `make test-runtime` passed (213 passed, 1 skipped). `make test-ui` passed (22 files, 161 tests).
+  - `make test-journey` passed after the repair above, with every PASS line, both `ingress_check.py` runs, the refusal of a backup without `NUMEN_INGRESS_KEY` and the grant round trip into a fresh cluster among them. Its stack was then stopped with `./scripts/compose.sh -p asset-monitor-test -f compose.yaml -f compose.test.yaml down`.
+
 ## Commit review correction (2026-10-06)
 
 Program selection now precedes global review and only that program's records are fetched; switching programs clears the previous queue. New triage output includes a potential issue title and fix/hardening/introduction kind. Complete unrelated results are dismissed, incomplete evidence stays pending, and manual review actions after job submission take precedence. Jev's three typed questions follow its official contract; existing source messages and legacy reports remain readable without inventing classifications.

@@ -11,7 +11,7 @@ Install Docker Engine/Desktop with Compose. No host Python, Node, or agent insta
 ```sh
 ./scripts/init.sh
 ./scripts/compose.sh --profile images build
-./scripts/compose.sh up -d --wait app worker scheduler runner-broker fetch-gateway
+./scripts/compose.sh up -d --wait app worker scheduler runner-broker fetch-gateway ingress-push ingress-agent
 ./scripts/compose.sh --profile setup run --rm bootstrap-operator
 ```
 
@@ -23,9 +23,20 @@ Open **http://localhost:8788**. The operator is **admin**. Read the generated pa
 cat .numen/bootstrap-password
 ```
 
-Setup creates random credentials in protected `.env` and `.numen/bootstrap-password` files. It preserves existing configuration. Docker Desktop on macOS is detected even when its CLI and credential helper are absent from PATH.
+Setup creates random credentials in protected `.env` and `.numen/bootstrap-password` files. It preserves existing configuration: on an existing `.env` it only appends the keys that are missing, and never changes a line already there. After updating to release 2, run `make init` (`make up` runs it) to add the Ingress keys: `NUMEN_INGRESS_KEY`, `NUMEN_PUSH_DATABASE_PASSWORD`, `NUMEN_AGENT_DATABASE_PASSWORD`, `NUMEN_AGENT_TLS_KEY` and its pin `NUMEN_AGENT_TLS_PIN`. Until it has run, every Compose command, `./scripts/backup.sh` and `./scripts/restore.sh` stops with `Run setup first`. Docker Desktop on macOS is detected even when its CLI and credential helper are absent from PATH.
 
-Access is on `127.0.0.1` only: every published port is bound to loopback (a test fails otherwise), and database and broker ports are internal. Reach the dashboard from another device, such as a Discord link opened on a phone, through a private tunnel you run. Every response carries a Content Security Policy that forbids inline script (`script-src 'self'`, `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`), with `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. Diffs, reports, agent output, Transcripts and commit messages render as escaped text, and lint refuses raw-HTML rendering.
+Access is on `127.0.0.1` only: every published port is bound to loopback (a test fails otherwise), and database and broker ports are internal. The dashboard stays on 127.0.0.1:8788. Reach it from another device, such as a Discord link opened on a phone, through a private tunnel you run.
+
+The Ingress adds two listeners, each its own service, for inbound machine traffic only:
+
+- The push listener, on 127.0.0.1:8791, answers only `POST /push/<push id>` (Push deliveries). It is the only port a Public tunnel may point at.
+- The agent listener, on 127.0.0.1:8792, serves TLS with `NUMEN_AGENT_TLS_KEY`, which On-server agents pin by `NUMEN_AGENT_TLS_PIN`. Each server reaches it through its own Agent tunnel, which opens that port and nothing else: for example a dedicated SSH key whose `authorized_keys` entry on this host is `restrict,port-forwarding,permitopen="127.0.0.1:8792",command="/bin/false"`.
+- Never point any tunnel from a server at 8788: it would give every user on that server the dashboard's login and Approvals.
+- Neither listener has cookies, sessions or CSRF, and neither serves `/api` or the dashboard. `NUMEN_PUSH_PORT` and `NUMEN_AGENT_PORT` in `.env` move them.
+
+For now the push listener answers `404` to every push id, and the agent listener answers only `GET /health`: Push webhooks and On-server agents come in later phases.
+
+Every response, the Ingress's included, carries a Content Security Policy that forbids inline script (`script-src 'self'`, `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`), with `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. Diffs, reports, agent output, Transcripts and commit messages render as escaped text, and lint refuses raw-HTML rendering.
 
 To reset the operator password interactively and revoke existing sessions:
 
@@ -77,7 +88,7 @@ make test-demo
 
 `test-runtime` explicitly enables actual Docker Engine cases. `test-integration` includes PostgreSQL claims, fencing, persistence, source/CVE workflows, and native-cache handling. Named `CASE` values are validated; unknown cases and empty pytest selections fail.
 
-The journey uses an isolated `asset-monitor-test` project at http://localhost:18788, with real HTTP/SVN source fixtures, a fixture npm registry and captured webhook delivery. It makes no authenticated inference or production-target requests. Its React2Shell case links an Own Node app that locks a harmless stand-in of `react-server-dom-webpack@19.0.0` (a crafted field returns a marker; nothing runs), shows the Upstream Finding's Disclosure report, refuses its downloads, reproduces it in a Lab on the real Engine after an Approval, and shows the fixed 19.0.1 stand-in as Not reproduced. Its Advisory check case links an Own repository whose Dockerfile and `.nvmrc` pin Node 20.11.1 and checks it against the fixture's OSV, GHSA and NVD routes, which list the fixture CVE-2026-111497, cross-aliased, for that version only: it opens exactly one advisory Finding with its report and a ready bump draft to `node:20.19.5-alpine`, refuses a Lab, and a second check opens none. Its Served-content case watches the fixture's homepage and a checkout page through the real gateway: the accepted Baselines survive rotating CSRF tokens, nonces and bundler hashes, Googlebot-only gambling links change only the Googlebot fingerprint, a ClickFix prompt's loader host changes both, and the fixture's beacon script, which would call back if run, never does. Only the test override opens the fixture's isolated `asset-monitor-test-served` network to the gateway (below). Stop that test stack afterward:
+The journey uses an isolated `asset-monitor-test` project at http://localhost:18788, with real HTTP/SVN source fixtures, a fixture npm registry and captured webhook delivery. Its Ingress listeners are on 127.0.0.1:18791 and 18792, and it checks them live before and after its backup round trip: the routes, the TLS pin and each Ingress role's login. It makes no authenticated inference or production-target requests. Its React2Shell case links an Own Node app that locks a harmless stand-in of `react-server-dom-webpack@19.0.0` (a crafted field returns a marker; nothing runs), shows the Upstream Finding's Disclosure report, refuses its downloads, reproduces it in a Lab on the real Engine after an Approval, and shows the fixed 19.0.1 stand-in as Not reproduced. Its Advisory check case links an Own repository whose Dockerfile and `.nvmrc` pin Node 20.11.1 and checks it against the fixture's OSV, GHSA and NVD routes, which list the fixture CVE-2026-111497, cross-aliased, for that version only: it opens exactly one advisory Finding with its report and a ready bump draft to `node:20.19.5-alpine`, refuses a Lab, and a second check opens none. Its Served-content case watches the fixture's homepage and a checkout page through the real gateway: the accepted Baselines survive rotating CSRF tokens, nonces and bundler hashes, Googlebot-only gambling links change only the Googlebot fingerprint, a ClickFix prompt's loader host changes both, and the fixture's beacon script, which would call back if run, never does. Only the test override opens the fixture's isolated `asset-monitor-test-served` network to the gateway (below). Stop that test stack afterward:
 
 ```sh
 ./scripts/compose.sh -p asset-monitor-test -f compose.yaml -f compose.test.yaml down
@@ -85,11 +96,11 @@ The journey uses an isolated `asset-monitor-test` project at http://localhost:18
 
 ## Demo
 
-The demo (A16) runs on a disposable VM only (ADR-0005), with `make demo-up` and `make demo-step STEP=<name>`, under its own `asset-monitor-demo` project on 127.0.0.1:8790. Its repositories, packages, advisories and served pages are local stand-ins, and no real exploit code is used. Follow the run sheet, [docs/demo.md](docs/demo.md). `make test-demo` checks it with no model keys: a smoke test of every step that needs no agent, then a dry run with canned agent decisions (test-only `compose.demo-test.yaml`), both on the isolated `asset-monitor-demo-test` project at http://localhost:18790.
+The demo (A16) runs on a disposable VM only (ADR-0005), with `make demo-up` and `make demo-step STEP=<name>`, under its own `asset-monitor-demo` project on 127.0.0.1:8790, with its Ingress listeners on 8793 (push) and 8794 (agent). Its repositories, packages, advisories and served pages are local stand-ins, and no real exploit code is used. Follow the run sheet, [docs/demo.md](docs/demo.md). `make test-demo` checks it with no model keys: a smoke test of every step that needs no agent, then a dry run with canned agent decisions (test-only `compose.demo-test.yaml`), both on the isolated `asset-monitor-demo-test` project at http://localhost:18790, with its Ingress listeners on 18793 and 18794.
 
 ## Backup and restore
 
-`make backup` briefly pauses application writers and creates a consistent database/artifact/credential-key set under `.numen/backups/`. It includes Transcripts of both kinds: Triage Transcripts are in the database and Analysis Transcripts in artifact storage. The scheduler deletes Triage Transcripts after 30 days, and the oldest ones once they pass 256 MB together. It keeps an Analysis Transcript as long as a Finding is about its subject, and otherwise 30 days. Preserve the full private set, including `deployment.env`.
+`make backup` briefly pauses application writers and both Ingress services, and creates a consistent database/artifact/credential-key set under `.numen/backups/`. It includes Transcripts of both kinds: Triage Transcripts are in the database and Analysis Transcripts in artifact storage. The scheduler deletes Triage Transcripts after 30 days, and the oldest ones once they pass 256 MB together. It keeps an Analysis Transcript as long as a Finding is about its subject, and otherwise 30 days. Preserve the full private set, including `deployment.env`.
 
 ```sh
 make backup
@@ -98,7 +109,9 @@ make restore BACKUP=.numen/backups/<timestamp>
 
 Restore replaces the application database and artifacts with the chosen backup. It validates the backup and matching database credentials first. For a fresh deployment, restore its `deployment.env` as `.env` before creating the new project's empty database volume. Use the operator password associated with that backup, or reset it through the container command.
 
-`make down` stops the main stack while keeping its volumes. `make logs` shows recent service output. Use `NUMEN_PORT` and `NUMEN_DASHBOARD_URL` in `.env` to change the local address.
+Restore pauses and resumes both Ingress services too. The Ingress database roles, `asset_monitor_push` and `asset_monitor_agent`, belong to the Postgres cluster rather than to `database.sql`, so restore creates any that is missing before it loads, and `migrate`, which runs when the services resume or at the next `make up`, gives them their login and passwords. A backup whose `deployment.env` lacks `NUMEN_INGRESS_KEY`, `NUMEN_PUSH_DATABASE_PASSWORD`, `NUMEN_AGENT_DATABASE_PASSWORD` or `NUMEN_AGENT_TLS_KEY` is refused before anything changes: "Backup deployment.env lacks <keys>. For a backup made before release 2, copy them from the current .env into its deployment.env." Every backup made before release 2 lacks them. Copying those four lines from the current `.env` into the backup's `deployment.env` is safe, because nothing in such a backup is encrypted with them.
+
+`make down` stops the main stack while keeping its volumes. `make logs` shows recent service output, both Ingress services included. Use `NUMEN_PORT` and `NUMEN_DASHBOARD_URL` in `.env` to change the local address, and `NUMEN_PUSH_PORT` and `NUMEN_AGENT_PORT` to move the Ingress listeners.
 
 ## Implementation documents
 

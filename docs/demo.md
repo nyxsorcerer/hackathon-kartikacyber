@@ -73,7 +73,7 @@ cat .numen/bootstrap-password
 `make demo-up` does the following:
 
 1. It runs `make build`. On a fresh checkout, that first runs `make init`, which creates `.env` and `.numen/bootstrap-password`.
-2. `./scripts/demo.sh up` starts the normal stack plus the `fixtures` stand-in, under its own Compose project `asset-monitor-demo`, with its own volumes, on 127.0.0.1:8790.
+2. `./scripts/demo.sh up` starts the normal stack plus the `fixtures` stand-in, under its own Compose project `asset-monitor-demo`, with its own volumes, on 127.0.0.1:8790, and the two Ingress listeners on 127.0.0.1:8793 (push listener) and 127.0.0.1:8794 (agent listener), which no demo step uses yet.
 3. It creates the Operator `admin`.
 4. It seeds the demo through the public HTTP API only, with no database edits.
 

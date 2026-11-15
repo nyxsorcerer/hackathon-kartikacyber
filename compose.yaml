@@ -34,7 +34,7 @@ services:
       POSTGRES_USER: numen
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run setup first}
     volumes: [postgres-data:/var/lib/postgresql]
-    networks: [application]
+    networks: [application, push-db, agent-db]
     healthcheck:
       test: [CMD-SHELL, pg_isready -U numen -d numen]
       interval: 5s
@@ -43,7 +43,13 @@ services:
   migrate:
     <<: *app
     restart: no
-    command: [alembic, upgrade, head]
+    # The ingress roles are created outside the migrations; this sets their LOGIN, passwords and
+    # limits on every start (ADR-0006 8).
+    command: [sh, -c, "alembic upgrade head && python -m numen.cli ingress-roles"]
+    environment:
+      <<: *app-env
+      NUMEN_PUSH_DATABASE_PASSWORD: ${NUMEN_PUSH_DATABASE_PASSWORD:?Run setup first}
+      NUMEN_AGENT_DATABASE_PASSWORD: ${NUMEN_AGENT_DATABASE_PASSWORD:?Run setup first}
     depends_on:
       db:
         condition: service_healthy
@@ -59,6 +65,10 @@ services:
   app:
     <<: *app
     ports: ["127.0.0.1:${NUMEN_PORT:-8788}:8080"]
+    # Encrypts Push webhook secrets. Only ingress-push, the app and the worker hold it (ADR-0006 5).
+    environment:
+      <<: *app-env
+      NUMEN_INGRESS_KEY: ${NUMEN_INGRESS_KEY:?Run setup first}
     # Agent session chat relays operator input to the broker.
     networks: [application, control]
     healthcheck:
@@ -73,6 +83,7 @@ services:
       <<: *app-env
       NUMEN_WORKER_CONCURRENCY: ${NUMEN_WORKER_CONCURRENCY:-3}
       NUMEN_AUDIT_CONCURRENCY: ${NUMEN_AUDIT_CONCURRENCY:-3}
+      NUMEN_INGRESS_KEY: ${NUMEN_INGRESS_KEY:?Run setup first}
     networks: [application, control]
     depends_on:
       db:
@@ -126,6 +137,59 @@ services:
     security_opt: [no-new-privileges:true]
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8082/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  # The ingress (B01, ADR-0006): one service per listener, off the x-app anchor, so neither holds the
+  # vault key, the broker token or the database owner's password. Each joins its own bridge, which
+  # carries its published port, and an internal network that only it and db share.
+  ingress-push:
+    image: asset-monitor-app:0.1.0
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: [python, -m, numen.ingress, push]
+    networks: [push-inbound, push-db]
+    # The only port a Public tunnel may reach.
+    ports: ["127.0.0.1:${NUMEN_PUSH_PORT:-8791}:8083"]
+    environment:
+      NUMEN_DATABASE_URL: postgresql+psycopg://asset_monitor_push:${NUMEN_PUSH_DATABASE_PASSWORD:?Run setup first}@db:5432/numen
+      NUMEN_INGRESS_KEY: ${NUMEN_INGRESS_KEY:?Run setup first}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # A TCP connect: an HTTP check would spend the listener's global bucket.
+      test: [CMD, python, -c, "import socket; socket.create_connection(('localhost', 8083), 3).close()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  ingress-agent:
+    image: asset-monitor-app:0.1.0
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: [python, -m, numen.ingress, agent]
+    networks: [agent-inbound, agent-db]
+    # Each server's Agent tunnel reaches this port and nothing else.
+    ports: ["127.0.0.1:${NUMEN_AGENT_PORT:-8792}:8084"]
+    # The TLS key and the self-signed certificate made from it at every start.
+    tmpfs: ["/tmp:size=1m,uid=10001,gid=10001,mode=0700"]
+    environment:
+      NUMEN_DATABASE_URL: postgresql+psycopg://asset_monitor_agent:${NUMEN_AGENT_DATABASE_PASSWORD:?Run setup first}@db:5432/numen
+      NUMEN_AGENT_TLS_KEY: ${NUMEN_AGENT_TLS_KEY:?Run setup first}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # The container holds the key, not the pin, so this check does not verify the certificate.
+      test: [CMD, python, -c, "import ssl, urllib.request; urllib.request.urlopen('https://localhost:8084/health', timeout=3, context=ssl._create_unverified_context())"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -198,6 +262,12 @@ networks:
   control:
     internal: true
   egress:
+  push-inbound:
+  agent-inbound:
+  push-db:
+    internal: true
+  agent-db:
+    internal: true
 volumes:
   postgres-data:
   artifact-data:

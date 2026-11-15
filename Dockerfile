@@ -26,7 +26,7 @@ CMD ["uvicorn", "numen.api:app", "--host", "0.0.0.0", "--port", "8080"]
 FROM app AS test
 USER root
 RUN uv sync --locked --extra dev
-# The loopback-only port test (A15) reads the compose files.
-COPY compose.yaml compose.test.yaml compose.demo.yaml compose.demo-test.yaml /app/
+# The deployment tests (A15, B01) read the compose files and both Dockerfiles.
+COPY compose.yaml compose.test.yaml compose.demo.yaml compose.demo-test.yaml Dockerfile Dockerfile.runner /app/
 USER 10001:10001
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]

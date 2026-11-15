@@ -8,6 +8,7 @@ numen_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$numen_root"
 export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-asset-monitor-demo}"
 export NUMEN_PORT="${NUMEN_DEMO_PORT:-8790}"
+export NUMEN_PUSH_PORT="${NUMEN_DEMO_PUSH_PORT:-8793}" NUMEN_AGENT_PORT="${NUMEN_DEMO_AGENT_PORT:-8794}"
 export NUMEN_DASHBOARD_URL="http://localhost:$NUMEN_PORT"
 demo_fail() {
     printf '%s\n' "$1" >&2
@@ -49,7 +50,7 @@ case "${1:-}" in
     up)
         [ "${ASSET_MONITOR_DEMO_VM:-}" = 1 ] || demo_fail "Run the demo only on a disposable VM that holds \
 demo-scoped, spend-capped keys (ADR-0005), and set ASSET_MONITOR_DEMO_VM=1 there."
-        demo_compose up -d --wait app worker scheduler runner-broker fetch-gateway fixtures
+        demo_compose up -d --wait app worker scheduler runner-broker fetch-gateway fixtures ingress-push ingress-agent
         # As the host user, for the same 0600 password file; bootstrap writes only to the database.
         demo_compose --profile setup run --rm --user "$(id -u):$(id -g)" bootstrap-operator
         demo_run demo.py seed

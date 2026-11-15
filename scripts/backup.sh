@@ -12,12 +12,12 @@ mkdir -p "$numen_destination"
 numen_services=''
 for numen_service in $(./scripts/compose.sh ps --services --status running); do
     case "$numen_service" in
-        app|worker|scheduler) numen_services="$numen_services $numen_service" ;;
+        app|worker|scheduler|ingress-push|ingress-agent) numen_services="$numen_services $numen_service" ;;
     esac
 done
 numen_resume() {
     if [ -n "$numen_services" ]; then
-        # Values above are restricted to three literal service names.
+        # Values above are restricted to literal service names.
         ./scripts/compose.sh start $numen_services >/dev/null
     fi
 }

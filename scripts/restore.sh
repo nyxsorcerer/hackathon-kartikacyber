@@ -27,11 +27,18 @@ if current.get("POSTGRES_PASSWORD") != backup.get("POSTGRES_PASSWORD"):
     raise SystemExit("Database credentials differ. Use this backup deployment.env in a fresh Numen project/database volume.")
 if not backup.get("NUMEN_SECRET_KEY") or not backup.get("NUMEN_BROKER_TOKEN"):
     raise SystemExit("Backup credential keys are missing.")
+# Release 2 (B01): a Push webhook secret is encrypted with NUMEN_INGRESS_KEY, and the ingress
+# services need their role passwords and the agent listener its TLS key.
+missing = [key for key in ("NUMEN_INGRESS_KEY", "NUMEN_PUSH_DATABASE_PASSWORD",
+                           "NUMEN_AGENT_DATABASE_PASSWORD", "NUMEN_AGENT_TLS_KEY") if not backup.get(key)]
+if missing:
+    raise SystemExit("Backup deployment.env lacks " + ", ".join(missing) + ". For a backup made before "
+                     "release 2, copy them from the current .env into its deployment.env.")
 '
 numen_services=''
 for numen_service in $(./scripts/compose.sh ps --services --status running); do
     case "$numen_service" in
-        app|worker|scheduler|runner-broker) numen_services="$numen_services $numen_service" ;;
+        app|worker|scheduler|runner-broker|ingress-push|ingress-agent) numen_services="$numen_services $numen_service" ;;
     esac
 done
 numen_resume() {
@@ -43,8 +50,21 @@ trap numen_resume EXIT INT TERM
 if [ -n "$numen_services" ]; then
     ./scripts/compose.sh stop -t 30 $numen_services
 fi
+# The ingress roles belong to the cluster, not to database.sql, whose GRANTs name them: create
+# any that is missing, NOLOGIN, with the migration's DO block. migrate (run by the resume below or
+# the next make up) gives them LOGIN and their passwords.
+./scripts/compose.sh exec -T db psql -v ON_ERROR_STOP=1 -U numen -d numen >/dev/null <<'SQL'
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'asset_monitor_push')
+    THEN CREATE ROLE asset_monitor_push NOLOGIN; END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'asset_monitor_agent')
+    THEN CREATE ROLE asset_monitor_agent NOLOGIN; END IF;
+END $$;
+SQL
+# Re-create public as initdb makes it: pg_dump writes its owner and ACL only where they differ
+# from that, so anything else would drop PUBLIC's USAGE.
 ./scripts/compose.sh exec -T db psql -v ON_ERROR_STOP=1 -U numen -d numen \
-    -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public AUTHORIZATION numen;' >/dev/null
+    -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public AUTHORIZATION pg_database_owner; GRANT USAGE ON SCHEMA public TO PUBLIC;' >/dev/null
 ./scripts/compose.sh exec -T db psql -v ON_ERROR_STOP=1 -U numen -d numen \
     < "$numen_backup/database.sql" >/dev/null
 ./scripts/compose.sh run --rm --no-deps -T \

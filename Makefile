@@ -16,14 +16,14 @@ prune:
 	docker image prune -f --filter label=org.pruferva.asset-monitor.image=true
 
 up: build
-	$(COMPOSE) up -d --wait app worker scheduler runner-broker fetch-gateway
+	$(COMPOSE) up -d --wait app worker scheduler runner-broker fetch-gateway ingress-push ingress-agent
 	$(COMPOSE) --profile setup run --rm bootstrap-operator
 
 down:
 	$(COMPOSE) down
 
 logs:
-	$(COMPOSE) logs --tail=100 -f app worker scheduler runner-broker db
+	$(COMPOSE) logs --tail=100 -f app worker scheduler runner-broker ingress-push ingress-agent db
 
 check: init
 	$(COMPOSE) --profile test run --build --no-deps --rm backend-tests ruff check --no-cache numen tests

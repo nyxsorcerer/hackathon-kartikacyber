@@ -195,6 +195,69 @@ Submission returns `{run_id, status}`. `GET /internal/runs/{id}` returns `{run_i
 
 Implement real Pi, Claude, and Codex argv/protocol adapters, isolated container jobs, and capabilities/native login flows. Fixture modes may exist only in explicit test configuration. Unsupported credentials or unavailable engines fail truthfully. Sensitive credentials are never included in ordinary run responses or logs. Trusted native-login credential ingress requires a separate authenticated retrieval channel, deleted after successful vault ingestion; coordinate the exact minimal channel with backend owner.
 
+## Ingress (B01, ADR-0006)
+
+The Ingress is `backend/numen/ingress.py`, run as two Compose services from the app image. This section describes it as built in Phase 12, before any push id or On-server agent exists.
+
+- **Services and ports.**
+  - `ingress-push` runs `python -m numen.ingress push`: the push listener on container port 8083, published on `127.0.0.1:${NUMEN_PUSH_PORT:-8791}`. Its healthcheck is a TCP connect, because an HTTP check would spend the listener's global bucket.
+  - `ingress-agent` runs `python -m numen.ingress agent`: the agent listener on container port 8084, published on `127.0.0.1:${NUMEN_AGENT_PORT:-8792}`, TLS only. Plain http gets no answer. Its healthcheck is `GET https://localhost:8084/health` with an unverified TLS context, because the container holds the key, not the pin.
+  - Both use the image `asset-monitor-app:0.1.0` with no build. They are off the `x-app` anchor, with `user: "10001:10001"`, `read_only: true`, `cap_drop: [ALL]`, `no-new-privileges:true`, `init: true` and `restart: unless-stopped`. Each has `depends_on: migrate: condition: service_completed_successfully`.
+  - uvicorn serves each with `access_log=False`, `lifespan="off"` and `ws="none"`.
+  - `make up`, `make logs`, `backup.sh`, `restore.sh`, `test-journey.sh` and `demo.sh` include both. Host ports per project: journey 18791 and 18792; demo 8793 and 8794 (`NUMEN_DEMO_PUSH_PORT`, `NUMEN_DEMO_AGENT_PORT`); demo test 18793 and 18794.
+- **Routes and answers in Phase 12.**
+  - **Push listener.** Every request first takes the global `push` bucket. When it is empty, the answer is `429` `rate_limited` with `retryable: true`. Every other request, `POST /push/<anything>` included, gets `404` `not_found` before its body is read, because no push id exists yet.
+  - **Agent listener.** Every request's body is read through `read_body` with the 64 KiB cap first, and a refused body gets `413` `request_too_large`. Then `GET /health` gets `200 {"status": "ok"}`, and every other method and path gets `404` `not_found`.
+  - Neither answers `405`: a wrong method is a `404`. Neither serves `/api`, `/api/auth/login`, the SPA or `/assets`.
+  - Error bodies are `DomainError(...).as_dict()`, `{code, message, retryable}`, with the codes `not_found`, `request_too_large` and `rate_limited`.
+- **Body caps.** `read_body(scope, receive, cap)` returns the body, or `None` to refuse it.
+  - It refuses before the first `receive()` when any `Content-Length` header is not all digits or is over the cap.
+  - Otherwise it adds up every `http.request` chunk as it arrives, and refuses as soon as the total passes the cap, so a chunked body is capped on the bytes read. A disconnect is refused too.
+  - `BODY_CAP` (64 KiB) applies to every agent-listener request. The other B01 caps come with their routes: 1 MiB for a Push delivery in Phase 13, and 16 MiB for a File manifest and for an upload in Phase 16a.
+- **Buckets.** `Buckets.take(key, limit, window=60.0)` keeps a sliding window per key, on `time.monotonic`.
+  - A key is an identity (a push id, an agent, an Enrollment code) or a global name, never a client address.
+  - A refused take is not counted, and a key whose window has emptied is dropped. Each process has its own `Buckets`, and uvicorn's single event loop needs no lock.
+  - Wired in Phase 12: only the push listener's global `push` bucket, `PUSH_LISTENER_PER_MINUTE` = 120 a minute.
+  - Wired by the routes that name them: 60 Push deliveries a minute per push id (Phase 13); 600 requests a minute per On-server agent, 10 Enrollment attempts an hour per Enrollment code, and 60 requests a minute in all that name an unknown agent or code (Phase 15b).
+- **Cookies, headers and logs.**
+  - `listener(app)` serves `http` scopes only. It removes every `Cookie` header, whatever its case, from the scope before routing, so a `numen_session` cookie changes nothing. No route sets a cookie.
+  - It wraps the app in `security.SecurityHeaders`, so every response carries the dashboard's CSP, `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+  - There is no access log, because it would record push ids. Nothing logs a header or a body. There are no websockets and no lifespan.
+  - `numen.ingress` imports only the standard library, starlette's `JSONResponse`, `cryptography`, `numen.config.secret_env` and `numen.security`. It never imports `numen.api`, `numen.domain`, `numen.workflows` or `numen.worker`, where jobs, Findings and Alerts are made.
+- **TLS key and pin.**
+  - `NUMEN_AGENT_TLS_KEY` is a P-256 private key, as one line of standard base64 of DER PKCS#8.
+  - `NUMEN_AGENT_TLS_PIN` is the lowercase hex SHA-256 of that key's DER SubjectPublicKeyInfo. On-server agents pin the key, not the certificate, and the Go agent of Phases 15a and 15b must use the same encoding.
+  - At every start, `tls_files` refuses a key that is not P-256 with `ValueError`. It writes `key.pem` and a new self-signed `cert.pem`, each created with `O_EXCL` and mode 0600, into a fresh `mkdtemp()` under the service's `/tmp` tmpfs (`size=1m`, uid and gid 10001, mode 0700).
+  - The certificate has CN `asset-monitor-agent-listener`, SHA-256, a random serial, and validity from one day before the start for 365 days.
+- **Database roles.**
+  - Migration `b8c9d0e1f2a3`, chained from `a7b8c9d0e1f2`, creates `asset_monitor_push` and `asset_monitor_agent` `NOLOGIN` when missing, in one `DO $$ ... IF NOT EXISTS (SELECT FROM pg_roles ...)` block. It grants nothing, and its downgrade drops no role.
+  - `python -m numen.cli ingress-roles` creates a missing role the same way, then runs `ALTER ROLE <role> WITH LOGIN PASSWORD <password> CONNECTION LIMIT 5` and `ALTER ROLE <role> SET statement_timeout = '5s'`, composed with `psycopg.sql`. It grants nothing and can run any number of times.
+  - Without both role passwords, it exits non-zero before it connects, naming `NUMEN_PUSH_DATABASE_PASSWORD` and `NUMEN_AGENT_DATABASE_PASSWORD` and `make init`. Otherwise it prints `Ingress database roles configured`, never the password.
+  - `migrate` runs `alembic upgrade head && python -m numen.cli ingress-roles` on every start.
+  - Each later migration grants and revokes only on the tables it adds. Phase 13's grants must also `GRANT USAGE ON SCHEMA` to the roles: backend tests migrate into non-public schemas, where `PUBLIC` has no `USAGE`, and a database restored by a release-1 `restore.sh` has a `public` without `PUBLIC`'s `USAGE`. `restore.sh` now re-creates `public` as initdb makes it (owner `pg_database_owner`, `USAGE` for `PUBLIC`), which is the ACL `pg_dump` assumes, so a restore keeps the source's schema privileges. Later phases size their SQLAlchemy pools under the connection limit, for example `pool_size` 2 and `max_overflow` 0.
+  - In Phase 12 neither ingress service opens a database connection. The journey's `ingress_check.py` proves both role logins.
+- **Environment split.**
+  - `ingress-push` gets exactly `NUMEN_DATABASE_URL` as `asset_monitor_push` and `NUMEN_INGRESS_KEY`.
+  - `ingress-agent` gets exactly `NUMEN_DATABASE_URL` as `asset_monitor_agent` and `NUMEN_AGENT_TLS_KEY`.
+  - `app` and `worker` also get `NUMEN_INGRESS_KEY`, which is not on the anchor, so the scheduler, `migrate`, `bootstrap-operator` and `backend-tests` do not.
+  - `migrate` gets both role passwords.
+  - Neither ingress service gets `NUMEN_SECRET_KEY`, `NUMEN_BROKER_TOKEN` or the database owner's URL. No service gets `NUMEN_AGENT_TLS_PIN`.
+- **Networks.**
+  - `ingress-push` is on `push-inbound`, a bridge that carries its published port, and on `push-db`, which is internal.
+  - `ingress-agent` is on `agent-inbound` and on `agent-db`, which is internal.
+  - `db` joins `application`, `push-db` and `agent-db`. Neither ingress service is on `application` or `control`, so neither resolves `app` or `runner-broker`. None of the four networks has a fixed name.
+- **`make init`** (`scripts/init.sh`).
+  - When `.env` already holds all five keys, it exits without Docker.
+  - Otherwise, on an existing `.env`, it appends only the missing keys, after a newline if the file lacks a trailing one, and prints their names, never their values. It never changes an existing line or `.numen/bootstrap-password`.
+  - `NUMEN_INGRESS_KEY` is a Fernet key, made like `NUMEN_SECRET_KEY`. Each role password is `secrets.token_urlsafe(32)`.
+  - The TLS key comes from `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -outform DER`, and its pin from `openssl pkey -inform DER -pubout -outform DER`.
+  - A missing pin is derived from the existing key. A pin with no key, or a key that does not decode, stops init with nothing changed.
+- **Backup and restore.**
+  - `backup.sh` pauses and resumes `ingress-push` and `ingress-agent` with app, worker and scheduler. `pg_dump` writes the GRANTs to the roles.
+  - `restore.sh` refuses a backup whose `deployment.env` lacks any of `NUMEN_INGRESS_KEY`, `NUMEN_PUSH_DATABASE_PASSWORD`, `NUMEN_AGENT_DATABASE_PASSWORD` or `NUMEN_AGENT_TLS_KEY`, before any service stops: "Backup deployment.env lacks <keys>. For a backup made before release 2, copy them from the current .env into its deployment.env."
+  - It also stops and resumes both ingress services.
+  - Before `DROP SCHEMA public`, it runs the migration's `DO` block through `psql`, so `database.sql`'s GRANTs load on a fresh volume. `migrate`, on resume or at the next `make up`, gives the roles `LOGIN` again.
+
 ## Quality and verification
 
 Backend uses Python/FastAPI/SQLAlchemy/Alembic and PostgreSQL in Docker; SQLite may be used for cheap deterministic API tests, but PostgreSQL claim/lease behavior must be checked against PostgreSQL. Frontend uses React/TypeScript/Vite. The backend serves built frontend assets at `/` in deployment. All actual source fetches, job execution, and database changes remain observable and durable. Implement all requested workflows; do not fabricate monitoring results or mark provider mocks as verified compatibility.

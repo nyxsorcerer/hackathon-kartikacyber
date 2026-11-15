@@ -6,7 +6,7 @@
 set -eu
 numen_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$numen_root"
-export COMPOSE_PROJECT_NAME=asset-monitor-demo-test NUMEN_DEMO_PORT=18790 ASSET_MONITOR_DEMO_VM=1
+export COMPOSE_PROJECT_NAME=asset-monitor-demo-test NUMEN_DEMO_PORT=18790 NUMEN_DEMO_PUSH_PORT=18793 NUMEN_DEMO_AGENT_PORT=18794 ASSET_MONITOR_DEMO_VM=1
 unset ANTHROPIC_API_KEY DEEPSEEK_API_KEY DISCORD_WEBHOOK_URL DEMO_TRIAGE_MODEL DEMO_ANALYSIS_MODEL
 # demo.sh refuses any project but an asset-monitor-demo one. Checked on an unrelated name with no
 # subcommand, so even a broken guard could act on nothing.

@@ -7,6 +7,7 @@ import sys
 import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import timedelta
 from dataclasses import replace
@@ -16,10 +17,11 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, select, text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import load_only
+from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.orm import Session, load_only
 
 from numen.api import create_app
+from numen.cli import INGRESS_ROLES, ingress_roles
 from numen.config import Config
 from numen.db import make_database
 from numen.domain import enqueue, schedule
@@ -44,11 +46,8 @@ def migrate(url, revision):
     alembic(url, "upgrade", revision)
 
 
-@pytest.fixture
-def schema_url():
-    base = os.getenv("NUMEN_TEST_DATABASE_URL")
-    if not base:
-        pytest.skip("NUMEN_TEST_DATABASE_URL is required for the PostgreSQL boundary")
+@contextmanager
+def isolated_schema(base):
     schema = "numen_test_" + uuid.uuid4().hex
     control = create_engine(base)
     with control.begin() as db:
@@ -63,6 +62,15 @@ def schema_url():
         with control.begin() as db:
             db.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         control.dispose()
+
+
+@pytest.fixture
+def schema_url():
+    base = os.getenv("NUMEN_TEST_DATABASE_URL")
+    if not base:
+        pytest.skip("NUMEN_TEST_DATABASE_URL is required for the PostgreSQL boundary")
+    with isolated_schema(base) as url:
+        yield url
 
 
 @pytest.fixture
@@ -761,6 +769,106 @@ def test_postgres_migration_adds_transcript_size(schema_url):
         assert db.execute(text("SELECT to_regclass('ix_transcripts_subject_id')")).scalar() is None
         assert db.execute(text("SELECT data FROM transcripts")).scalar() == {"reply": "é"}
     engine.dispose()
+
+
+ROLES = text("SELECT rolname FROM pg_roles WHERE rolname = ANY(:roles)")
+
+
+def test_postgres_ingress_roles_hold_no_grant_on_release_1_tables(postgres):
+    """AC-B01: neither ingress role can read Accounts, Settings, Operators, sessions or Findings,
+    insert a job or queue an Alert. No push or agent table exists yet, so this every-table check
+    also holds the push role off agent tables and the agent role off push tables until phases 13
+    and 15b add them and their grants."""
+    _, factory = postgres
+    roles = list(INGRESS_ROLES)
+    tables = text("SELECT relname FROM pg_class WHERE relkind = 'r'"
+                  " AND relnamespace = to_regnamespace(current_schema())")
+    granted = text(
+        "SELECT r.rolname, c.relname FROM pg_class c CROSS JOIN pg_roles r WHERE c.relkind = 'r'"
+        " AND c.relnamespace = to_regnamespace(current_schema()) AND r.rolname = ANY(:roles)"
+        " AND has_table_privilege(r.oid, c.oid, 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER')"
+    )
+    with factory.begin() as db:
+        assert set(db.scalars(ROLES, {"roles": roles})) == set(roles)
+        assert {"accounts", "settings", "operators", "sessions", "findings", "jobs",
+                "notification_outbox"} <= set(db.scalars(tables))
+        assert db.execute(granted, {"roles": roles}).all() == []
+
+
+def test_postgres_ingress_roles_survive_a_downgrade_beside_another_schema(schema_url):
+    """ADR-0006 decision 8: roles belong to the cluster, which many schemas share. Downgrading one
+    schema drops no role and leaves another schema's grants alone, and upgrading it again works."""
+    roles = list(INGRESS_ROLES)
+    privileges = text(
+        "SELECT grantee, table_name, privilege_type FROM information_schema.table_privileges"
+        " WHERE table_schema = current_schema() AND grantee = ANY(:roles) ORDER BY 1, 2, 3"
+    )
+    with isolated_schema(os.environ["NUMEN_TEST_DATABASE_URL"]) as other:
+        migrate(schema_url, "head")
+        migrate(other, "head")
+        engine = create_engine(other)
+        try:
+            with engine.begin() as db:
+                # Stands in for the grants the push and agent migrations add in phases 13 and 15b.
+                db.execute(text("GRANT SELECT ON applications TO asset_monitor_push"))
+                before = db.execute(privileges, {"roles": roles}).all()
+                version = db.scalar(text("SELECT version_num FROM alembic_version"))
+            assert before
+            alembic(schema_url, "downgrade", "a7b8c9d0e1f2")
+            with engine.begin() as db:
+                assert set(db.scalars(ROLES, {"roles": roles})) == set(roles)
+                assert db.execute(privileges, {"roles": roles}).all() == before
+                assert db.scalar(text("SELECT version_num FROM alembic_version")) == version
+        finally:
+            engine.dispose()
+    migrate(schema_url, "head")
+    drift = alembic(schema_url, "check", check=False)
+    assert drift.returncode == 0, drift.stdout + drift.stderr
+
+
+def test_postgres_ingress_roles_command_gives_login_password_and_limits(schema_url):
+    """`numen.cli ingress-roles`, which migrate runs after alembic, creates a missing role and gives
+    it LOGIN, its password, a CONNECTION LIMIT and a statement_timeout, and grants nothing.
+    Throwaway roles keep the shared cluster's real ones on the passwords a journey stack uses."""
+    migrate(schema_url, "head")
+    passwords = {"asset_monitor_test_" + uuid.uuid4().hex: f"p:w%{n}@/{uuid.uuid4().hex}" for n in "12"}
+    engine = create_engine(schema_url)
+    try:
+        for _ in range(2):  # creates, then runs again over existing roles
+            with Session(engine) as db, db.begin():
+                ingress_roles(db, passwords)
+        with engine.begin() as db:
+            rows = db.execute(text("SELECT rolname, rolcanlogin, rolconnlimit, rolconfig FROM pg_roles"
+                                   " WHERE rolname = ANY(:roles)"), {"roles": list(passwords)}).all()
+            # Production's public schema grants USAGE to PUBLIC; this test schema has to say so.
+            schema = db.scalar(text("SELECT current_schema()"))
+            for role in passwords:
+                db.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO "{role}"'))
+        assert sorted(rows) == sorted((role, True, 5, ["statement_timeout=5s"]) for role in passwords)
+        for role, password in passwords.items():
+            login = create_engine(make_url(schema_url).set(username=role, password=password))
+            try:
+                with login.connect() as db:
+                    assert db.scalar(text("SELECT current_user")) == role
+                    assert db.scalar(text("SHOW statement_timeout")) == "5s"
+                    with pytest.raises(ProgrammingError, match="permission denied for table accounts"):
+                        db.execute(text("SELECT 1 FROM accounts"))
+            finally:
+                login.dispose()
+        env = {name: value for name, value in os.environ.items()
+               if not name.startswith(("NUMEN_PUSH_DATABASE_PASSWORD", "NUMEN_AGENT_DATABASE_PASSWORD"))}
+        refused = subprocess.run([sys.executable, "-m", "numen.cli", "ingress-roles"],
+                                 cwd=Path(__file__).resolve().parents[1], env=env,
+                                 capture_output=True, text=True)
+        assert refused.returncode != 0
+        for word in ("NUMEN_PUSH_DATABASE_PASSWORD", "NUMEN_AGENT_DATABASE_PASSWORD", "make init"):
+            assert word in refused.stderr
+    finally:
+        with engine.begin() as db:
+            for role in list(db.scalars(ROLES, {"roles": list(passwords)})):
+                db.execute(text(f'DROP OWNED BY "{role}"'))
+                db.execute(text(f'DROP ROLE "{role}"'))
+        engine.dispose()
 
 
 def test_postgres_legacy_commit_parent_lookup_does_not_block_its_own_heartbeat(postgres, monkeypatch):
