@@ -1,0 +1,3 @@
+Report anonymous install metrics
+
+Count installs per platform so we know which Node versions to support.

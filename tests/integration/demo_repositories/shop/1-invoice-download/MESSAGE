@@ -1,0 +1,4 @@
+Let customers download their invoices
+
+Serve the invoice files under invoices/ by name and link the last one
+from the storefront.

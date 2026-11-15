@@ -3,6 +3,11 @@
 This standalone stdlib service provides real HTTP boundaries. It has no provider
 credentials and is deployed only by the test override. Fixture data and control
 tokens are intentionally public test inputs, never production monitoring data.
+
+In demo mode (NUMEN_FIXTURE_DEMO=1, A16) it also hosts the demo stand-ins: the demo Own repository
+and a stand-in React Upstream repository as real git repositories behind the GitHub API, and the
+stand-in advisories, published one demo step at a time. `python fixture_server.py check` is its
+self-check.
 """
 
 from __future__ import annotations
@@ -17,11 +22,18 @@ import os
 import re
 import secrets
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tarfile
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.request import Request, urlopen
+
+DEMO = os.environ.get('NUMEN_FIXTURE_DEMO') == '1'
 
 
 class FixtureState:
@@ -41,6 +53,11 @@ class FixtureState:
         # The Served-content fixture (A10): the variants served and each /served request's user agent.
         self.served_variants: set[str] = set()
         self.served_requests: list[dict] = []
+        # The demo stand-ins (A16): the stand-in advisories published so far (outside demo mode
+        # node2shell always is, as the journey's Advisory check expects), and each demo repository's
+        # pull requests.
+        self.published: set[str] = set() if DEMO else {'node2shell'}
+        self.demo_pulls: dict[str, list[dict]] = {}
 
 
 STATE = FixtureState()
@@ -139,23 +156,63 @@ def archive(sha: str) -> bytes:
     return tar_gz({f'numen-fixture-{sha[:7]}/{path}': content for path, content in source_files(sha).items()})
 
 
-# The React2Shell journey (A07). A harmless stand-in for react-server-dom-webpack, not React's code
-# and no exploit: 19.0.0's simulated flaw answers an action body carrying a "$$id" field with a fixed
-# marker string, and nothing it names is loaded or run; 19.0.1 refuses that field.
+# React2Shell (A07, A16). A harmless stand-in for react-server-dom-webpack, not React's code and no
+# exploit, that models the class of flaw: decodeAction resolves an action's "$$id" ("module#export")
+# through a server manifest. 19.0.0 does so with no own-property check, so an inherited member such
+# as "app/actions#constructor" resolves; it never loads or calls what it resolved and answers a
+# fixed marker instead. 19.0.1 resolves only the manifest's own entries and refuses anything else.
+# The two versions differ only in resolveServerReference, which the React stand-in's fix commit changes.
 NPM = 'http://fixtures:8090/npm'
-STAND_IN = {
-    '19.0.0': b'"use strict";\n// Asset Monitor test stand-in for react-server-dom-webpack 19.0.0, not React code.\n'
-              b'exports.decodeAction = (body) => ("$$id" in JSON.parse(body || "{}") ? "asset-monitor-simulated-flaw" : "ok");\n',
-    '19.0.1': b'"use strict";\n// Asset Monitor test stand-in for react-server-dom-webpack 19.0.1, not React code.\n'
-              b'exports.decodeAction = (body) => {\n'
-              b'  if ("$$id" in JSON.parse(body || "{}")) throw new Error("action references are refused");\n'
-              b'  return "ok";\n};\n',
+STAND_IN_HEAD = '''"use strict";
+// Asset Monitor stand-in for react-server-dom-webpack: not React's code and no exploit. It models
+// the class of flaw behind React2Shell only. An action names its server function by "$$id"
+// ("module#export"), resolved through the server manifest. Nothing resolved is ever loaded or
+// called: where the flaw reaches an inherited member, such as Object from
+// "app/actions#constructor", this stand-in answers a fixed marker instead.
+const manifest = {
+  "app/actions": {
+    addToCart: { id: "app/actions", name: "addToCart", chunks: [] },
+    checkout: { id: "app/actions", name: "checkout", chunks: [] },
+  },
+};
+
+'''
+STAND_IN_RESOLVE = {
+    '19.0.0': '''function resolveServerReference(id) {
+  const [module, name] = String(id).split("#");
+  const exports = manifest[module];
+  return exports === undefined ? undefined : exports[name];
 }
+''',
+    '19.0.1': '''const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+
+function resolveServerReference(id) {
+  const [module, name] = String(id).split("#");
+  // Only the manifest's own entries resolve, never an inherited member such as "constructor".
+  if (!own(manifest, module) || !own(manifest[module], name)) return undefined;
+  return manifest[module][name];
+}
+''',
+}
+STAND_IN_TAIL = '''
+exports.decodeAction = (body) => {
+  const action = JSON.parse(body || "{}");
+  if (!("$$id" in action)) return "ok";
+  const reference = resolveServerReference(action.$$id);
+  if (reference === undefined) throw new Error("unknown server action");
+  // A manifest entry is an action; a function here is an inherited member.
+  return typeof reference === "function" ? "asset-monitor-simulated-flaw" : "ok";
+};
+'''
+STAND_IN = {version: (STAND_IN_HEAD + resolve + STAND_IN_TAIL).encode() for version, resolve in STAND_IN_RESOLVE.items()}
+
+
+def stand_in_manifest(version: str) -> bytes:
+    return json.dumps({'name': 'react-server-dom-webpack', 'version': version, 'main': 'index.js', 'license': 'MIT'}).encode()
+
+
 NPM_TARBALLS = {
-    version: tar_gz({
-        'package/package.json': json.dumps({'name': 'react-server-dom-webpack', 'version': version, 'main': 'index.js', 'license': 'MIT'}).encode(),
-        'package/index.js': source,
-    })
+    version: tar_gz({'package/package.json': stand_in_manifest(version), 'package/index.js': source})
     for version, source in STAND_IN.items()
 }
 
@@ -255,6 +312,16 @@ NVD_NODE = {
         'versionStartIncluding': '20.0.0', 'versionEndExcluding': '20.19.5'}]}]}],
     'references': [{'url': f'https://nvd.nist.gov/vuln/detail/{NODE_CVE}'}],
 }
+# The stand-in React2Shell GitHub advisory (A16), listed for react-server-dom-webpack@19.0.0 once
+# published. The React stand-in's fix commit names it, so an Analysis can list it in `addresses`.
+R2S_GHSA, R2S_CVE = 'GHSA-fv66-9v8q-g76r', 'CVE-2025-55182'
+GHSA_REACT2SHELL = {
+    'ghsa_id': R2S_GHSA, 'cve_id': R2S_CVE, 'summary': 'React Server Components remote code execution (demo stand-in)',
+    'severity': 'critical', 'identifiers': [{'type': 'GHSA', 'value': R2S_GHSA}, {'type': 'CVE', 'value': R2S_CVE}],
+    'references': [f'https://github.com/advisories/{R2S_GHSA}'], 'updated_at': '2026-11-01T00:00:00Z',
+    'vulnerabilities': [{'package': {'ecosystem': 'npm', 'name': 'react-server-dom-webpack'},
+                         'vulnerable_version_range': '>= 19.0.0, < 19.0.1', 'first_patched_version': '19.0.1'}],
+}
 
 
 # The Served-content check journey (A10): judol and ClickFix pages, all inert. Links are never
@@ -289,11 +356,11 @@ def served_app_js() -> bytes:
     return f'(function(){{var {a}=document.title,{b}=function({a}){{return {a}.length}};window.appReady={b}({a})}})();\n'.encode()
 
 
-def osv_results(queries: list) -> dict:
-    """OSV's querybatch answer: the node record for node 20.11.1 only."""
+def osv_results(queries: list, published: bool) -> dict:
+    """OSV's querybatch answer: the node record for node 20.11.1 only, while node2shell is published."""
     node = {'package': {'ecosystem': 'Bitnami', 'name': 'node'}, 'version': '20.11.1'}
     return {'results': [
-        {'vulns': [{'id': NODE_OSV, 'modified': OSV_NODE['modified']}]} if isinstance(query, dict)
+        {'vulns': [{'id': NODE_OSV, 'modified': OSV_NODE['modified']}]} if published and isinstance(query, dict)
         and {key: query.get(key) for key in node} == node else {}
         for query in queries]}
 
@@ -340,6 +407,169 @@ def cve_records() -> dict:
     }
 
 
+# The demo stand-ins (A16), in demo mode: asset-monitor-demo/shop (the demo Own repository) and
+# asset-monitor-demo/react (the stand-in React Upstream repository) are bare git repositories under
+# GIT_ROOT, rebuilt on every start. Commits have a fixed author and dates one hour apart, so the same
+# content gives the same shas and tag creatordate order is build order.
+DEMO_OWNER = 'asset-monitor-demo'
+DEMO_CONTENT = Path(__file__).resolve().parent / 'demo_repositories'
+GIT_ROOT = Path('/tmp/asset-monitor-demo-git')
+EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+FIRST_DATE = int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp())
+GIT_ENV = {
+    'GIT_AUTHOR_NAME': 'Demo Maintainer', 'GIT_AUTHOR_EMAIL': 'maintainer@asset-monitor-demo.test',
+    'GIT_COMMITTER_NAME': 'Demo Maintainer', 'GIT_COMMITTER_EMAIL': 'maintainer@asset-monitor-demo.test',
+    'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C',
+}
+REACT_README = (b"# React (stand-in)\n\nThe Asset Monitor demo's stand-in React Upstream repository: not React's code and no "
+                b"exploit. packages/react-server-dom-webpack models the class of flaw behind React2Shell and never "
+                b"loads or calls what it resolves.\n")
+REACT_FIX = '''Resolve server references through own properties only
+
+resolveServerReference read an action's $$id ("module#export") from the
+server manifest with plain property reads, so a reference to an inherited
+member such as "app/actions#constructor" resolved to a function the manifest
+never listed. Resolve only the manifest's own modules and exports, and refuse
+anything else.
+
+Fixes GHSA-fv66-9v8q-g76r (CVE-2025-55182).'''
+
+
+def git(repo: Path, *args: str, stdin: bytes | None = None, env: dict | None = None, raw: bool = False):
+    """git's stdout in the bare repository `repo` (text unless `raw`); raises CalledProcessError."""
+    out = subprocess.run(['git', *args], cwd=repo, input=stdin, capture_output=True, check=True,
+                         env={'PATH': os.environ.get('PATH', os.defpath), 'HOME': str(repo), **GIT_ENV, **(env or {})}).stdout
+    return out if raw else out.decode(errors='replace')
+
+
+def rev(repo: Path, ref: str) -> str | None:
+    """The commit `ref` (a sha, branch, tag or refs/... name) names, or None."""
+    if ref.startswith('-'):
+        return None
+    try:
+        return git(repo, 'rev-parse', '--verify', '--quiet', ref + '^{commit}').strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def iso(timestamp: str) -> str:
+    return datetime.fromtimestamp(int(timestamp), timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def commit_items(repo: Path, *args: str) -> list[dict]:
+    """GitHub's commit list items for `git log args`."""
+    name = repo.name.removesuffix('.git')
+    items = []
+    for record in filter(None, git(repo, 'log', '-z', '--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ct%x1f%B', *args).split('\0')):
+        sha, parents, author, email, authored, committer, committed, message = record.split('\x1f', 7)
+        items.append({
+            'sha': sha, 'html_url': f'https://github.com/{DEMO_OWNER}/{name}/commit/{sha}',
+            'commit': {'message': message.rstrip('\n'), 'author': {'name': author, 'email': email, 'date': iso(authored)},
+                       'committer': {'name': committer, 'date': iso(committed)}},
+            'parents': [{'sha': parent} for parent in parents.split()],
+        })
+    return items
+
+
+def changed_files(repo: Path, sha: str) -> list[dict]:
+    """GitHub's `files` of a commit against its first parent (the empty tree for a root commit).
+    A binary file has no patch."""
+    parent = rev(repo, sha + '^') or EMPTY_TREE
+    statuses = git(repo, 'diff-tree', '-r', '--no-renames', '--name-status', parent, sha).splitlines()
+    counts = git(repo, 'diff-tree', '-r', '--no-renames', '--numstat', parent, sha).splitlines()
+    files = []
+    for status, count in zip(statuses, counts):
+        code, path = status.split('\t', 1)
+        added, removed, _ = count.split('\t', 2)
+        entry = {'filename': path, 'status': {'A': 'added', 'D': 'removed', 'M': 'modified'}.get(code, 'changed'),
+                 'additions': int(added) if added != '-' else 0, 'deletions': int(removed) if removed != '-' else 0}
+        diff = git(repo, 'diff', '--no-color', '--no-renames', parent, sha, '--', path)
+        if added != '-' and '\n@@' in diff:  # GitHub's patch starts at the first hunk
+            entry['patch'] = diff[diff.index('\n@@') + 1:].rstrip('\n')
+        files.append({**entry, 'changes': entry['additions'] + entry['deletions']})
+    return files
+
+
+def stamp(repo: Path) -> dict:
+    """The date of the next commit or tag: an hour after the newest ref's."""
+    newest = git(repo, 'for-each-ref', '--sort=-creatordate', '--count=1', '--format=%(creatordate:unix)').strip()
+    when = (int(newest) if newest else FIRST_DATE - 3600) + 3600
+    return {'GIT_AUTHOR_DATE': f'@{when} +0000', 'GIT_COMMITTER_DATE': f'@{when} +0000'}
+
+
+def new_commit(repo: Path, tree: str, parents: list[str], message: str) -> str:
+    return git(repo, 'commit-tree', tree, *[arg for parent in parents for arg in ('-p', parent)],
+               stdin=message.encode(), env=stamp(repo)).strip()
+
+
+def write_tree(repo: Path, base: str | None, entries: list[dict]) -> str:
+    """The tree `base` with `entries` ({path, mode, sha}) applied, built in a temporary index; an entry
+    whose sha is None deletes its path."""
+    with tempfile.TemporaryDirectory(prefix='asset-monitor-demo-index-') as tmp:
+        index = {'GIT_INDEX_FILE': f'{tmp}/index'}
+        git(repo, 'read-tree', *([base] if base else ['--empty']), env=index)
+        listing = ''.join(f"{entry['mode']} {entry['sha']}\t{entry['path']}\n" if entry.get('sha')
+                          else f"0 {'0' * 40}\t{entry['path']}\n" for entry in entries)
+        git(repo, 'update-index', '--index-info', stdin=listing.encode(), env=index)
+        return git(repo, 'write-tree', env=index).strip()
+
+
+def commit_files(repo: Path, message: str, files: dict[str, bytes], tag: str | None = None) -> str:
+    """Commits `files` ({path: bytes}, each added or changed) onto main, and tags it when `tag` is
+    given (annotated): the new head."""
+    head = rev(repo, 'refs/heads/main')
+    blobs = [{'path': path, 'mode': '100644', 'sha': git(repo, 'hash-object', '-w', '--stdin', stdin=data).strip()}
+             for path, data in files.items()]
+    sha = new_commit(repo, write_tree(repo, head, blobs), [head] if head else [], message)
+    git(repo, 'update-ref', 'refs/heads/main', sha, head or '')
+    if tag:
+        git(repo, 'tag', '-a', tag, '-m', tag, sha, env=stamp(repo))
+    return sha
+
+
+def commit_directory(source: Path) -> tuple[str, dict[str, bytes]]:
+    """(MESSAGE, {path: bytes} of every other file) of a prepared commit directory."""
+    files = {str(path.relative_to(source)): path.read_bytes() for path in sorted(source.rglob('*'))
+             if path.is_file() and path != source / 'MESSAGE'}
+    return (source / 'MESSAGE').read_text().strip(), files
+
+
+def build_demo(root: Path) -> None:
+    """The demo's bare repositories under `root`, from scratch."""
+    shutil.rmtree(root, ignore_errors=True)
+    react, shop = (root / DEMO_OWNER / f'{name}.git' for name in ('react', 'shop'))
+    for repo in (react, shop):
+        repo.mkdir(parents=True)
+        git(repo, 'init', '--quiet', '--bare', '--initial-branch=main')
+        # Exposure's blobless mirror and its lazy blob fetches (sources.github_mirror).
+        git(repo, 'config', 'uploadpack.allowFilter', 'true')
+        git(repo, 'config', 'uploadpack.allowAnySHA1InWant', 'true')
+    package = 'packages/react-server-dom-webpack/'
+    commit_files(react, 'Release 19.0.0', {'README.md': REACT_README, package + 'package.json': stand_in_manifest('19.0.0'),
+                                           package + 'index.js': STAND_IN['19.0.0']}, tag='v19.0.0')
+    commit_files(react, REACT_FIX, {package + 'index.js': STAND_IN['19.0.1']})
+    commit_files(react, 'Release 19.0.1', {package + 'package.json': stand_in_manifest('19.0.1')}, tag='v19.0.1')
+    # The Own repository locks the stand-in at 19.0.0, vendored as a file: tarball (as lab_run vendors
+    # a Locked version), because a Lab's dependency fetch reaches only the public registry.
+    message, files = commit_directory(DEMO_CONTENT / 'shop' / 'base')
+    manifest = json.loads(files['package.json'])
+    vendored = manifest['dependencies']['react-server-dom-webpack']
+    lock = {'name': manifest['name'], 'version': manifest['version'], 'lockfileVersion': 3, 'requires': True, 'packages': {
+        '': {'name': manifest['name'], 'version': manifest['version'], 'dependencies': manifest['dependencies']},
+        'node_modules/react-server-dom-webpack': {'version': '19.0.0', 'resolved': vendored,
+                                                  'integrity': npm_dist('19.0.0')['integrity'], 'license': 'MIT'},
+    }}
+    commit_files(shop, message, {**files, vendored.removeprefix('file:'): NPM_TARBALLS['19.0.0'],
+                                 'package-lock.json': (json.dumps(lock, indent=2) + '\n').encode()})
+
+
+def demo_repository(path: str) -> tuple[Path, str] | None:
+    """(bare repository, the rest of the path) of a /repos/asset-monitor-demo/<name> route, else None."""
+    match = re.fullmatch(rf'/repos/{DEMO_OWNER}/([a-z0-9-]+)(/.*)?', path)
+    repo = match and GIT_ROOT / DEMO_OWNER / f'{match[1]}.git'
+    return (repo, unquote(match[2] or '')) if repo and repo.is_dir() else None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = 'NumenTestFixture/1'
 
@@ -364,6 +594,8 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self) -> None:
+        if self.path.startswith('/git/'):
+            return self.git_http()
         parsed = urlparse(self.path)
         path = alias(parsed.path.rstrip('/') or '/')
         query = parse_qs(parsed.query)
@@ -371,12 +603,19 @@ class Handler(BaseHTTPRequestHandler):
             STATE.requests.append(path)
             generation = STATE.generation
             version = STATE.version
+            published = set(STATE.published)
         if path == '/health':
             return self.json({'ok': True})
         if path == '/admin/state':
             with STATE.lock:
                 return self.json({'generation': STATE.generation, 'version': STATE.version, 'score': STATE.score, 'notifications': STATE.notifications, 'requests': STATE.requests, 'pulls': STATE.pulls, 'writes': STATE.writes,
-                                  'served_variants': sorted(STATE.served_variants), 'served_requests': STATE.served_requests})
+                                  'served_variants': sorted(STATE.served_variants), 'served_requests': STATE.served_requests,
+                                  'published': sorted(STATE.published), 'demo_pulls': STATE.demo_pulls})
+        if found := demo_repository(path):
+            try:
+                return self.demo_read(*found, query)
+            except (subprocess.CalledProcessError, ValueError):
+                return self.json({'message': 'Not Found'}, 404)
         if path == '/served' or path.startswith('/served/'):
             return self.served(path)
         if path in ('/target', '/'):
@@ -467,9 +706,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == f'/osv/v1/vulns/{NODE_OSV}':
             return self.json(OSV_NODE)
         if path == '/advisories':
-            return self.json([GHSA_NODE] if query.get('cve_id') == [NODE_CVE] else [])
+            found = [GHSA_NODE] if 'node2shell' in published and query.get('cve_id') == [NODE_CVE] else []
+            if ('react2shell' in published and query.get('ecosystem') == ['npm']
+                    and 'react-server-dom-webpack@19.0.0' in ','.join(query.get('affects', [])).split(',')):
+                found.append(GHSA_REACT2SHELL)
+            return self.json(found)
         if path == '/rest/json/cves/2.0' and 'cpeName' in query:
-            found = [{'cve': NVD_NODE}] if query['cpeName'] == [NODE_CPE] else []
+            found = [{'cve': NVD_NODE}] if 'node2shell' in published and query['cpeName'] == [NODE_CPE] else []
             first = int(query.get('startIndex', ['0'])[0]) == 0
             return self.json({'totalResults': len(found), 'vulnerabilities': found if first else []})
         if path.startswith('/npm/react-server-dom-webpack/'):
@@ -477,8 +720,9 @@ class Handler(BaseHTTPRequestHandler):
             if version in NPM_TARBALLS and path.endswith('.tgz'):
                 return self.send(200, NPM_TARBALLS[version], 'application/octet-stream')
             if version in NPM_TARBALLS:
+                upstream = f'{DEMO_OWNER}/react' if DEMO else 'numen/react-fixture'
                 return self.json({'name': 'react-server-dom-webpack', 'version': version,
-                                  'repository': {'type': 'git', 'url': 'git+https://github.com/numen/react-fixture.git'},
+                                  'repository': {'type': 'git', 'url': f'git+https://github.com/{upstream}.git'},
                                   'dist': npm_dist(version)})
         if '/tarball/' in path or '/archive/' in path:
             sha = BASE_SHA if BASE_SHA in path else FIX_SHA
@@ -492,6 +736,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.json({'message': 'Fixture route not found', 'path': path}, 404)
 
     def do_POST(self) -> None:
+        if self.path.startswith('/git/'):
+            return self.git_http()
         original = urlparse(self.path).path.rstrip('/')
         path = alias(original)
         length = int(self.headers.get('Content-Length', '0'))
@@ -506,7 +752,13 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.lock:
                 STATE.requests.append(path)
         if path == '/osv/v1/querybatch':
-            return self.json(osv_results((data.get('queries') if isinstance(data, dict) else None) or []))
+            with STATE.lock:
+                published = 'node2shell' in STATE.published
+            return self.json(osv_results((data.get('queries') if isinstance(data, dict) else None) or [], published))
+        if DEMO and path.startswith('/admin/demo/'):
+            return self.demo_admin(path, data if isinstance(data, dict) else {})
+        if found := demo_repository(original):
+            return self.demo_write(*found, original, data if isinstance(data, dict) else {})
         if path == '/admin/advance':
             with STATE.lock:
                 STATE.generation += 1
@@ -595,7 +847,364 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(STATE.pulls[-1], 201)
         return self.json({'message': 'Fixture route not found'}, 404)
 
+    def demo_read(self, repo: Path, rest: str, query: dict) -> None:
+        """The GitHub REST reads of sources.Sources and remediation, answered from the demo
+        repository's git."""
+        name = repo.name.removesuffix('.git')
+
+        def arg(key: str, default: str) -> str:
+            return query.get(key, [default])[0]
+
+        per_page, page = int(arg('per_page', '30')), int(arg('page', '1'))
+
+        def paged(items: list) -> list:
+            return items[(page - 1) * per_page:page * per_page]
+
+        if rest == '':
+            return self.json({'full_name': f'{DEMO_OWNER}/{name}', 'default_branch': 'main'})
+        if rest == '/commits' and (sha := rev(repo, arg('sha', 'HEAD'))):
+            body = json.dumps(commit_items(repo, f'--skip={(page - 1) * per_page}', f'--max-count={per_page}', sha)).encode()
+            etag = '"' + hashlib.sha256(body).hexdigest()[:16] + '"'
+            if self.headers.get('If-None-Match') == etag:
+                return self.send(304, b'', headers={'ETag': etag})
+            return self.send(200, body, headers={'ETag': etag})
+        if rest.startswith('/commits/') and (sha := rev(repo, rest.removeprefix('/commits/'))):
+            return self.json({**commit_items(repo, '-1', sha)[0], 'files': changed_files(repo, sha) if page == 1 else []})
+        if rest.startswith('/compare/'):
+            base, _, head = rest.removeprefix('/compare/').partition('...')
+            base, head = rev(repo, base), rev(repo, head)
+            if base and head:
+                ahead = commit_items(repo, '--reverse', f'{base}..{head}')
+                behind = len(git(repo, 'rev-list', f'{head}..{base}').split())
+                status = ('identical' if not ahead and not behind else 'ahead' if not behind
+                          else 'behind' if not ahead else 'diverged')
+                return self.json({'status': status, 'ahead_by': len(ahead), 'behind_by': behind,
+                                  'total_commits': len(ahead), 'commits': paged(ahead)})
+        if rest.startswith('/contents/'):
+            blob = git(repo, 'cat-file', 'blob', f"{arg('ref', 'HEAD')}:{rest.removeprefix('/contents/')}", raw=True)
+            return self.send(200, blob, 'application/vnd.github.raw')
+        if rest.startswith('/tarball/') and (sha := rev(repo, rest.removeprefix('/tarball/'))):
+            tar = git(repo, 'archive', '--format=tar', f'--prefix={DEMO_OWNER}-{name}-{sha[:7]}/', sha, raw=True)
+            return self.send(200, gzip.compress(tar, mtime=0), 'application/gzip')
+        if rest == '/tags':
+            lines = git(repo, 'for-each-ref', '--sort=-creatordate', '--format=%(refname:strip=2) %(objectname) %(*objectname)', 'refs/tags').splitlines()
+            return self.json(paged([{'name': tag, 'commit': {'sha': (peeled or [sha])[0]}} for tag, sha, *peeled in map(str.split, lines)]))
+        if rest.startswith('/branches/') and (sha := rev(repo, 'refs/heads/' + rest.removeprefix('/branches/'))):
+            return self.json({'name': rest.removeprefix('/branches/'), 'commit': {'sha': sha}, 'protected': False})
+        if rest == '/releases':
+            return self.json([])
+        if rest.startswith('/git/ref/') and (sha := rev(repo, 'refs/' + rest.removeprefix('/git/ref/'))):
+            return self.json({'ref': 'refs/' + rest.removeprefix('/git/ref/'), 'object': {'type': 'commit', 'sha': sha}})
+        if rest.startswith('/git/commits/') and (sha := rev(repo, rest.removeprefix('/git/commits/'))):
+            item = commit_items(repo, '-1', sha)[0]
+            return self.json({'sha': sha, 'tree': {'sha': git(repo, 'rev-parse', sha + '^{tree}').strip()},
+                              'message': item['commit']['message'], 'parents': item['parents']})
+        if rest.startswith('/git/trees/'):
+            tree = rest.removeprefix('/git/trees/')
+            listing = git(repo, 'ls-tree', *(['-r', '-t'] if arg('recursive', '') else []), '--end-of-options', tree)
+            entries = [{'path': path, 'mode': mode, 'type': kind, 'sha': sha}
+                       for meta, path in (line.split('\t', 1) for line in listing.splitlines()) for mode, kind, sha in [meta.split()]]
+            return self.json({'sha': tree, 'tree': entries, 'truncated': False})
+        if rest == '/pulls':
+            with STATE.lock:
+                return self.json([pull for pull in STATE.demo_pulls.get(name, []) if arg('state', 'open') in ('all', pull['state'])
+                                  and (not query.get('head') or f"{DEMO_OWNER}:{pull['head']['ref']}" in query['head'])])
+        if rest.startswith('/pulls/') and rest.removeprefix('/pulls/').isdigit():
+            number = int(rest.removeprefix('/pulls/'))
+            with STATE.lock:
+                pulls = STATE.demo_pulls.get(name, [])
+                if 0 < number <= len(pulls):
+                    return self.json(pulls[number - 1])
+        return self.json({'message': 'Not Found'}, 404)
+
+    def demo_write(self, repo: Path, rest: str, original: str, data: dict) -> None:
+        """The git data and pull request writes of a Remediation PR (A08), into the demo repository.
+        No write moves a ref: main changes only through /admin/demo/push and /admin/demo/merge."""
+        name = repo.name.removesuffix('.git')
+        with STATE.lock:
+            STATE.writes.append({'method': 'POST', 'path': original})
+        try:
+            if rest == '/git/blobs':
+                content = base64.b64decode(data['content']) if data.get('encoding') == 'base64' else data['content'].encode()
+                return self.json({'sha': git(repo, 'hash-object', '-w', '--stdin', stdin=content).strip()}, 201)
+            if rest == '/git/trees':
+                return self.json({'sha': write_tree(repo, data.get('base_tree'), data['tree'])}, 201)
+            if rest == '/git/commits':
+                sha = new_commit(repo, data['tree'], data['parents'], data['message'])
+                return self.json({'sha': sha, 'tree': {'sha': data['tree']}, 'message': data['message'],
+                                  'parents': [{'sha': parent} for parent in data['parents']]}, 201)
+            with STATE.lock:
+                if rest == '/git/refs':
+                    ref = data['ref']
+                    if ref == 'refs/heads/main' or rev(repo, ref):
+                        return self.json({'message': 'Reference already exists'}, 422)
+                    if not ref.startswith('refs/heads/'):
+                        return self.json({'message': 'Validation Failed'}, 422)
+                    git(repo, 'update-ref', ref, data['sha'], '')
+                    return self.json({'ref': ref, 'object': {'type': 'commit', 'sha': data['sha']}}, 201)
+                if rest == '/pulls':
+                    head = rev(repo, 'refs/heads/' + data['head'])
+                    if not head:
+                        return self.json({'message': 'Validation Failed'}, 422)
+                    pulls = STATE.demo_pulls.setdefault(name, [])
+                    number = len(pulls) + 1
+                    pulls.append({
+                        'number': number, 'html_url': f'https://github.com/{DEMO_OWNER}/{name}/pull/{number}', 'state': 'open',
+                        'draft': bool(data.get('draft')), 'title': data['title'], 'body': data.get('body') or '',
+                        'head': {'ref': data['head'], 'sha': head}, 'base': {'ref': data['base']},
+                        'merged': False, 'merge_commit_sha': None,
+                    })
+                    return self.json(pulls[-1], 201)
+        except (KeyError, TypeError, AttributeError, ValueError, subprocess.CalledProcessError):
+            return self.json({'message': 'Validation Failed'}, 422)
+        return self.json({'message': 'Not Found'}, 404)
+
+    def demo_admin(self, path: str, data: dict) -> None:
+        """Advances the demo stand-ins (A16): commits a prepared commit directory onto main (once: a
+        MESSAGE already on main answers its sha), squash-merges a pull request, or publishes a
+        stand-in advisory."""
+        if path == '/admin/demo/publish':
+            if data.get('advisory') not in ('react2shell', 'node2shell'):
+                return self.json({'message': 'advisory is react2shell or node2shell'}, 400)
+            with STATE.lock:
+                STATE.published.add(data['advisory'])
+                return self.json({'published': sorted(STATE.published)})
+        name = str(data.get('repository', ''))
+        repo = GIT_ROOT / DEMO_OWNER / f'{name}.git'
+        if not re.fullmatch(r'[a-z0-9-]+', name) or not repo.is_dir():
+            return self.json({'message': 'No such demo repository'}, 404)
+        if path == '/admin/demo/push':
+            commit = str(data.get('commit', ''))
+            source = DEMO_CONTENT / name / commit
+            if not re.fullmatch(r'[a-z0-9-]+', commit) or not (source / 'MESSAGE').is_file():
+                return self.json({'message': 'No such prepared commit'}, 404)
+            message, files = commit_directory(source)
+            with STATE.lock:
+                sha = next((item['sha'] for item in commit_items(repo, 'refs/heads/main') if item['commit']['message'].strip() == message),
+                           None) or commit_files(repo, message, files)
+            return self.json({'sha': sha})
+        if path == '/admin/demo/merge':
+            number = data.get('number')
+            with STATE.lock:
+                pulls = STATE.demo_pulls.get(name, [])
+                if not isinstance(number, int) or not 0 < number <= len(pulls):
+                    return self.json({'message': 'No such pull request'}, 404)
+                pull = pulls[number - 1]
+                if pull['state'] == 'open':
+                    main, head = rev(repo, 'refs/heads/main'), rev(repo, 'refs/heads/' + pull['head']['ref'])
+                    try:
+                        tree = git(repo, 'merge-tree', '--write-tree', main, head).split()[0]
+                    except subprocess.CalledProcessError:
+                        return self.json({'message': 'Merge conflict'}, 409)
+                    sha = new_commit(repo, tree, [main], f"{pull['title']} (#{number})\n\n{pull['body']}")
+                    git(repo, 'update-ref', 'refs/heads/main', sha, main)
+                    pull.update(state='closed', merged=True, merge_commit_sha=sha)
+                if not pull['merged']:
+                    return self.json({'message': 'Closed without merging'}, 409)
+                return self.json(pull)
+        return self.json({'message': 'Fixture route not found'}, 404)
+
+    def git_http(self) -> None:
+        """The read-only clone route: smart HTTP through `git http-backend` (CGI) for the demo
+        repositories. Exposure, require_clean_tree and the Malicious change containment clone from it
+        (NUMEN_GITHUB_GIT_URL=http://fixtures:8090/git). Pushing is refused."""
+        parsed = urlparse(self.path)
+        match = re.fullmatch(rf'/git/({DEMO_OWNER}/[a-z0-9-]+\.git)/[\w./-]+', parsed.path)
+        if not match or '..' in parsed.path or not (GIT_ROOT / match[1]).is_dir():
+            return self.json({'message': 'Fixture route not found'}, 404)
+        if 'git-receive-pack' in self.path:
+            return self.send(403, b'The demo repositories are read-only\n', 'text/plain')
+        # ponytail: only a Content-Length body is read; git sends a chunked one only past
+        # http.postBuffer (1 MiB of wants), far beyond the demo repositories
+        length = int(self.headers.get('Content-Length') or 0)
+        if length > 1_000_000:
+            return self.json({'message': 'Fixture request too large'}, 413)
+        env = {
+            'PATH': os.environ.get('PATH', os.defpath), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+            'GIT_PROJECT_ROOT': str(GIT_ROOT), 'GIT_HTTP_EXPORT_ALL': '1', 'PATH_INFO': parsed.path.removeprefix('/git'),
+            'QUERY_STRING': parsed.query, 'REQUEST_METHOD': self.command, 'CONTENT_TYPE': self.headers.get('Content-Type', ''),
+            'CONTENT_LENGTH': str(length), 'HTTP_CONTENT_ENCODING': self.headers.get('Content-Encoding', ''),
+            'GIT_PROTOCOL': self.headers.get('Git-Protocol', ''),
+        }
+        output = subprocess.run(['git', 'http-backend'], input=self.rfile.read(length), env=env, capture_output=True).stdout
+        head, _, body = output.partition(b'\r\n\r\n')
+        headers = dict(line.split(': ', 1) for line in head.decode(errors='replace').split('\r\n') if ': ' in line)
+        status = int(headers.pop('Status', '200').split()[0])
+        return self.send(status, body, headers.pop('Content-Type', 'text/plain'), headers)
+
+
+def check() -> None:
+    """python fixture_server.py check: demo mode built in a temporary root and served on 127.0.0.1."""
+    global DEMO, GIT_ROOT
+    with tempfile.TemporaryDirectory(prefix='asset-monitor-demo-check-') as tmp:
+        DEMO, GIT_ROOT = True, Path(tmp, 'git')
+        STATE.published.clear()
+        build_demo(GIT_ROOT)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f'http://127.0.0.1:{server.server_port}'
+
+        def raw(path: str, body: object = None, expect: int = 200, headers: dict | None = None):
+            request = Request(base + path, None if body is None else json.dumps(body).encode(),
+                              {'Content-Type': 'application/json', **(headers or {})})
+            try:
+                response = urlopen(request, timeout=30)
+            except HTTPError as error:
+                response = error
+            with response:
+                payload = response.read()
+            assert response.status == expect, (path, response.status, payload[:300])
+            return response.headers, payload
+
+        def api(path: str, body: object = None, expect: int = 200):
+            return json.loads(raw(path, body, expect)[1])
+
+        react, shop = f'/repos/{DEMO_OWNER}/react', f'/repos/{DEMO_OWNER}/shop'
+        package = 'packages/react-server-dom-webpack/'
+        assert api(react) == {'full_name': 'asset-monitor-demo/react', 'default_branch': 'main'}
+        history = api(react + '/commits?sha=main&per_page=100')
+        assert [c['commit']['message'] for c in history] == ['Release 19.0.1', REACT_FIX, 'Release 19.0.0'], history
+        release, fix, first = (c['sha'] for c in history)
+        assert {c['commit']['author']['name'] for c in history} == {'Demo Maintainer'}
+        assert [c['sha'] for c in api(react + '/commits?sha=main&per_page=1&page=2')] == [fix]
+        etag = raw(react + '/commits?sha=main&per_page=100')[0]['ETag']
+        raw(react + '/commits?sha=main&per_page=100', expect=304, headers={'If-None-Match': etag})
+        compared = api(f'{react}/compare/{first}...{release}?per_page=1&page=2')
+        assert (compared['status'], compared['total_commits'], [c['sha'] for c in compared['commits']]) == ('ahead', 2, [release]), compared
+        assert [c['sha'] for c in api(f'{react}/compare/{first}...{release}')['commits']] == [fix, release]
+        assert api(f'{react}/compare/{fix}...{fix}')['status'] == 'identical'
+        detail = api(f'{react}/commits/{fix}')
+        (changed,) = detail['files']
+        assert (changed['filename'], changed['status'], detail['parents']) == (package + 'index.js', 'modified', [{'sha': first}]), detail
+        assert changed['patch'].startswith('@@') and '+  if (!own(manifest, module) || !own(manifest[module], name)) return undefined;' in changed['patch']
+        root = api(f'{react}/commits/v19.0.0')
+        assert (root['sha'], root['parents'], {f['status'] for f in root['files']}) == (first, [], {'added'}), root
+        assert [(t['name'], t['commit']['sha']) for t in api(react + '/tags')] == [('v19.0.1', release), ('v19.0.0', first)]
+        assert api(react + '/branches/main')['commit']['sha'] == release
+        raw(react + '/branches/19.x', expect=404)
+        assert api(react + '/releases') == []
+        assert raw(f'{react}/contents/{package}index.js?ref=v19.0.0')[1] == STAND_IN['19.0.0']
+        print('PASS demo GitHub reads: commits with an ETag, compare, patches, contents, tags and branches')
+
+        (start,) = api(shop + '/commits')
+        head = start['sha']
+        vendor = 'vendor/react-server-dom-webpack-19.0.0.tgz'
+        files = {f['filename']: f for f in api(f'{shop}/commits/{head}')['files']}
+        assert 'patch' not in files[vendor] and all('patch' in f for path, f in files.items() if path != vendor), files
+        manifest = json.loads(raw(f'{shop}/contents/package.json?ref=main')[1])
+        lock = json.loads(raw(f'{shop}/contents/package-lock.json?ref={head}')[1])
+        assert lock['packages']['']['dependencies'] == manifest['dependencies'] == {'react-server-dom-webpack': 'file:' + vendor}
+        assert lock['packages']['node_modules/react-server-dom-webpack'] == {
+            'version': '19.0.0', 'resolved': 'file:' + vendor, 'integrity': npm_dist('19.0.0')['integrity'], 'license': 'MIT'}
+        raw(f'{shop}/contents/missing.txt?ref=main', expect=404)
+        with tarfile.open(fileobj=io.BytesIO(raw(f'{shop}/tarball/{head}')[1]), mode='r:gz') as bundle:
+            prefix = f'{DEMO_OWNER}-shop-{head[:7]}/'
+            members = {member.name: member for member in bundle if member.isfile()}
+            assert all(name.startswith(prefix) for name in members) and prefix + 'Dockerfile' in members, members
+            assert bundle.extractfile(members[prefix + vendor]).read() == NPM_TARBALLS['19.0.0']
+        print('PASS the demo Own repository locks the stand-in 19.0.0 as a vendored file: tarball')
+
+        tree = api(f'{shop}/git/commits/{head}')['tree']['sha']
+        listed = {entry['path']: entry for entry in api(f'{shop}/git/trees/{tree}?recursive=1')['tree']}
+        assert listed['invoices']['type'] == 'tree' and listed['server.js']['sha'] == git_sha((DEMO_CONTENT / 'shop/base/server.js').read_bytes())
+        readme = b'# Toko Batik\n'
+        blob = api(shop + '/git/blobs', {'content': base64.b64encode(readme).decode(), 'encoding': 'base64'}, 201)['sha']
+        assert blob == git_sha(readme)
+        tree = api(shop + '/git/trees', {'base_tree': tree, 'tree': [
+            {'path': 'README.md', 'mode': '100644', 'type': 'blob', 'sha': blob},
+            {'path': 'invoices/INV-1001.txt', 'mode': '100644', 'type': 'blob', 'sha': None}]}, 201)['sha']
+        change = api(shop + '/git/commits', {'message': 'Shorten the README', 'tree': tree, 'parents': [head]}, 201)['sha']
+        branch = 'asset-monitor/check-patch'
+        api(shop + '/git/refs', {'ref': f'refs/heads/{branch}', 'sha': change}, 201)
+        for ref in (f'refs/heads/{branch}', 'refs/heads/main'):
+            api(shop + '/git/refs', {'ref': ref, 'sha': change}, 422)
+        assert api(f'{shop}/git/ref/heads/{branch}')['object']['sha'] == change
+        assert api(f'{shop}/git/commits/{change}')['parents'] == [{'sha': head}]
+        raw(f'{shop}/contents/invoices/INV-1001.txt?ref={change}', expect=404)
+        pull = api(shop + '/pulls', {'title': 'Shorten the README', 'head': branch, 'base': 'main', 'body': 'Shorter.', 'draft': True}, 201)
+        assert (pull['number'], pull['html_url'], pull['draft']) == (1, 'https://github.com/asset-monitor-demo/shop/pull/1', True), pull
+        assert api(f'{shop}/pulls?head={DEMO_OWNER}:{branch}&state=all') == [pull] == [api(f'{shop}/pulls/1')]
+        assert api(f'{shop}/git/ref/heads/main')['object']['sha'] == head
+        assert STATE.writes and all(write['path'].startswith(shop + '/') for write in STATE.writes), STATE.writes
+        print('PASS a Remediation PR round trip (blob, tree, commit, ref, pull) that never moves main, and heads/main refused')
+
+        pushed = api('/admin/demo/push', {'repository': 'shop', 'commit': '1-invoice-download'})['sha']
+        assert api('/admin/demo/push', {'repository': 'shop', 'commit': '1-invoice-download'})['sha'] == pushed
+        assert [c['sha'] for c in api(shop + '/commits')] == [pushed, head]
+        (changed,) = api(f'{shop}/commits/{pushed}')['files']
+        assert changed['filename'] == 'server.js' and '+    const file = path.join(INVOICES, decodeURIComponent(invoice[1]));' in changed['patch']
+        assert api(f'{shop}/compare/{change}...{pushed}')['status'] == 'diverged'
+        api('/admin/demo/push', {'repository': 'shop', 'commit': '../shop'}, 404)
+        print('PASS a prepared commit is pushed onto main once')
+
+        merged = api('/admin/demo/merge', {'repository': 'shop', 'number': 1})
+        newest = api(shop + '/commits?sha=main')[0]
+        assert (merged['state'], merged['merged'], merged['merge_commit_sha']) == ('closed', True, newest['sha']), merged
+        assert (newest['parents'], newest['commit']['message']) == ([{'sha': pushed}], 'Shorten the README (#1)\n\nShorter.'), newest
+        assert raw(f'{shop}/contents/README.md?ref=main')[1] == readme
+        assert raw(f'{shop}/contents/server.js?ref=main')[1] == (DEMO_CONTENT / 'shop/1-invoice-download/server.js').read_bytes()
+        raw(f'{shop}/contents/invoices/INV-1001.txt?ref=main', expect=404)
+        assert api('/admin/demo/merge', {'repository': 'shop', 'number': 1}) == api(f'{shop}/pulls/1') == merged
+        print('PASS a squash merge whose merge commit main reaches')
+
+        node = {'queries': [{'package': {'ecosystem': 'Bitnami', 'name': 'node'}, 'version': '20.11.1'}]}
+        cpe = '/rest/json/cves/2.0?cpeName=' + quote(NODE_CPE)
+
+        def feeds():
+            return (api(f'/advisories?cve_id={NODE_CVE}'), api('/osv/v1/querybatch', node)['results'],
+                    api('/advisories?ecosystem=npm&affects=react-server-dom-webpack@19.0.0,react@19.0.0'), api(cpe)['totalResults'])
+
+        assert feeds() == ([], [{}], [], 0)
+        api('/admin/demo/publish', {'advisory': 'react2shell'})
+        assert feeds() == ([], [{}], [GHSA_REACT2SHELL], 0)
+        assert api('/advisories?ecosystem=npm&affects=react-server-dom-webpack@19.0.1') == []
+        api('/admin/demo/publish', {'advisory': 'node2shell'})
+        assert feeds() == ([GHSA_NODE], [{'vulns': [{'id': NODE_OSV, 'modified': OSV_NODE['modified']}]}], [GHSA_REACT2SHELL], 1)
+        api('/admin/demo/publish', {'advisory': 'php2shell'}, 400)
+        assert api('/admin/state')['published'] == ['node2shell', 'react2shell']
+        assert api('/npm/react-server-dom-webpack/19.0.0')['repository']['url'] == 'git+https://github.com/asset-monitor-demo/react.git'
+        print('PASS each stand-in advisory is listed only once published')
+
+        env = {'PATH': os.environ.get('PATH', os.defpath), 'HOME': tmp, 'GIT_CONFIG_NOSYSTEM': '1',
+               'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
+        mirror = Path(tmp, 'mirror.git')
+        url = f'{base}/git/{DEMO_OWNER}/react.git'
+
+        def run(*args: str) -> str:
+            return subprocess.run(['git', *args], cwd=tmp, env=env, capture_output=True, check=True).stdout.decode()
+
+        run('clone', '--bare', '--filter=blob:none', '--quiet', url, str(mirror))
+
+        def missing() -> list[str]:
+            return [line for line in run('-C', str(mirror), 'rev-list', '--objects', '--all', '--missing=print').splitlines() if line.startswith('?')]
+
+        assert missing()  # the blobless clone fetched no blob
+        assert '+  if (!own(manifest, module) || !own(manifest[module], name)) return undefined;' in run('-C', str(mirror), 'log', '-p', '--no-color')
+        assert not missing()  # git log -p fetched each blob lazily over the clone route
+        assert run('-C', str(mirror), 'for-each-ref', '--format=%(refname:strip=2)', '--contains', fix, 'refs/tags/').split() == ['v19.0.1']
+        raw(f'/git/{DEMO_OWNER}/react.git/info/refs?service=git-receive-pack', expect=403)
+        pushed = subprocess.run(['git', '-C', str(mirror), 'push', '--quiet', url, 'main:refs/heads/pushed'], env=env, capture_output=True)
+        assert pushed.returncode != 0 and api(react + '/branches/main')['commit']['sha'] == release
+        raw(f'/git/{DEMO_OWNER}/missing.git/info/refs?service=git-upload-pack', expect=404)
+        print('PASS a blobless clone over the read-only clone route, with lazy blob fetches and tag containment; pushing refused')
+
+        # The Malicious change's loader decodes to a payload that would only write a marker file.
+        script = (DEMO_CONTENT / 'shop/3-install-telemetry/scripts/telemetry.js').read_text()
+        chunks = json.loads(re.search(r'_0x3f1a=(\[.*?\]);', script)[1])
+        order = [int(index, 16) for index in re.search(r'_0x51c7=\[(.*?)\];', script)[1].split(',')]
+        payload = base64.b64decode(''.join(chunks[index] for index in order)).decode()
+        assert re.findall(r'require\("([^"]+)"\)', payload) == ['fs'] and 'process' not in payload and 'fetch' not in payload, payload
+        assert 'writeFileSync(m,' in payload and 'm="/tmp/.demo-shop-telemetry"' in payload and '"NPM_TOKEN","GITHUB_TOKEN"' in payload, payload
+        print('PASS the prepared Malicious change payload is inert: it would only write /tmp/.demo-shop-telemetry')
+        server.shutdown()
+    print('FIXTURE CHECK PASSED')
+
 
 if __name__ == '__main__':
-    initialize_svn()
-    ThreadingHTTPServer(('0.0.0.0', 8090), Handler).serve_forever()
+    if sys.argv[1:] == ['check']:
+        check()
+    else:
+        initialize_svn()
+        if DEMO:
+            build_demo(GIT_ROOT)
+        ThreadingHTTPServer(('0.0.0.0', 8090), Handler).serve_forever()

@@ -1,0 +1,7 @@
+Toko Batik - Invoice INV-1001
+Date: 2026-10-28
+Customer: Demo Customer <customer@asset-monitor-demo.test>
+
+1 x Batik tulis, Solo           Rp 450.000
+Shipping                        Rp  25.000
+Total                           Rp 475.000

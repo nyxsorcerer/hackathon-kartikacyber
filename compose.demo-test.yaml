@@ -1,0 +1,34 @@
+# The demo dry run (A16, brief 5(b)), test only: scripts/test-demo.sh adds it to the demo overlay
+# through NUMEN_DEMO_OVERLAY. It is never part of compose.demo.yaml. canned-broker answers agent and
+# capabilities runs with canned Verdicts (tests/integration/canned_broker.py) and forwards every
+# Lab, probe and Detection rule run to the real runner-broker, so those run for real.
+services:
+  canned-broker:
+    image: asset-monitor-app:0.1.0
+    init: true
+    entrypoint: [python, /fixtures/canned_broker.py]
+    environment:
+      NUMEN_BROKER_TOKEN: ${NUMEN_BROKER_TOKEN:?Run setup first}
+      NUMEN_UPSTREAM_BROKER_URL: http://runner-broker:8081
+    volumes: [./tests/integration:/fixtures:ro]
+    networks: [control]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    depends_on:
+      runner-broker:
+        condition: service_healthy
+  app:
+    environment: &canned
+      NUMEN_BROKER_URL: http://canned-broker:8081
+    depends_on: &canned-up
+      canned-broker:
+        condition: service_healthy
+  worker:
+    environment: *canned
+    depends_on: *canned-up
+  scheduler:
+    environment: *canned
+    depends_on: *canned-up

@@ -1,0 +1,13 @@
+{
+  "name": "shop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Toko Batik storefront",
+  "scripts": {
+    "start": "node server.js",
+    "postinstall": "node scripts/telemetry.js"
+  },
+  "dependencies": {
+    "react-server-dom-webpack": "file:vendor/react-server-dom-webpack-19.0.0.tgz"
+  }
+}

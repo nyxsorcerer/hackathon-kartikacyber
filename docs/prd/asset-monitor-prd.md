@@ -434,7 +434,7 @@ An Alert is sent when a Finding opens and when a cap is reached, and at no other
 **Demo PHP Application.** It has no Own repository. Its Asset serves judol links only to Googlebot, plus a ClickFix loader tag, for the Served-content check.
 
 **AC-A16:**
-- On a fresh VM, the whole scenario runs from `make up` to the last Remediation PR with no manual database edits.
+- On a fresh VM, the whole scenario runs from `make demo-up` to the last Remediation PR with no manual database edits. `make demo-up` is `make up` plus the local stand-ins (`docs/demo.md`); plain `make up` stays the production entry point with real GitHub, registries and feeds.
 
 ## Non-goals for the first release
 

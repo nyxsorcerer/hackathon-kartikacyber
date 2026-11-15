@@ -23,6 +23,17 @@ USER_AGENTS = {
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
 }
+# The React2Shell stand-in's n-day PoC (also the demo dry run's, canned_broker.py): its action
+# references an inherited member of the server manifest, and it sees the stand-in's marker, never
+# anything executed.
+R2S_POC = (b'import json,os,sys,time,urllib.error,urllib.request\n'
+           b'request=urllib.request.Request(os.environ["TARGET_URL"]+"/action",data=json.dumps({"$$id":"app/actions#constructor"}).encode(),method="POST")\n'
+           b'for _ in range(50):\n'
+           b'    try:\n        body=urllib.request.urlopen(request,timeout=1).read();break\n'
+           b'    except urllib.error.HTTPError as error:\n        body=error.read();break\n'
+           b'    except OSError:time.sleep(0.2)\n'
+           b'else:sys.exit("the application never answered")\n'
+           b'sys.exit(0 if body==b"asset-monitor-simulated-flaw" else 1)\n')
 
 
 class Client:
@@ -342,17 +353,11 @@ def main():
     }, expect=(200, 201))
     disclosure = b'# Server action reference trusted before validation\n\nControlled integration fixture for the numen/react-fixture maintainers, not a real report.\n'
     # The Lab supplies package.json, package-lock.json and server.js from the Own head, with the
-    # Locked version vendored; the PoC sees the stand-in's marker, never anything executed.
+    # Locked version vendored. The PoC's action references an inherited member of the server
+    # manifest; it sees the stand-in's marker, never anything executed.
     r2s_files = {
-        'poc.py': b'import json,os,sys,time,urllib.error,urllib.request\n'
-                  b'request=urllib.request.Request(os.environ["TARGET_URL"]+"/action",data=json.dumps({"$$id":"asset-monitor-probe"}).encode(),method="POST")\n'
-                  b'for _ in range(50):\n'
-                  b'    try:\n        body=urllib.request.urlopen(request,timeout=1).read();break\n'
-                  b'    except urllib.error.HTTPError as error:\n        body=error.read();break\n'
-                  b'    except OSError:time.sleep(0.2)\n'
-                  b'else:sys.exit("the application never answered")\n'
-                  b'sys.exit(0 if body==b"asset-monitor-simulated-flaw" else 1)\n',
-        'report.md': b'# React2Shell stand-in\n\nControlled integration fixture, not a real finding: an action body naming a server reference is answered with a marker.\n',
+        'poc.py': R2S_POC,
+        'report.md': b'# React2Shell stand-in\n\nControlled integration fixture, not a real finding: an action whose server reference names an inherited member is answered with a marker.\n',
         'disclosure-report.md': disclosure,
         'vulnerable-app/Dockerfile': b'FROM asset-monitor-lab:0.1.0\nWORKDIR /app\nCOPY . /app/\nCMD ["node", "server.js"]\n',
         'vulnerable-app/compose.yaml': b'services:\n  app:\n    build: .\n    ports: ["127.0.0.1:18080:8080"]\n',

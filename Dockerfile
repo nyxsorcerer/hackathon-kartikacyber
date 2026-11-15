@@ -27,6 +27,6 @@ FROM app AS test
 USER root
 RUN uv sync --locked --extra dev
 # The loopback-only port test (A15) reads the compose files.
-COPY compose.yaml compose.test.yaml /app/
+COPY compose.yaml compose.test.yaml compose.demo.yaml compose.demo-test.yaml /app/
 USER 10001:10001
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]

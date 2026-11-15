@@ -72,6 +72,7 @@ make test-integration
 make test-runtime
 make test-ui
 make test-journey
+make test-demo
 ```
 
 `test-runtime` explicitly enables actual Docker Engine cases. `test-integration` includes PostgreSQL claims, fencing, persistence, source/CVE workflows, and native-cache handling. Named `CASE` values are validated; unknown cases and empty pytest selections fail.
@@ -81,6 +82,10 @@ The journey uses an isolated `asset-monitor-test` project at http://localhost:18
 ```sh
 ./scripts/compose.sh -p asset-monitor-test -f compose.yaml -f compose.test.yaml down
 ```
+
+## Demo
+
+The demo (A16) runs on a disposable VM only (ADR-0005), with `make demo-up` and `make demo-step STEP=<name>`, under its own `asset-monitor-demo` project on 127.0.0.1:8790. Its repositories, packages, advisories and served pages are local stand-ins, and no real exploit code is used. Follow the run sheet, [docs/demo.md](docs/demo.md). `make test-demo` checks it with no model keys: a smoke test of every step that needs no agent, then a dry run with canned agent decisions (test-only `compose.demo-test.yaml`), both on the isolated `asset-monitor-demo-test` project at http://localhost:18790.
 
 ## Backup and restore
 
@@ -106,4 +111,5 @@ Restore replaces the application database and artifacts with the chosen backup. 
 | [Execution ADR](docs/adr/ADR-0002-agent-execution.md) | Container execution boundary |
 | [Work plan](docs/plans/20261003-feature-numen.md) | Implementation order and proof boundaries |
 | [Coordination contract](docs/implementation-contract.md) | Actual shared API/runtime shapes and ownership |
+| [Demo run sheet](docs/demo.md) | The demo on a disposable VM, step by step |
 | [Evidence register](docs/references.md) | Primary integration sources and inspection evidence |

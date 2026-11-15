@@ -2,7 +2,7 @@ SHELL := /bin/sh
 COMPOSE := ./scripts/compose.sh
 CASE ?= all
 
-.PHONY: init build up down logs check test test-unit test-integration test-runtime test-ui test-journey backup restore reset-password prune
+.PHONY: init build up down logs check test test-unit test-integration test-runtime test-ui test-journey test-demo demo-up demo-step demo-down backup restore reset-password prune
 
 init:
 	./scripts/init.sh
@@ -48,6 +48,22 @@ test-ui: init
 
 test-journey: build
 	./scripts/test-journey.sh
+
+# The demo smoke test (no model keys) and dry run (canned agent decisions, compose.demo-test.yaml)
+# under the isolated asset-monitor-demo-test project.
+test-demo: build
+	./scripts/test-demo.sh
+
+# The demo (A16) on a disposable VM only: see docs/demo.md.
+demo-up: build
+	./scripts/demo.sh up
+
+# One demo step: STEP=1, 2, 3, merge-revert, 4, 5, merge-bump, php-inject or php-clean.
+demo-step:
+	./scripts/demo.sh step "$(STEP)"
+
+demo-down:
+	./scripts/demo.sh down
 
 backup:
 	./scripts/backup.sh $(if $(BACKUP),"$(BACKUP)")

@@ -1641,6 +1641,150 @@ Phase 10 (A13's read-only plugin list and the Pi upgrade, AC-A13's second and th
   - The `dangerouslySetInnerHTML` lint rule also catches a props object key and a member access. A temporary probe file had four forms: the JSX attribute, `createElement` props, a JSX spread object and a quoted key. `eslint` reported four errors, and the probe was then deleted.
   - Runs on Docker Desktop (Engine 20.10, 8 GB), with no request to an outside host: `make build` passed. `make check` passed. `make test-unit` passed: 250 passed; runner 145 passed, 69 skipped. `make test-integration`, with `COMPOSE_PROJECT_NAME=asset-monitor-test` and `COMPOSE_FILE=compose.yaml:compose.test.yaml` so the Operator's database was not used, passed: 612 passed. `make test-runtime` passed: 213 passed, 1 skipped. `make test-ui` passed: 161 passed in 22 files. `make test-journey` passed: `JOURNEY PASSED`, "PASS a container rebuild keeps the Transcripts" and "PASS a backup, an empty project and a restore keep the Transcripts". Its stack was then stopped.
 
+## Phase 11: Demo (2026-11-15)
+
+Phase 11 covers A16 and AC-A16 (the demo Node Application's five steps and the demo PHP Application), ADR-0005's "run every demo on a disposable VM" and A10's demo fixture private range, allowed only on the demo VM. The run sheet is `docs/demo.md`. Everything the demo watches is a local stand-in, and no real exploit code is used. No database change was needed, so there is no Alembic migration.
+
+- **T1, the git-backed GitHub stand-in, the staged advisory feeds and the prepared demo content.**
+  - **Demo mode.** `tests/integration/fixture_server.py` gains a demo mode, switched on by `NUMEN_FIXTURE_DEMO=1`. It is still one server with one Handler. Before it serves anything, it builds bare git repositories under `/tmp/asset-monitor-demo-git`, with `uploadpack.allowFilter` and `allowAnySHA1InWant` set:
+    - `asset-monitor-demo/react` holds three commits: "Release 19.0.0" (annotated tag `v19.0.0`), a fix commit whose message names GHSA-fv66-9v8q-g76r (CVE-2025-55182), and "Release 19.0.1" (`v19.0.1`).
+    - `asset-monitor-demo/shop` is built from `tests/integration/demo_repositories/shop/base/`. The code adds the vendored `vendor/react-server-dom-webpack-19.0.0.tgz` and a lockfileVersion 3 `package-lock.json` that locks 19.0.0 as `file:vendor/...`.
+
+    Commits use a fixed author and dates one hour apart, so a rebuild gives the same shas.
+  - **The GitHub routes.** Everything under `/repos/asset-monitor-demo/<repo>` is answered from git:
+    - the reads Asset Monitor calls, including commits with an ETag and 304, compare, contents, tarball, tags, branches, `git/trees?recursive=1` and pulls;
+    - the writes `git/blobs`, `git/trees`, `git/commits`, `git/refs` (create only) and `pulls`, each recorded in `STATE.writes`.
+
+    `/git/asset-monitor-demo/<repo>.git` runs `git http-backend` for read-only clones, and `git-receive-pack` answers 403. `/admin/demo/push`, `/admin/demo/merge` and `/admin/demo/publish` work in demo mode only.
+  - **The advisory feeds.** In demo mode each stand-in advisory is published one step at a time: React2Shell at step 4, node2shell at step 5. Outside demo mode node2shell is listed from the start, so the journey is unchanged.
+  - **The React stand-in is rewritten.** `decodeAction` resolves an action's `$$id` (`module#export`) through a server manifest. 19.0.0 has no own-property check: an inherited member such as `app/actions#constructor` is answered with the marker `asset-monitor-simulated-flaw`, and nothing is loaded or called. 19.0.1 adds the `hasOwnProperty` check and refuses. The two versions differ only in `resolveServerReference`, which is what the fix commit changes.
+    - This changes the journey's React2Shell PoC body, which now sends `{"$$id": "app/actions#constructor"}`, and the stand-in tarballs' integrity.
+    - The Phase 7 T6 line above that describes 19.0.0's `$$id` behaviour is now historical. `docs/implementation-contract.md` describes the new behaviour.
+  - **The prepared Own-repository content:**
+    - the storefront, whose `POST /action` goes through `decodeAction`, with a Dockerfile `FROM node:20.11.1-alpine` that runs `npm ci`;
+    - step 1, a `GET /invoices/<name>` path traversal;
+    - step 3, a `postinstall` hook and an `_0x` string-array and base64 loader. Its decoded payload only writes `/tmp/.demo-shop-telemetry`, and it names `NPM_TOKEN`, `GITHUB_TOKEN` and `collect.shop-metrics.test` as strings only.
+  - **Tests.**
+    - `python fixture_server.py check`, which `make test-demo` runs in a driver container, asserts the repositories and routes above. That includes a blobless clone whose `git log -p` fetches blobs lazily (`rev-list --missing=print`), `for-each-ref --contains` giving `v19.0.1`, a refused push, and an inert decoded payload.
+    - `make test-journey` was re-run on the new stand-in and passes.
+  - **Ad hoc checks, not committed:**
+    - the real backend clients (Sources, exposure, remediation, dependencies and the advisory clients) ran against a live demo fixture without errors;
+    - the Pre-filter flags step 3;
+    - an offline `npm ci --ignore-scripts` of the step 1 shop in the Lab image succeeded and gave the marker and `root:x:0:0`;
+    - `node --check` parses the three prepared JavaScript files.
+
+- **T2, the demo overlay, `scripts/demo.sh`, the seed through the public API, and the seed's smoke test.**
+  - **`make demo-up`** runs `make build`, then `./scripts/demo.sh up`. That starts `compose.yaml` plus `compose.demo.yaml` under the `asset-monitor-demo` project, with its own volumes, on 127.0.0.1:8790. It then bootstraps the Operator and seeds the demo through the HTTP API, idempotently:
+    - the two stand-in GitHub accounts;
+    - a Provider account for each model key present in the environment, followed by a capability refresh;
+    - the default profiles (decision 11), `dashboard_url` and the Alert webhook;
+    - the Demo Node shop, with its Own repository `asset-monitor-demo/shop` and the derived React Upstream repository at Locked version 19.0.0, both with Baselines;
+    - the Demo PHP storefront, with no repository, two Watched pages and accepted Baselines.
+
+    Keys reach the driver container only by name (`-e NAME`), and no value is printed. With no model keys, the seed prints `NEEDS MODEL KEYS`.
+  - **`demo.sh` guards:**
+    - it accepts only a project named `asset-monitor-demo` or `asset-monitor-demo-*`;
+    - `config | head -n 1` must name that project;
+    - `up` refuses unless `ASSET_MONITOR_DEMO_VM=1`.
+  - **The overlay:**
+    - runner-broker gets `NUMEN_SERVED_CONTENT_FIXTURE_NETWORK=${COMPOSE_PROJECT_NAME}_served` and `NUMEN_NPM_REGISTRY_URL=https://registry.invalid`;
+    - the `served` network is internal and has no fixed name;
+    - `fixtures` publishes no port;
+    - app and worker get `NUMEN_TEST_MODE=1` and the stand-in base URLs.
+  - **Tests:**
+    - `make test-demo` (`scripts/test-demo.sh`) runs both guards safely: an unrelated project name with no subcommand, and `up` with `ASSET_MONITOR_DEMO_VM` empty. It then runs the fixture self-check, `down`, `up` (which seeds) and a second seed, and `demo_check.py smoke seed`. That stage checks no duplicates, the Own and Upstream links and Baselines, the PHP Asset's 4 matching rows with every fetched resource on `toko-batik.test`, and no Finding, Alert, stand-in write or agent job.
+    - `backend/tests/test_deployment.py`: `test_every_published_port_is_bound_to_loopback` now reads all four compose files. `test_the_served_content_fixture_network_is_opened_only_by_an_overlay` is new.
+    - The Dockerfile's test stage copies `compose.demo.yaml` and `compose.demo-test.yaml` for those tests.
+
+- **T3, the scripted demo steps.**
+  - **`make demo-step STEP=<name>`** runs `./scripts/demo.sh step <name>`. The names are `1`, `2`, `3`, `merge-revert`, `4`, `5`, `merge-bump`, `php-inject` and `php-clean`:
+    - steps 1 and 3 push a prepared commit and run Check now;
+    - `2`, `merge-revert` and `merge-bump` squash-merge each open patch, revert or bump Remediation PR in the stand-in and run Check now. With none open they exit 1 and say what to approve first;
+    - step 4 publishes React2Shell, runs the Advisory check and a Backfill of 2 on the React link;
+    - step 5 publishes node2shell and runs the Advisory check;
+    - `php-inject` and `php-clean` switch the served variants and run one Served-content check.
+
+    Each step then waits until no job that runs no agent is still queued or running, and prints what to click.
+  - **What the driver never does:** `demo.py` requests no `/lab-runs` or `/approvals` route. `status` lists the Findings, their Remediation PRs with pull URLs, pending Approvals and the stand-in's pull requests. `login()` waits out the login throttle (429) for up to about 90 s.
+  - **Tests:** `make test-demo` runs every step through `./scripts/demo.sh step`, in run-sheet order, each followed by its `demo_check.py smoke <stage>`:
+    - step 1's import with Triage off;
+    - step 3's Pre-filter flags and its 0-match Advisory check;
+    - step 4's Confirmed, exposed React2Shell advisory Finding with its ready bump, and the Backfill reaching the fix commit;
+    - step 5's single node2shell Finding with its runtime bump, and no duplicate on a second check (AC-A09);
+    - `approve`, which first checks that nothing was approved;
+    - merge detection after `merge-bump`;
+    - `php-inject`'s Googlebot-only link hosts and the ClickFix script host, with `/served/executed` never requested;
+    - `php-clean`'s 4 matching rows.
+
+    Steps 2 and `merge-revert` must fail with the "approve … first" message, and `status` must list the merged bump and the pending React bump.
+
+- **T4, the dry run with canned Verdicts, through a test-only broker overlay.**
+  - **The canned broker.** `tests/integration/canned_broker.py` is a stdlib server that speaks the broker contract.
+    - It answers `agent` and `capabilities` runs at once with canned replies, chosen by operation and by the prepared commit or served change, and never forwards them. Every report says "Canned dry-run reply: no agent ran.", and the catalogue's only model is "Canned dry run, no agent".
+    - An unmatched decision fails with `no_canned_reply`.
+    - It forwards `lab`, `probe` and `detection_rule` runs, and `/health`, to the real runner-broker, so Labs, yara and served-content fetches run for real.
+  - **The test-only overlay.** `compose.demo-test.yaml` adds `canned-broker` and points app, worker and scheduler's `NUMEN_BROKER_URL` at it. Only `scripts/test-demo.sh` adds it, through `NUMEN_DEMO_OVERLAY`, and `compose.demo.yaml` never does.
+  - **Tests:**
+    - `make test-demo`'s second phase runs `canned_broker.py check`, brings up a fresh project with placeholder keys, and checks that the seed output never contains the key and has no `NEEDS MODEL KEYS` line. It then runs `demo_check.py dry-run`, which took about 8 minutes on Docker Desktop.
+    - `test_deployment.py::test_the_canned_dry_run_broker_is_only_in_the_test_overlay`.
+    - `journey.py`'s React2Shell PoC moved to a module-level `R2S_POC`, which the canned broker reuses. The journey was re-run and passes.
+
+- **T5, the run sheet, the README pointer and this record.**
+  - **New `docs/demo.md`:**
+    - the stand-ins and "no real exploit code" stated up front;
+    - prerequisites (a disposable VM with demo-scoped, spend-capped keys; Docker Engine with Compose 2.24 or later, make and git; 4 vCPU, 8 GB RAM with 16 GB recommended, 40 GB disk; the SSH tunnel to 127.0.0.1:8790);
+    - the keys and where they are set (exported in the shell, never in `.env`), the stand-in GitHub tokens the seed creates, and what works without model keys;
+    - every step in order, with its command, what to click, what the audience sees and how long it takes;
+    - troubleshooting, teardown, and the `make demo-up` deviation.
+  - **README.md** gains a Demo section, `make test-demo` in the Checks list and the run sheet in the documents table. `docs/implementation-contract.md` gains a Demo overlay bullet and the rewritten stand-in's behaviour. `runner/README.md` gains a sentence on the overlay's fixture network and `registry.invalid`.
+  - **The run-sheet check.** `scripts/test-demo.sh` checks that `docs/demo.md` names `make demo-step STEP=<name>` for every name in `demo.py`'s `STEPS`. The check failed before `docs/demo.md` existed ("docs/demo.md does not name make demo-step STEP=1.") and passes now.
+  - **A Linux host.** `.numen/bootstrap-password` is mode 0600 and owned by the host user. The image's uid 10001 could not read the bind-mounted file on a Linux VM, so the scenario would need a manual step there. `demo.sh` therefore runs `bootstrap-operator` and the driver with `--user "$(id -u):$(id -g)"`. Neither writes outside the database and `/tmp`. `make test-demo` passes with this change on Docker Desktop. Docker Desktop maps file ownership, so the Linux case itself is still unobserved and is left to the Operator's VM run. `docs/demo.md` no longer carries the `chgrp 10001` workaround.
+  - **The dry-run overlay stays out of the real demo.** `demo.sh` refuses a set `NUMEN_DEMO_OVERLAY` on any project but `asset-monitor-demo-test`, so a stale export cannot put canned Verdicts on the real `asset-monitor-demo` dashboard. `make test-demo` checks this guard first, together with the project and `ASSET_MONITOR_DEMO_VM` guards.
+  - **The overlay's `NUMEN_TEST_MODE` comment** in `compose.demo.yaml` now lists its three side effects, as the contract does: the relaxed webhook check, http git clones and no NVD pacing.
+
+- **Phase 11 acceptance, each mapped to its tests.**
+  - **AC-A16** (on a fresh VM, the whole scenario runs to the last Remediation PR with no manual database edits) is proven under canned agents by `make test-demo`'s dry run, `demo_check.py dry-run`.
+    - It runs on a fresh `asset-monitor-demo-test` project from `demo.sh up`, the same seed `make demo-up` runs, then every step in run-sheet order through `demo.py`'s own `step()`, and ends at the node2shell runtime bump's draft pull request, the last Remediation PR.
+    - Only agent decisions are canned: the broker's `/state` shows only `agent` and `capabilities` canned, and `lab`, `probe` and `detection_rule` forwarded.
+    - `demo.py` and `demo_check.py` use only the HTTP API and the stand-in's routes, never the database.
+    - The real-key run on a fresh VM was not performed (see below).
+  - **Step 1** (Vulnerability introduced, Lab Proof after Approval, patch Remediation PR): `demo_check.py` `dry_step_1` (Finding Open by the Verdict, bundle complete, patch ready, no Lab before Approval; Lab verified and Confirmed by proof; draft pull request on `asset-monitor/<sha7>-patch`). The smoke stage `1` covers the intake with no agent.
+  - **Step 2** (merging the patch Remediates the Finding): `dry_step_2`. Merge detection with no agent is covered by the smoke stage `merge-bump`.
+  - **Step 3** (Malicious change and its Cure): `dry_step_3`. It checks Confirmed by a validated Detection rule, the indicator files, a cleanup report naming the commit and `NPM_TOKEN`/`GITHUB_TOKEN`, a ready revert, a Lab refused with 409 `lab_not_allowed`, and the revert approved and merged (Remediated). The smoke stage `3` covers the Pre-filter flags.
+  - **Step 4** (Backfill reaches the fix commit, Vulnerability fix and exposed, shared with the advisory match, n-day Proof after Approval, bump Remediation PR): `dry_step_4`. It checks `fix_commit_id` on the advisory Finding, the Exposure "v19.0.0 does not contain the fix" with target `v19.0.1`, a single open Finding, the Lab verified at Locked version 19.0.0 on the Own head, and one bump opened on the shop stand-in only. The smoke stage `4` covers everything that needs no agent.
+  - **Step 5** (the Advisory check opens node2shell): smoke stage `5` and `dry_step_5`, which approves its runtime bump.
+  - **The demo PHP Application** (judol links only to Googlebot, plus a ClickFix loader tag): smoke stages `php-inject` and `php-clean` cover the fingerprints and Baselines. `dry_php` covers the 3 served-content Findings, each Confirmed by a validated Detection rule, with no Remediation PR and no Lab, Remediated by `baseline_match` after `php-clean`.
+  - **Alerts:** one fixed-template Alert per opened Finding, 7 in all (`dry_run`).
+  - **A10's demo fixture private range, demo VM only:** `test_deployment.py::test_the_served_content_fixture_network_is_opened_only_by_an_overlay`, and the smoke seed's check that every fetched resource is on `toko-batik.test`.
+  - **ADR-0005, demos on a disposable VM:** the `demo.sh` guards, which `make test-demo` checks first (`ASSET_MONITOR_DEMO_VM=1` for `up`, and the project name), plus `docs/demo.md`'s prerequisites. The canned broker stays out of the demo: `test_the_canned_dry_run_broker_is_only_in_the_test_overlay`.
+  - **The scripts never approve:** `make test-demo`'s grep of `demo.py`, and the `approve` stage's check that no Finding has an approved event.
+  - **A15's loopback-only publishing:** `test_every_published_port_is_bound_to_loopback`, over all four compose files.
+  - **Known failures:** none.
+
+- **Deviations, for the orchestrator to record.** No PRD, ADR or glossary file was edited.
+  - AC-A16 says "from `make up`". On the demo VM the scenario runs from `make demo-up`: `make build`, then the normal stack plus the stand-ins under `asset-monitor-demo`, then the seed. `make up` stays the Operator's production entry point.
+  - The demo project sets `NUMEN_TEST_MODE=1` to point the base URLs at the stand-ins. That also relaxes the Discord-only webhook check, NVD pacing and git's https-only clone protocol inside the demo project.
+  - The stand-in advisories are published per step. Real feeds would list both from the start.
+  - Pull request links point at github.com, where they do not exist. The stand-in holds the pull requests, and `./scripts/demo.sh status` lists them.
+  - The node2shell and php2shell CVE ids are still unconfirmed (a PRD risk). The demo uses only stand-in feeds.
+
+- **Runs** on Docker Desktop (Engine 20.10, 8 GB), with no request to an outside host and the Operator's `asset-monitor` project on 127.0.0.1:8788 left untouched, on the final code:
+  - `make build` passed. `make check` passed, and passed again after the last change.
+  - `make test-unit` passed: 250 passed; runner 145 passed, 69 skipped.
+  - `make test-integration` passed: 614 passed. It ran with `COMPOSE_PROJECT_NAME=asset-monitor-test` and `COMPOSE_FILE=compose.yaml:compose.test.yaml`, so the Operator's database was not used. The 2 tests added since Phase 10 are the new `test_deployment.py` tests.
+  - `make test-runtime` passed: 213 passed, 1 skipped.
+  - `make test-ui` passed: 161 passed in 22 files.
+  - `make test-journey` passed: `JOURNEY PASSED`, "PASS a container rebuild keeps the Transcripts" and "PASS a backup, an empty project and a restore keep the Transcripts". Its `asset-monitor-test` stack was then stopped without `-v`.
+  - `make test-demo` passed from scratch on `asset-monitor-demo-test` (127.0.0.1:18790), after the journey and never at the same time: `DEMO SMOKE PASSED` and `DEMO DRY RUN PASSED`. It printed every `PASS` line of the guards, "docs/demo.md names every demo step", the fixture check, the canned broker check (whose deliberate unmatched commit logs `no canned reply`), the seed, each step's smoke stage and each dry-run step, 7 Alerts and the broker split. Its containers, networks and volumes were removed afterwards.
+
+- **Operator-dependent check.** The real-key run on a fresh VM was not performed here, because it means paid inference.
+  - **What it needs from the Operator:** a disposable VM, `ANTHROPIC_API_KEY` and `DEEPSEEK_API_KEY` (with `DEMO_ANALYSIS_MODEL` and `DEMO_TRIAGE_MODEL`), then `make demo-up` and `docs/demo.md` step by step.
+  - **Not exercised here:**
+    - the seed's real-key path: account creation, the capability refresh, model and profile selection, and `triage_mode` `pi`;
+    - real Triage and Analysis Verdicts;
+    - a Linux host's file permissions.
+  - **Why it can differ from the dry run:** real agents are not deterministic. The prepared commits are designed so the intended Verdict follows from the diff alone (the fix commit's message names GHSA-fv66-9v8q-g76r), but a real Analysis may still differ. Each squash-merged Remediation PR commit also gets a paid Triage, and maybe an Analysis.
+
 ## Commit review correction (2026-10-06)
 
 Program selection now precedes global review and only that program's records are fetched; switching programs clears the previous queue. New triage output includes a potential issue title and fix/hardening/introduction kind. Complete unrelated results are dismissed, incomplete evidence stays pending, and manual review actions after job submission take precedence. Jev's three typed questions follow its official contract; existing source messages and legacy reports remain readable without inventing classifications.
@@ -1692,7 +1836,7 @@ The Pi image's shrinkwrapped brace-expansion vulnerability is repaired using a p
 
 ## Operator-dependent checks
 
-No paid model inference, personal provider login, production-target testing, or actual Discord-channel delivery was performed. Connect operator-owned accounts, refresh model/effort capabilities, and check eligible API/subscription access before running agent work. Native Pi headless login setup is unsupported. Claude subscription login (authorization-code paste) and session import are available, but completing that login needs an operator account and was verified only with a synthetic CLI. Codex device login is account/workspace-dependent.
+No paid model inference, personal provider login, production-target testing, or actual Discord-channel delivery was performed. Connect operator-owned accounts, refresh model/effort capabilities, and check eligible API/subscription access before running agent work. Native Pi headless login setup is unsupported. Claude subscription login (authorization-code paste) and session import are available, but completing that login needs an operator account and was verified only with a synthetic CLI. Codex device login is account/workspace-dependent. The demo's real-key run on a fresh disposable VM (AC-A16 with real agents, `docs/demo.md`) was not performed, because it means paid inference. Only the canned-agent dry run of `make test-demo` was run (Phase 11).
 
 ## Codex device-login regression
 

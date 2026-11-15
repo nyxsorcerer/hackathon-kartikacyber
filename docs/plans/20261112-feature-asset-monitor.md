@@ -142,7 +142,7 @@ Tests make no paid model requests and send no traffic to real Assets or Upstream
 - Seed the PHP demo Application (no Own repository), whose Asset serves judol and ClickFix.
 - Write a run sheet for the disposable VM.
 
-**Done when:** AC-A16 passes on a fresh VM from `make up`.
+**Done when:** AC-A16 passes on a fresh VM from `make demo-up` (`make up` plus the local stand-ins; see `docs/demo.md`).
 
 ## Later (after the first release)
 

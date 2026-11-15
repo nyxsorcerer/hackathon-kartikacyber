@@ -1,0 +1,55 @@
+# The demo overlay (A16, ADR-0005): the normal stack plus the local stand-ins, for a disposable VM
+# only. Run it through ./scripts/demo.sh, which names its own project (asset-monitor-demo) so its
+# containers, networks and volumes never touch the Operator's asset-monitor project. The
+# repositories, packages, advisories and served site are all stand-ins served by `fixtures`; only
+# the model providers are real.
+services:
+  fixtures:
+    image: asset-monitor-app:0.1.0
+    user: root
+    environment:
+      NUMEN_FIXTURE_DEMO: "1"
+    entrypoint: [/fixtures/start.sh]
+    volumes: [./tests/integration:/fixtures:ro]
+    networks:
+      application:
+      # The Served-content stand-in (A10): a check's gateway joins this network and reaches only
+      # its range. toko-batik.test is the demo PHP Application's Asset; cdn.clickfix-fixture.test
+      # poses as the ClickFix loader's external script host. Both are the fixture itself.
+      served:
+        aliases: [toko-batik.test, cdn.clickfix-fixture.test]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8090/health', timeout=3)"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+  app:
+    environment: &demo-env
+      # Points the base URLs below at the stand-ins. It also relaxes the Discord-only webhook check
+      # (any http(s) Alert target is accepted), allows git clones over http and skips NVD pacing
+      # (docs/implementation-contract.md, Demo overlay).
+      NUMEN_TEST_MODE: "1"
+      NUMEN_GITHUB_API_URL: http://fixtures:8090
+      NUMEN_GITHUB_GIT_URL: http://fixtures:8090/git
+      NUMEN_NPM_REGISTRY_URL: http://fixtures:8090/npm
+      NUMEN_PACKAGIST_URL: http://fixtures:8090/packagist
+      NUMEN_OSV_URL: http://fixtures:8090/osv
+      NUMEN_NVD_API_URL: http://fixtures:8090/rest/json/cves/2.0
+    depends_on:
+      fixtures:
+        condition: service_healthy
+  worker:
+    environment: *demo-env
+    depends_on:
+      fixtures:
+        condition: service_healthy
+  runner-broker:
+    environment:
+      # Labs vendor the stand-in package, so their dependency fetch never reaches a registry.
+      NUMEN_NPM_REGISTRY_URL: https://registry.invalid
+      # The demo fixture's private range (A10), opened by this overlay only: this project's own
+      # served network.
+      NUMEN_SERVED_CONTENT_FIXTURE_NETWORK: ${COMPOSE_PROJECT_NAME}_served
+networks:
+  served:
+    internal: true
