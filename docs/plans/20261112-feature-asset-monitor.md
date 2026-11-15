@@ -146,6 +146,8 @@ Tests make no paid model requests and send no traffic to real Assets or Upstream
 
 ## Later (after the first release)
 
+The On-server agent, Push webhooks and the PHP Lab moved to release 2: see `docs/prd/asset-monitor-r2-prd.md` and `docs/plans/20261115-feature-asset-monitor-r2.md`.
+
 - The On-server agent, which reports file changes on the server and can remove a Malicious change there.
 - Push webhooks through the private tunnel.
 - A PHP Lab.

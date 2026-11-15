@@ -438,9 +438,9 @@ An Alert is sent when a Finding opens and when a cap is reached, and at no other
 
 ## Non-goals for the first release
 
-- The On-server agent, which would report file changes on the server and remove a Malicious change there.
-- GitHub push webhooks or any other public inbound endpoint.
-- A PHP Lab.
+- The On-server agent, which would report file changes on the server and remove a Malicious change there. Moved to release 2, where it moves files into a Quarantine folder after Approval instead of removing them (`docs/prd/asset-monitor-r2-prd.md`, B03 to B08).
+- GitHub push webhooks or any other public inbound endpoint. Push webhooks moved to release 2, where the ingress's push listener is the only public endpoint (`docs/prd/asset-monitor-r2-prd.md`, B01 and B02).
+- A PHP Lab. Moved to release 2 (`docs/prd/asset-monitor-r2-prd.md`, B09).
 - Discord buttons or a bot.
 - Multiple Operators or human roles.
 - Installing Pi plugins from the dashboard.
