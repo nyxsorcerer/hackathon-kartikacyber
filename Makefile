@@ -1,8 +1,10 @@
 SHELL := /bin/sh
 COMPOSE := ./scripts/compose.sh
 CASE ?= all
+AGENT_GO_IMAGE := golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
+AGENT_GO := docker run --rm --network none -v "$(CURDIR)/agent:/src" -w /src -e GOFLAGS=-mod=readonly -e GOTOOLCHAIN=local -e GOPROXY=off -e CGO_ENABLED=0 $(AGENT_GO_IMAGE)
 
-.PHONY: init build up down logs check test test-unit test-integration test-runtime test-ui test-journey test-demo demo-up demo-step demo-down backup restore reset-password prune
+.PHONY: agent test-agent init build up down logs check test test-unit test-integration test-runtime test-ui test-journey test-demo demo-up demo-step demo-down backup restore reset-password prune
 
 init:
 	./scripts/init.sh
@@ -73,3 +75,15 @@ restore:
 
 reset-password:
 	$(COMPOSE) --profile setup run --rm -e NUMEN_ADMIN_PASSWORD_FILE= bootstrap-operator python -m numen.cli reset-password
+
+# The On-server agent: both binaries and SHA256SUMS in agent/dist/, and its Go checks.
+agent:
+	$(AGENT_GO) ./build.sh dist
+
+# Also builds twice with fresh caches: the two must be byte-identical and match agent/dist/SHA256SUMS
+# when it exists. TestDistBinaries then checks both binaries are static (no PT_INTERP, no DT_NEEDED).
+test-agent:
+	$(AGENT_GO) sh -c 'set -e; test -z "$$(gofmt -l .)"; go vet ./...; \
+	  GOCACHE=/tmp/c1 ./build.sh /tmp/b1 >/dev/null; GOCACHE=/tmp/c2 ./build.sh /tmp/b2 >/dev/null; \
+	  cmp /tmp/b1/SHA256SUMS /tmp/b2/SHA256SUMS; if [ -f dist/SHA256SUMS ]; then cmp /tmp/b1/SHA256SUMS dist/SHA256SUMS; fi; \
+	  AGENT_DIST=/tmp/b1 go test -count=1 ./...'
