@@ -1,4 +1,4 @@
-// Command asset-monitor-agent is the On-server agent of Asset Monitor (ADR-0007).
+// Command asset-monitor-agent is the On-server agent of GarudaNetra (ADR-0007).
 //
 //	asset-monitor-agent enroll --url URL --tls-pin PIN --dashboard-key KEY --key-id ID --agent-id ID --allow PATH...
 //	asset-monitor-agent repin --key KEY --key-id ID
@@ -267,7 +267,7 @@ func writeRootFile(dir, name string, data []byte, mode os.FileMode) error {
 func renderUnit(allowed []string, listenerIP string) string {
 	var b strings.Builder
 	b.WriteString(`[Unit]
-Description=Asset Monitor On-server agent
+Description=GarudaNetra On-server agent
 After=network-online.target
 Wants=network-online.target
 

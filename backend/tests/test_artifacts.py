@@ -736,7 +736,7 @@ def test_webhook_failure_retry_retains_its_identity(system, monkeypatch):
     queued = client.post("/api/settings/webhook/test").json()["job_id"]
     run_once(config, app.state.factory, FixtureBroker())
     # The test button uses the one Alert template.
-    assert sent == [{"content": "Asset Monitor: Webhook test\nhttp://localhost:8080/", "allowed_mentions": {"parse": []}}]
+    assert sent == [{"content": "GarudaNetra: Webhook test\nhttp://localhost:8080/", "allowed_mentions": {"parse": []}}]
     note = client.get("/api/notifications").json()["items"][0]
     assert note["status"] == "failed" and note["error"]["code"] == "webhook_http_error"
     assert client.get(f"/api/jobs/{queued}").json()["result"]["status"] == "failed"

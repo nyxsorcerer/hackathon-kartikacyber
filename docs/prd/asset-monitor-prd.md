@@ -1,6 +1,6 @@
-# PRD: Asset Monitor
+# PRD: GarudaNetra
 
-Status: agreed in a design-grilling session on 2026-11-12, then revised after an adversarial review of the documents against Numen's code. Asset Monitor is a fork of Numen (ADR-0003), and this document lists only what differs from the fork's `docs/prd/numen-prd.md` at commit `4970c7b`. Every Numen requirement and acceptance criterion not changed here stays in force. Terms are defined in `GLOSSARY.md`.
+Status: agreed in a design-grilling session on 2026-11-12, then revised after an adversarial review of the documents against Numen's code. GarudaNetra is a fork of Numen (ADR-0003), and this document lists only what differs from the fork's `docs/prd/numen-prd.md` at commit `4970c7b`. Every Numen requirement and acceptance criterion not changed here stays in force. Terms are defined in `GLOSSARY.md`.
 
 ## Overview
 
@@ -10,7 +10,7 @@ A self-hosted, all-Docker dashboard that watches the Operator's Applications for
 
 ### Background
 
-A Numen Program pairs an Asset with the upstream software it runs (a CMS or plugin). Numen triages that software's commits with a chosen agent, model and effort, alerts on Discord, and builds Proof, report and Lab bundles. Asset Monitor adds:
+A Numen Program pairs an Asset with the upstream software it runs (a CMS or plugin). Numen triages that software's commits with a chosen agent, model and effort, alerts on Discord, and builds Proof, report and Lab bundles. GarudaNetra adds:
 
 - Own repositories;
 - Upstream repositories shared across Applications, with Exposure;
@@ -253,7 +253,7 @@ Lab limits:
 - the secrets its payload could reach, which must be rotated;
 - the Detection rule to run on the server.
 
-Asset Monitor never sends it.
+GarudaNetra never sends it.
 
 **AC-A07:**
 - A Lab build cannot run a dependency install script.
@@ -270,7 +270,7 @@ Asset Monitor never sends it.
 **Opening.** After Approval, application code opens a **draft** pull request on a branch named `asset-monitor/<short-sha>-<action>` in the Own repository, from exactly the approved diff.
 - It uses a separate fine-grained token (Contents and Pull requests: read and write) limited to Own repositories.
 - That token is never present in an agent run.
-- Asset Monitor never pushes to a default branch, never merges, and never writes to an Upstream repository or to a server.
+- GarudaNetra never pushes to a default branch, never merges, and never writes to an Upstream repository or to a server.
 - Each (Application, subject, action) has an idempotency key.
 
 **Merging.** The Operator merges. When the poller sees the PR's merge commit on the Own repository's default branch, the Finding becomes Remediated.
@@ -283,7 +283,7 @@ Asset Monitor never sends it.
 
 ### A09: Advisory check
 
-**What is collected.** Daily, and whenever a lockfile, manifest or Dockerfile changes, Asset Monitor collects:
+**What is collected.** Daily, and whenever a lockfile, manifest or Dockerfile changes, GarudaNetra collects:
 - each Application's pinned runtime versions: the Dockerfile's `FROM` image tag, `.nvmrc`, `engines`, and the `composer.json` platform setting;
 - its package versions and Locked versions.
 
@@ -415,7 +415,7 @@ An Alert is sent when a Finding opens and when a cap is reached, and at no other
 - Every Approval request carries the Operator's password, which is checked on that request. There is no re-authentication window.
 - Diffs, reports, agent output and Transcripts are rendered as escaped text under a Content Security Policy that forbids inline script.
 - Upstream Proofs are never posted or exported, including by artifact download. This overrides Numen's AC-12 for Upstream Findings.
-- The Disclosure report is shown for the Operator to copy into the Upstream repository's GitHub private vulnerability reporting form. Asset Monitor never sends it.
+- The Disclosure report is shown for the Operator to copy into the Upstream repository's GitHub private vulnerability reporting form. GarudaNetra never sends it.
 
 **AC-A15:**
 - A commit message containing `<script>` renders as text.
@@ -478,7 +478,7 @@ The Operator delegated these on 2026-11-12. Each one can be changed by editing t
 
 - Building Labs from code attackers can influence, through the Docker socket, is accepted on a disposable host (ADR-0005).
 - Prompt injection can still distort a Verdict (ADR-0004).
-- Numen's automated tests never use paid inference, and no real Discord delivery is recorded (`docs/verification.md`). Operator-run analyses on real Provider accounts have succeeded, but API-key-only automated runs at Asset Monitor's volume have not been tried.
+- Numen's automated tests never use paid inference, and no real Discord delivery is recorded (`docs/verification.md`). Operator-run analyses on real Provider accounts have succeeded, but API-key-only automated runs at GarudaNetra's volume have not been tried.
 - Exposure depends on tag naming and patch-id matching. When either fails, the result is unknown, which is treated as exposed.
 - Herdr downloads agent-detection manifests remotely, so agent status detection can change without a Herdr upgrade.
 - The CVE ids for php2shell and node2shell come from web research on 2026-11-12. Confirm them against OSV before the demo.

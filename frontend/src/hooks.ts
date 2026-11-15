@@ -187,7 +187,7 @@ export function useDebounced<T>(value: T, ms = 250) {
 }
 export function useDocumentTitle(title: string | undefined) {
   useEffect(() => {
-    if (title) document.title = `${title} · Numen`;
+    if (title) document.title = `${title} · GarudaNetra`;
   }, [title]);
 }
 /** Runs `handler` for single-key shortcuts when focus is not in a text field. */

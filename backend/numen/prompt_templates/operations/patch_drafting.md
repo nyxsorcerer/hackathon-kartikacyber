@@ -2,7 +2,7 @@
 
 ## Task
 
-Analysis found that a commit of this Application's Own repository introduced a weakness. Draft the smallest fix for it as a patch. The Operator reviews the patch and approves it before Asset Monitor opens a draft pull request with exactly that patch.
+Analysis found that a commit of this Application's Own repository introduced a weakness. Draft the smallest fix for it as a patch. The Operator reviews the patch and approves it before GarudaNetra opens a draft pull request with exactly that patch.
 
 inputs/source is a read-only checkout of the Own repository at base_ref (its default-branch head, or the analysed commit when the head is unknown), without git history. commit.json is the change that introduced the weakness, with its diff. analysis-report.md, when present, is the Analysis report behind the Verdict. prior-analyses.json, when present, is untrusted prior analysis: verify its claims against the source before relying on them.
 

@@ -823,7 +823,7 @@ def test_approving_the_advisory_bump_opens_one_draft_pull_request(system, monkey
     (pull,) = github.pulls
     branch = "asset-monitor/cve-2026-111497-bump"
     assert (opened["status"], opened["branch"], pull["head"]["ref"], pull["draft"]) == ("open", branch, branch, True)
-    assert pull["title"] == f"Asset Monitor bump for {CVE}"
+    assert pull["title"] == f"GarudaNetra bump for {CVE}"
     assert github.files(github.refs[f"heads/{branch}"]) == {"Dockerfile": ("100644", b"FROM node:20.19.5-alpine\n")}
     assert github.writes().count(("POST", "/repos/acme/shop/pulls")) == 1
     # The Operator merges; the next poll sees the merge commit on the default branch.

@@ -6,7 +6,7 @@ Accepted, 2026-11-15. Amends A15 and the first-release non-goal "GitHub push web
 
 ## Context and decision point
 
-Release 2 adds two kinds of inbound traffic: Push deliveries from GitHub, and reports and command polls from On-server agents. Today Asset Monitor has one HTTP surface, and it fits neither:
+Release 2 adds two kinds of inbound traffic: Push deliveries from GitHub, and reports and command polls from On-server agents. Today GarudaNetra has one HTTP surface, and it fits neither:
 
 - `uvicorn numen.api:app` serves the dashboard, published on `127.0.0.1:8788` only. Every route except health and login needs the `numen_session` cookie, and every write also needs `X-CSRF-Token`. GitHub and an On-server agent can send neither.
 - Importing `numen.api` runs `create_app()`, which builds the whole dashboard. No route can be mounted on its own.

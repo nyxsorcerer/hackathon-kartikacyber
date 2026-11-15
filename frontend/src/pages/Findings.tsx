@@ -1073,7 +1073,7 @@ function FindingBody({
       {approve && (
         <Approval
           title="Approve the Lab"
-          description="Asset Monitor builds the vulnerable application and runs the Proof in a disposable Lab. Enter your password to approve this Lab."
+          description="GarudaNetra builds the vulnerable application and runs the Proof in a disposable Lab. Enter your password to approve this Lab."
           path={`/findings/${finding.id}/lab-runs`}
           success="Lab started after Approval."
           icon={FlaskConical}
@@ -1211,7 +1211,7 @@ function TranscriptText({ id }: { id: string }) {
   );
 }
 /** The Disclosure report (A06, A15) as escaped text, for the Operator to copy into the Upstream
- * repository's GitHub private vulnerability reporting form. Asset Monitor never sends it. */
+ * repository's GitHub private vulnerability reporting form. GarudaNetra never sends it. */
 function DisclosureReportPanel({
   report,
 }: {
@@ -1220,7 +1220,7 @@ function DisclosureReportPanel({
   return (
     <Panel
       title="Disclosure report"
-      description="For the Upstream repository's maintainers: copy it into their GitHub private vulnerability reporting form. Asset Monitor never sends it."
+      description="For the Upstream repository's maintainers: copy it into their GitHub private vulnerability reporting form. GarudaNetra never sends it."
       actions={
         <>
           <CopyButton value={report.text} label="Copy the Disclosure report" />
@@ -1244,7 +1244,7 @@ function rangeLines(ranges: AdvisoryRanges) {
       `${feed}: ${lists.map((list) => list.map(([op, bound]) => op + bound).join(" ") || "all versions").join(" || ")}`,
   );
 }
-/** An Advisory check match on the Finding (A09, A06): its report, rendered by Asset Monitor from
+/** An Advisory check match on the Finding (A09, A06): its report, rendered by GarudaNetra from
  * the feeds' records, its aliases, each pin with its affected ranges, and the version its bump
  * moves to. Feed text is shown only as text. */
 function AdvisoryPanel({
@@ -1271,7 +1271,7 @@ function AdvisoryPanel({
   return (
     <Panel
       title={`Advisory ${advisory.vulnerability}`}
-      description="Rendered by Asset Monitor from the OSV, GHSA and NVD records, shown as text."
+      description="Rendered by GarudaNetra from the OSV, GHSA and NVD records, shown as text."
       actions={
         <CopyButton value={advisory.report} label="Copy the advisory report" />
       }
@@ -1581,7 +1581,7 @@ function CleanupReportPanel({
   return (
     <Panel
       title="Cleanup report"
-      description="What to remove and which secrets to rotate. Asset Monitor never sends it."
+      description="What to remove and which secrets to rotate. GarudaNetra never sends it."
       padded
     >
       <DetailGrid
@@ -2156,7 +2156,7 @@ function RemediationPRs({
       {approving?.diff_sha256 && (
         <Approval
           title={`Approve the ${approving.action} Remediation PR`}
-          description={`Asset Monitor opens one draft pull request on the Own repository from exactly the diff with SHA-256 ${approving.diff_sha256}. It never merges. Enter your password to approve it.`}
+          description={`GarudaNetra opens one draft pull request on the Own repository from exactly the diff with SHA-256 ${approving.diff_sha256}. It never merges. Enter your password to approve it.`}
           path={`/findings/${finding.id}/remediation-prs/${approving.id}/approvals`}
           body={{ diff_sha256: approving.diff_sha256 }}
           success="Remediation PR approved: opening the draft pull request."

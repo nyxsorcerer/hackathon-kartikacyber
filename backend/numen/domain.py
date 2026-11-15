@@ -1294,7 +1294,7 @@ DISCLOSURE_LIMIT = 64 * 1024
 def disclosure_report(db, finding, root):
     """The Disclosure report (A06, A15) the Analysis drafted for an Upstream Finding, read from
     its current revision for the Operator to copy into the Upstream repository's GitHub private
-    vulnerability reporting form: {text, form_url}, or None. Asset Monitor never sends it."""
+    vulnerability reporting form: {text, form_url}, or None. GarudaNetra never sends it."""
     cell = finding_cell(db, finding)
     if finding_role(db, finding) != "upstream" or (cell and "disclosure_report" not in PLAYBOOKS[cell]):
         return None

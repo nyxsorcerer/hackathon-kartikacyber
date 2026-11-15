@@ -1,4 +1,4 @@
-# Asset Monitor implementation plan
+# GarudaNetra implementation plan
 
 This plan delivers `docs/prd/asset-monitor-prd.md` on a fork of Numen (ADR-0003). Phases are ordered so each one leaves a working, demonstrable system. Every phase ends with `make build`, `make check` and `make test`; `make test` includes `test-runtime`, and Compose sets `NUMEN_DOCKER_TESTS=1`. Phases that change UI flows also run `make test-journey`.
 

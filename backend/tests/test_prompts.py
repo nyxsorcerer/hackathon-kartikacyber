@@ -47,7 +47,7 @@ def test_the_bundle_section_describes_the_offline_node_lab():
         "the Lab places the Own repository at the Verdict's commit under vulnerable-app/",
         # The three vulnerable-app rules (A07), so a bundle carries only the Dockerfile and its own files.
         "own_head: the Lab places the Own repository at its default-branch head",
-        "minimal, with the packages and locked_version facts: Asset Monitor writes vulnerable-app/package.json",
+        "minimal, with the packages and locked_version facts: GarudaNetra writes vulnerable-app/package.json",
         "bundle only the Dockerfile and the files you wrote yourself",
         "COPY . /app/",
         'CMD ["node", "server.js"]',

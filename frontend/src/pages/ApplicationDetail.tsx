@@ -299,7 +299,7 @@ function ApplicationBody({
               }
             >
               The deployed version of {application.asset_url} has not been
-              observed, so Numen cannot tell which CVEs affect it.
+              observed, so GarudaNetra cannot tell which CVEs affect it.
             </Callout>
           )}
           <div className="detail-columns">

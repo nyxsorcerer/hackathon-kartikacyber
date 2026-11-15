@@ -111,7 +111,7 @@ function AuthenticatedApp() {
         <div className="login-card">
           <div className="brand">
             <Logo />
-            numen<span className="brand-caption">ASSET INTELLIGENCE</span>
+            GarudaNetra<span className="brand-caption">ASSET INTELLIGENCE</span>
           </div>
           <h1>Connection unavailable</h1>
           <ErrorNote>{error}</ErrorNote>
@@ -126,7 +126,7 @@ function AuthenticatedApp() {
       <div className="auth-screen">
         <div className="brand">
           <Logo />
-          numen
+          GarudaNetra
         </div>
         <p role="status" className="hint">
           Verifying session…
@@ -179,7 +179,7 @@ function Login({ onLogin }: { onLogin: (session: Session) => void }) {
       <div className="login-card">
         <div className="brand">
           <Logo />
-          numen
+          GarudaNetra
         </div>
         <p className="eyebrow">ASSET INTELLIGENCE</p>
         <h1>Welcome back.</h1>
@@ -355,7 +355,7 @@ function Shell({
         <div className="sidebar-top">
           <Link className="brand" to="/" onClick={close}>
             <Logo />
-            numen
+            GarudaNetra
           </Link>
           <button
             className="icon-button mobile-only"

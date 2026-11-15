@@ -64,7 +64,7 @@ def test_an_alert_carries_only_application_generated_fields(system, monkeypatch)
     assert queued["subject"]["label"] == "Vulnerability introduced · high confidence"
     (payload,) = deliver(system, monkeypatch)
     assert payload == {
-        "content": "Asset Monitor: Vulnerability introduced · high confidence\nApplication: Site\n"
+        "content": "GarudaNetra: Vulnerability introduced · high confidence\nApplication: Site\n"
                    f"Source: aaaaaaa\nhttp://localhost:8080/findings/{finding_id}",
         "allowed_mentions": {"parse": []},
     }
@@ -219,7 +219,7 @@ def test_a_legacy_numen_notification_is_sent_without_its_text(system, monkeypatc
         db.flush()
         domain.enqueue(db, "notification", inputs={"notification_id": row.id})
     assert deliver(system, monkeypatch) == [
-        {"content": "Asset Monitor: Alert\nhttp://localhost:8080/commits/1", "allowed_mentions": {"parse": []}}
+        {"content": "GarudaNetra: Alert\nhttp://localhost:8080/commits/1", "allowed_mentions": {"parse": []}}
     ]
 
 

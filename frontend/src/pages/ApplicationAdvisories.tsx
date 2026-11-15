@@ -71,7 +71,7 @@ export function ApplicationAdvisories({
         <div className="column-stack">
           <Panel
             title="Advisory check"
-            description="Daily, after a manifest, lockfile, .nvmrc or Dockerfile changes on the Own repository's default branch, and when you ask, Asset Monitor reads these pins from the head of the Own repository (else the source repository) and matches them against OSV, GHSA and NVD. A version that cannot be read is unknown, which counts as exposed."
+            description="Daily, after a manifest, lockfile, .nvmrc or Dockerfile changes on the Own repository's default branch, and when you ask, GarudaNetra reads these pins from the head of the Own repository (else the source repository) and matches them against OSV, GHSA and NVD. A version that cannot be read is unknown, which counts as exposed."
             actions={
               <ActionButton
                 className="secondary"

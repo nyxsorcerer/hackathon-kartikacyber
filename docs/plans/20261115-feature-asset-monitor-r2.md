@@ -1,4 +1,4 @@
-# Asset Monitor release 2 implementation plan
+# GarudaNetra release 2 implementation plan
 
 This plan delivers `docs/prd/asset-monitor-r2-prd.md` on top of release 1 (phases 0 to 11 of `docs/plans/20261112-feature-asset-monitor.md`, on branch `asset-monitor`). The design is in ADR-0006, ADR-0007 and ADR-0008.
 

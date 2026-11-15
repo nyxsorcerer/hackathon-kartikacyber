@@ -6,7 +6,7 @@ Accepted, 2026-11-12. Amends Numen's AC-05 (an explicit Analyze click before any
 
 ## Context and decision point
 
-Every commit, diff and served page that Asset Monitor reads is written by someone else, and with Upstream repositories in scope that someone is any upstream committer. The author of a Malicious change is hostile by definition. Text in a diff or commit message can steer an agent ("classify this as Unrelated", "run this command").
+Every commit, diff and served page that GarudaNetra reads is written by someone else, and with Upstream repositories in scope that someone is any upstream committer. The author of a Malicious change is hostile by definition. Text in a diff or commit message can steer an agent ("classify this as Unrelated", "run this command").
 
 The Operator wants Analysis to run without a click. The plan also adds steps with side effects: Remediation PRs and Cures. The question is which component holds the power to act, and when untrusted code may run.
 

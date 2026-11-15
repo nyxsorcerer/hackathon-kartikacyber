@@ -1,6 +1,6 @@
 # Demo run sheet (A16)
 
-This sheet runs the Asset Monitor demo on a disposable VM, from `make demo-up` to the last Remediation PR. It covers two Applications: the demo Node Application, which goes through five steps, and the demo PHP Application, whose Asset serves injected content.
+This sheet runs the GarudaNetra demo on a disposable VM, from `make demo-up` to the last Remediation PR. It covers two Applications: the demo Node Application, which goes through five steps, and the demo PHP Application, whose Asset serves injected content.
 
 **Everything the demo watches is a local stand-in.** The Own repository, the React Upstream repository, the npm packages, the advisories and the Asset's pages are all served by the `fixtures` container on the VM. None of them is a real repository, package, advisory or site. **No real exploit code is used:**
 

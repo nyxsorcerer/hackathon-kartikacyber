@@ -10,10 +10,10 @@ After the Operator's Approval, the Lab works in two phases. First it fetches the
 
 FROM must name asset-monitor-lab:0.1.0, scratch, or an earlier stage of your own file; any other image is refused. asset-monitor-lab:0.1.0 is Debian bookworm with Python 3.12, Node 24.9.0 and npm, running as root by default, and nothing else. COPY and ADD sources are bundle files inside vulnerable-app/, or carry --from naming one of your own stages. Build mounts and privileged build flags (--mount, --security, --network) are refused. Bundle files arrive owned by root with no execute bit, so CMD names its interpreter (CMD ["node", "server.js"]).
 
-The vulnerable_app fact names the application the Lab builds, which Asset Monitor supplies under vulnerable-app/; a file you bundle there replaces the supplied one:
+The vulnerable_app fact names the application the Lab builds, which GarudaNetra supplies under vulnerable-app/; a file you bundle there replaces the supplied one:
 - own_commit (the own_repository fact is true): the Lab places the Own repository at the Verdict's commit under vulnerable-app/ for you.
-- own_head: the Lab places the Own repository at its default-branch head under vulnerable-app/, and Asset Monitor installs the packages fact's packages at the locked_version fact, exactly as the npm registry publishes them, from vulnerable-app/.asset-monitor/.
-- minimal, with the packages and locked_version facts: Asset Monitor writes vulnerable-app/package.json, a minimal private application whose dependencies pin those packages at the Locked version, and installs them the same way.
+- own_head: the Lab places the Own repository at its default-branch head under vulnerable-app/, and GarudaNetra installs the packages fact's packages at the locked_version fact, exactly as the npm registry publishes them, from vulnerable-app/.asset-monitor/.
+- minimal, with the packages and locked_version facts: GarudaNetra writes vulnerable-app/package.json, a minimal private application whose dependencies pin those packages at the Locked version, and installs them the same way.
 
 In those cases bundle only the Dockerfile and the files you wrote yourself, such as the code that reaches the vulnerable package, never a copy of the repository or a package.json or package-lock.json of your own, and use COPY . /app/ so the build takes the whole application. When the facts name no packages or Locked version for a minimal app, nothing is supplied: bundle a minimal Node application that pins the vulnerable package version in package.json and package-lock.json, with the code that reaches it. Never present a reduced copy of a real application as the real one. Your outputs are limited to 8 MB.
 

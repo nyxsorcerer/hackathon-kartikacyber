@@ -404,7 +404,7 @@ def test_an_approved_draft_opens_a_draft_pull_request_from_exactly_the_approved_
     (pull,) = github.pulls
     assert (opened["branch"], opened["pull_number"], opened["pull_url"]) == (BRANCH, 1, pull["html_url"])
     assert (pull["head"]["ref"], pull["base"]["ref"], pull["draft"]) == (BRANCH, "main", True)
-    assert pull["title"] == f"Asset Monitor patch of {INTRODUCED[:7]}"
+    assert pull["title"] == f"GarudaNetra patch of {INTRODUCED[:7]}"
     assert "Approval" in pull["body"] and "Parses the value" not in pull["body"]  # no agent text
     # One new commit on the base revision, holding exactly the approved diff, modes kept.
     head = github.refs[f"heads/{BRANCH}"]

@@ -1,6 +1,6 @@
 # Demo repositories
 
-The prepared content of the Asset Monitor demo (A16). Everything here is an inert local stand-in:
+The prepared content of the GarudaNetra demo (A16). Everything here is an inert local stand-in:
 no real shop, no React code and no exploit code.
 
 `fixture_server.py`, in demo mode (`NUMEN_FIXTURE_DEMO=1`), builds the demo Own repository

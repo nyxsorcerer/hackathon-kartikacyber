@@ -1,4 +1,4 @@
-"""Asset Monitor's Served-content check (A10), staged as recipe.py like fingerprint_probe.py.
+"""GarudaNetra's Served-content check (A10), staged as recipe.py like fingerprint_probe.py.
 
 It fetches one Watched page through the gateway as each user agent of the fixed pair, and the
 scripts the page links to (same-origin and external, at most max_scripts) as that same user

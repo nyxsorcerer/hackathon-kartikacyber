@@ -493,7 +493,7 @@ def dry_run(client: Client, fixture: Client) -> None:
     while len(alerts := fixture.request('GET', '/admin/state')['notifications']) < len(opened) and time.monotonic() < deadline:
         time.sleep(1)
     # The fixed template's last line links the Finding it opened.
-    assert all(alert['content'].startswith('Asset Monitor: ') for alert in alerts), alerts
+    assert all(alert['content'].startswith('GarudaNetra: ') for alert in alerts), alerts
     linked = Counter(alert['content'].rsplit('/findings/', 1)[-1] for alert in alerts)
     assert linked == Counter(opened), (linked, opened)
     print(f'PASS dry run Alerts: one fixed-template Alert for each of the {len(opened)} opened Findings')

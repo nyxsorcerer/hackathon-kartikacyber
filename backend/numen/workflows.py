@@ -3617,10 +3617,10 @@ class Workflows:
         # A commit's Remediation PR names its short SHA; an Advisory check's its vulnerability.
         commit = db.get(Commit, row.subject)
         ref = row.data["revision"] if commit else row.subject
-        title = f"Asset Monitor {row.action} of {ref[:7]}" if commit else f"Asset Monitor {row.action} for {ref}"
+        title = f"GarudaNetra {row.action} of {ref[:7]}" if commit else f"GarudaNetra {row.action} for {ref}"
         link = domain.settings(db).data.get("dashboard_url", "").rstrip("/") + f"/findings/{row.finding_id}"
         body = (f"{title}, opened after the Operator's Approval of this exact diff. Review it before "
-                "merging: Asset Monitor never merges." + (f"\n\nFinding: {link}" if link.startswith("http") else ""))
+                "merging: GarudaNetra never merges." + (f"\n\nFinding: {link}" if link.startswith("http") else ""))
         message = f"{title}\n\nApproved diff SHA-256: {row.diff_sha256}"
         opened = remediation.open_pull_request(self.write_client(db), repository,
                                                remediation.branch_name(ref, row.action), row.base_ref,
@@ -3918,7 +3918,7 @@ class Workflows:
             raise DomainError("unsafe_webhook", "Use a Discord HTTPS webhook URL", 422)
         # The one Alert template (A12), built only from the stored application-generated fields; a
         # legacy Numen row's title and detail are never sent.
-        lines = [f"Asset Monitor: {row.data.get('verdict') or 'Alert'}"]
+        lines = [f"GarudaNetra: {row.data.get('verdict') or 'Alert'}"]
         for label, key in (("Application", "application"), ("Provider account", "account"), ("Source", "source")):
             if row.data.get(key):
                 lines.append(f"{label}: {row.data[key]}")

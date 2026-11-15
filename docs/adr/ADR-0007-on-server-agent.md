@@ -77,7 +77,7 @@ That program needs root to read every file under a web root. It runs on the mach
 
 ## Consequences
 
-- **A08 changes.** Asset Monitor still never pushes to a default branch, never merges, and never writes to an Upstream repository. Its only writes to a server are an approved Quarantine or Restore, which move files and delete none.
+- **A08 changes.** GarudaNetra still never pushes to a default branch, never merges, and never writes to an Upstream repository. Its only writes to a server are an approved Quarantine or Restore, which move files and delete none.
 - **Approvals.** Approval now also covers Quarantine, Restore, Watched root changes and rotating the Dashboard key, and the demo scripts never give any of them.
 - **The Dashboard key.** Whoever holds its private half can quarantine any file under the Allowed paths, and widen the Watched roots within them. They cannot delete a file, run code or reach other paths. Only the app holds it, so the worker, which handles attacker-written bytes, does not.
 - **The wanted list.** A compromised agent listener can ask an agent for the bytes of any file of at most 1 MiB under its Watched roots that is not on the secret list, and read them. The pinned TLS keeps a compromised tunnel from doing the same.

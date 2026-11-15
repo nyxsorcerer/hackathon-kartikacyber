@@ -1,4 +1,4 @@
-# ADR-0003: Build Asset Monitor as a fork of Numen
+# ADR-0003: Build GarudaNetra as a fork of Numen
 
 ## Status
 
@@ -6,7 +6,7 @@ Accepted, 2026-11-12. Numbered after Numen's ADR-0001 and ADR-0002, which come a
 
 ## Context and decision point
 
-The Asset Monitor plan matches Numen's own PRD (`docs/prd/numen-prd.md` at `4970c7b`, "PRD: Numen assets monitoring dashboard") almost feature for feature. On 2026-11-12, one agent checked every plan feature against Numen's code and a second agent tried to refute each claim; none was refuted. About 60 to 65 percent of the plan is already built end to end:
+The GarudaNetra plan matches Numen's own PRD (`docs/prd/numen-prd.md` at `4970c7b`, "PRD: Numen assets monitoring dashboard") almost feature for feature. On 2026-11-12, one agent checked every plan feature against Numen's code and a second agent tried to refute each claim; none was refuted. About 60 to 65 percent of the plan is already built end to end:
 
 - Asset registration and polling.
 - Triage on Pi, Claude Code or Codex, with model and effort checked against the account.
@@ -21,7 +21,7 @@ The Asset Monitor plan matches Numen's own PRD (`docs/prd/numen-prd.md` at `4970
 
 A Numen Program pairs an Asset with the upstream software it runs (a CMS or plugin, from GitHub or WordPress.org). Numen watches only that upstream code.
 
-Asset Monitor adds the following new scope:
+GarudaNetra adds the following new scope:
 
 - Own repositories.
 - Upstream repositories shared across Applications, with Exposure.

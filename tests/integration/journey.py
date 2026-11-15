@@ -222,7 +222,7 @@ def main():
         raise AssertionError('Webhook test was not delivered to fixture webhook')
     # The candidate mark sends no Alert, so the test delivery is the only one.
     (delivery,) = notifications
-    assert delivery['content'].startswith('Asset Monitor: Webhook test')
+    assert delivery['content'].startswith('GarudaNetra: Webhook test')
     assert delivery['allowed_mentions'] == {'parse': []} and 'embeds' not in delivery
     assert not [job for job in items(client.request('GET', '/api/jobs')) if job.get('application_id') == github['id'] and job['kind'] == 'commit_analysis']
     client.request('POST', f'/api/commits/{candidate["id"]}/analyses', {}, expect=(409, 422))
@@ -440,7 +440,7 @@ def main():
     while not advisory_alerts() and time.monotonic() < deadline:
         time.sleep(0.5)
     (alert,) = advisory_alerts()
-    assert alert['content'].startswith('Asset Monitor: Advisory\n') and f'Source: {cve}' in alert['content'], alert
+    assert alert['content'].startswith('GarudaNetra: Advisory\n') and f'Source: {cve}' in alert['content'], alert
     # The next check opens no duplicate and sends no second Alert.
     again = client.wait(client.request('POST', checks, {}, expect=(202,)))
     assert (again['result']['matches'], again['result']['opened']) == (1, 0), again['result']
@@ -707,7 +707,7 @@ def main():
         assert time.monotonic() < deadline, 'the regression Alert was never delivered'
         time.sleep(1)
     (alert,) = alerts
-    assert alert['content'].startswith('Asset Monitor: Malicious change · regressed'), alert
+    assert alert['content'].startswith('GarudaNetra: Malicious change · regressed'), alert
     assert f'Source: web-{suffix}' in alert['content'] and 'cache.php' not in alert['content'], alert
     print('PASS Restore after a password Approval puts the file back, and the next manifest regresses the Finding to Confirmed with one Alert naming the agent and no path')
 

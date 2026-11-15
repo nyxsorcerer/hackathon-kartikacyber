@@ -183,7 +183,7 @@ def archive(sha: str) -> bytes:
 # The two versions differ only in resolveServerReference, which the React stand-in's fix commit changes.
 NPM = 'http://fixtures:8090/npm'
 STAND_IN_HEAD = '''"use strict";
-// Asset Monitor stand-in for react-server-dom-webpack: not React's code and no exploit. It models
+// GarudaNetra stand-in for react-server-dom-webpack: not React's code and no exploit. It models
 // the class of flaw behind React2Shell only. An action names its server function by "$$id"
 // ("module#export"), resolved through the server manifest. Nothing resolved is ever loaded or
 // called: where the flaw reaches an inherited member, such as Object from
@@ -398,7 +398,7 @@ GHSA_REACT2SHELL = {
 # /served/beacon.js would request /served/executed only if something ran it.
 CLICKFIX_HOST = 'cdn.clickfix-fixture.test'
 SERVED_BEACON = b"fetch('/served/executed');\n"
-SERVED_LOADER = b"/* Asset Monitor fixture: inert ClickFix loader */\nnavigator.clipboard.writeText('echo asset-monitor-fixture');\n"
+SERVED_LOADER = b"/* GarudaNetra fixture: inert ClickFix loader */\nnavigator.clipboard.writeText('echo asset-monitor-fixture');\n"
 JUDOL = ('<section><h2>Slot gacor hari ini</h2><p>Daftar situs togel dan slot gacor maxwin terpercaya, bonus deposit setiap hari.</p>'
          '<a href="https://slot-gacor.test/daftar">Slot gacor</a> <a href="https://togel-maxwin.test/">Togel maxwin</a></section>')
 CLICKFIX = ('<div id="verify"><h2>Verify you are human</h2><p>Press Win+R, paste the command below and press Enter to finish the check.</p>'
@@ -489,7 +489,7 @@ GIT_ENV = {
     'GIT_COMMITTER_NAME': 'Demo Maintainer', 'GIT_COMMITTER_EMAIL': 'maintainer@asset-monitor-demo.test',
     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0', 'LC_ALL': 'C',
 }
-REACT_README = (b"# React (stand-in)\n\nThe Asset Monitor demo's stand-in React Upstream repository: not React's code and no "
+REACT_README = (b"# React (stand-in)\n\nThe GarudaNetra demo's stand-in React Upstream repository: not React's code and no "
                 b"exploit. packages/react-server-dom-webpack models the class of flaw behind React2Shell and never "
                 b"loads or calls what it resolves.\n")
 REACT_FIX = '''Resolve server references through own properties only

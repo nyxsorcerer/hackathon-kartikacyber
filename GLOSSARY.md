@@ -1,13 +1,13 @@
-# Asset Monitor
+# GarudaNetra
 
-Asset Monitor watches the Operator's Applications for security-relevant changes in four places: their own code, the upstream code they depend on, the content their Assets serve, and, with an On-server agent, the files on the server behind an Asset. It responds to each change with a fixed Playbook. "Asset Monitor" is a working name.
+GarudaNetra watches the Operator's Applications for security-relevant changes in four places: their own code, the upstream code they depend on, the content their Assets serve, and, with an On-server agent, the files on the server behind an Asset. It responds to each change with a fixed Playbook. "GarudaNetra" is a working name.
 
 ## Language
 
 ### People
 
 **Operator**:
-The one person who runs Asset Monitor, protects its Applications and gives every Approval.
+The one person who runs GarudaNetra, protects its Applications and gives every Approval.
 _Avoid_: user, admin, analyst
 
 ### Applications
@@ -17,7 +17,7 @@ An app the Operator protects: its Asset, the Upstream repositories it depends on
 _Avoid_: program, project, target
 
 **Own repository**:
-The repository that holds the Application's own source code. It is the only repository Asset Monitor ever proposes changes to. An Application may have none.
+The repository that holds the Application's own source code. It is the only repository GarudaNetra ever proposes changes to. An Application may have none.
 _Avoid_: main repo, app repo
 
 **Upstream repository**:
@@ -37,7 +37,7 @@ Whether an Upstream change or a published advisory reaches an Application: its L
 _Avoid_: impact, affected, applicability
 
 **Deployed version**:
-The version that an Asset is actually serving, as far as Asset Monitor can tell from outside. It may be unknown.
+The version that an Asset is actually serving, as far as GarudaNetra can tell from outside. It may be unknown.
 _Avoid_: remote version, live version
 
 **Asset**:
@@ -99,7 +99,7 @@ The changes with an Insufficient context Verdict that are waiting for the Operat
 _Avoid_: backlog, inbox
 
 **Finding**:
-One security weakness that Asset Monitor believes reaches an Application. It is opened by a Verdict, by a Malicious change in served content or in server files, or by an Advisory check match. It moves from Open to Confirmed or Dismissed, and from Open or Confirmed to Remediated. A server-files Finding also moves from Remediated back to Confirmed when a file it names comes back.
+One security weakness that GarudaNetra believes reaches an Application. It is opened by a Verdict, by a Malicious change in served content or in server files, or by an Advisory check match. It moves from Open to Confirmed or Dismissed, and from Open or Confirmed to Remediated. A server-files Finding also moves from Remediated back to Confirmed when a file it names comes back.
 _Avoid_: alert, issue, vuln, lead
 
 **Finding source**:
@@ -129,7 +129,7 @@ The evidence that demonstrates a Verdict. For a vulnerability it is a reproducti
 _Avoid_: exploit, PoC
 
 **Remediation PR**:
-A draft pull request on the Own repository, built by Asset Monitor after an Approval: a patch, a revert, or a dependency pin or bump.
+A draft pull request on the Own repository, built by GarudaNetra after an Approval: a patch, a revert, or a dependency pin or bump.
 _Avoid_: auto-fix, patch apply, hotfix
 
 **Cure**:
@@ -145,7 +145,7 @@ Moving quarantined files back to their original paths, after an Approval. A file
 _Avoid_: undo, unquarantine, rollback (and it is not `make restore`, which restores a backup)
 
 **Disclosure report**:
-A report written for the maintainers of an Upstream repository about a weakness in their code. Asset Monitor writes it and never sends it.
+A report written for the maintainers of an Upstream repository about a weakness in their code. GarudaNetra writes it and never sends it.
 _Avoid_: advisory, bug report
 
 **Detection rule**:
@@ -231,15 +231,15 @@ _Avoid_: server key, master key
 ### Inbound traffic
 
 **Ingress**:
-The part of Asset Monitor that receives inbound machine traffic: two services, each with one loopback listener, the push listener for Push deliveries and the agent listener for On-server agents. It accepts only signed requests and never serves the dashboard.
+The part of GarudaNetra that receives inbound machine traffic: two services, each with one loopback listener, the push listener for Push deliveries and the agent listener for On-server agents. It accepts only signed requests and never serves the dashboard.
 _Avoid_: gateway, proxy, public API (and it is not the runner's credential ingress)
 
 **Push webhook**:
-A GitHub webhook the Operator registers by hand on an Own repository, so that each push makes Asset Monitor poll that repository at once. Scheduled polling continues as before.
+A GitHub webhook the Operator registers by hand on an Own repository, so that each push makes GarudaNetra poll that repository at once. Scheduled polling continues as before.
 _Avoid_: "webhook" on its own (an Alert is not a webhook), hook, callback
 
 **Push webhook secret**:
-The per-repository secret that Asset Monitor generates for a Push webhook and uses to verify the signature of each Push delivery.
+The per-repository secret that GarudaNetra generates for a Push webhook and uses to verify the signature of each Push delivery.
 _Avoid_: webhook secret, shared secret, token
 
 **Push delivery**:

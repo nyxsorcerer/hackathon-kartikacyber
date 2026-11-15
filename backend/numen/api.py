@@ -148,7 +148,7 @@ def create_app(database_url=None, artifact_root=None, admin_password=None, confi
         engine.dispose()
 
     # No Swagger UI (/docs, /redoc, /openapi.json): it needs inline script, which the CSP forbids.
-    app = FastAPI(title="Numen", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="GarudaNetra", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(RequestLimits)
     app.add_middleware(SecurityHeaders)
     app.state.config, app.state.factory, app.state.vault = config, factory, vault

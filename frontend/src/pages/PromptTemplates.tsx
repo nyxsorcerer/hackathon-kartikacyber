@@ -252,7 +252,7 @@ function TemplateEditor({
           {draft.length.toLocaleString()} characters
           {dirty && " · Unsaved changes"}
         </span>
-        <span>Numen appends the run's facts after the prompt.</span>
+        <span>GarudaNetra appends the run's facts after the prompt.</span>
       </div>
       <div className="form-actions prompt-actions">
         {(template.customized || dirty) && (

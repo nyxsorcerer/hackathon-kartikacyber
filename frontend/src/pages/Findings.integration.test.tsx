@@ -1043,7 +1043,7 @@ it("shows the Playbook steps, the Disclosure report as text to copy and the Expo
   const report = screen.getByRole("region", { name: "Disclosure report" });
   expect(report.querySelector("pre")?.textContent).toBe(disclosure);
   expect(container.querySelector("script")).toBeNull();
-  expect(report).toHaveTextContent("Asset Monitor never sends it");
+  expect(report).toHaveTextContent("GarudaNetra never sends it");
   expect(
     within(report).getByRole("button", { name: "Copy the Disclosure report" }),
   ).toBeInTheDocument();

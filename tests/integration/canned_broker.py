@@ -301,7 +301,7 @@ def check() -> None:
     def triage(message):
         return json.loads(run('commit_triage', {'commit': {'message': message}})['result']['reply'])['decision']
 
-    assert [triage(m) for m in (INVOICE + '\n\nbody', TELEMETRY, REACT_FIX, 'Release 19.0.1', 'Asset Monitor patch of abc1234 (#1)')] == [
+    assert [triage(m) for m in (INVOICE + '\n\nbody', TELEMETRY, REACT_FIX, 'Release 19.0.1', 'GarudaNetra patch of abc1234 (#1)')] == [
         'security_candidate'] * 3 + ['unrelated'] * 2
     assert json.loads(run('commit_triage', {'page_url': 'http://toko-batik.test:8090/served/'})['result']['reply'])['decision'] == 'security_candidate'
     shop = DEMO_CONTENT / 'shop'

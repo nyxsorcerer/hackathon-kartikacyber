@@ -221,7 +221,7 @@ class Sources:
 
     def npm_tarball(self, dist):
         """The bytes of the npm tarball that `dist` (a version's registry dist) names, at most MAX_FILE:
-        only from the registry Asset Monitor reads, and only when they match dist.integrity's sha512."""
+        only from the registry GarudaNetra reads, and only when they match dist.integrity's sha512."""
         url = str((dist or {}).get("tarball") or "")
         if not url.startswith(self.npm.rstrip("/") + "/"):
             raise DomainError("package_untrusted", f"The tarball {url[:200]!r} is not on the npm registry {self.npm}", 422)

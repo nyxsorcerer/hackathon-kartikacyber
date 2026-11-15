@@ -7,5 +7,5 @@ The storefront of Toko Batik: the product list, and add to cart and checkout as 
 
 `react-server-dom-webpack` is vendored under `vendor/`, so a build needs no registry.
 
-This is the Asset Monitor demo's Own repository, a local stand-in: not a real shop, and its
+This is the GarudaNetra demo's Own repository, a local stand-in: not a real shop, and its
 `react-server-dom-webpack` is not React's code.
